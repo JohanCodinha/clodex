@@ -59,6 +59,82 @@ credential instances. It rejects symbolic links, foreign ownership, broad
 permissions on POSIX, files over 1 MiB, and more than 1,024 queued entries
 before attempting any credential-store deletion.
 
+## OS keyring layout and compatibility
+
+The default OS credential-store backend uses five service namespaces:
+
+- `clodex` stores a short credential directly or publishes the marker for a
+  long credential;
+- `clodex-chunks` stores the chunks for current long credentials;
+- `clodex-journal` records crash recovery, the active chunk generation, and a
+  deletion marker;
+- `clodex-deleted` stores a redundant non-secret deletion guard;
+- `clodex-state-key` stores a random per-account key that protects the
+  filesystem recovery marker.
+
+Clodex also keeps an authenticated encrypted per-account managed-state marker
+under the native OS account home at `~/.clodex/keyring-state`. Before each
+cleanup-journal write, the marker records the exact journal intent. A retry
+decrypts, republishes, and verifies that intent before continuing, then marks
+it managed. The encryption key remains only in the OS credential store, so a
+copied filesystem marker does not expose credentials or an offline credential
+confirmation value. If the OS keyring temporarily reports a managed journal as
+absent, the marker makes reads, writes, and deletes fail closed instead of
+replacing unknown chunk inventory. Malformed or unauthenticated local intent
+also remains fail-closed.
+
+If the filesystem marker outlives a complete OS credential-store reset,
+Clodex allows direct reauthorization only after sentinel-backed service
+enumeration proves that the main credential and chunk namespaces are empty.
+The recovery first records durable deleted state, then follows the normal
+journal-before-publication path for the replacement. A hidden, locked,
+incomplete, or partially restored namespace cannot take this path and remains
+fail-closed.
+
+Credential mutation locks live beside that state under
+`~/.clodex/credential-locks`. Neither path depends on `CLODEX_HOME`,
+`XDG_RUNTIME_DIR`, or temporary-directory environment variables because the OS
+keyring service and account namespaces are shared across those process-local
+settings. The native account-home filesystem must support hard links so lock
+publication remains atomic.
+
+New provider credentials use a stable, versioned account instance owned by the
+provider slot and selected credential backend. A retry derives the same
+candidate, so an ambiguous result cannot make its reference unreachable.
+Provisioning resumes well-formed candidate state, while unavailable or
+malformed recovery metadata remains fail-closed. Refresh paths replace the
+registry's current account only when its prior keyring state can be confirmed.
+Reauthorization provisions the selected backend first, then updates the
+registry after read-back verification. If the keyring hides both the main value
+and its metadata, replacement and deletion stop without publishing new state
+or reporting success.
+
+The active-generation journal is live metadata, not stale debris. Clodex keeps
+one generation after a successful long-credential write so a later release can
+retire the chunks through a current provider-removal operation if an older
+release removes or replaces only the main marker. Use the Clodex
+provider-removal path instead of deleting one of these entries manually.
+
+Long chunked credentials are not readable by older releases that do not
+understand their marker format. If a downgrade removes the main marker while
+leaving chunks behind, passive resolution preserves the recorded inventory
+because a missing keyring value cannot be distinguished from a collapsed read
+error on every platform. Remove the provider with a current Clodex release
+before reauthorizing to retire the orphaned generation. A published marker that
+does not match its recovery journal fails closed and leaves every recorded
+generation intact.
+
+Clodex does not implicitly import credentials from the legacy `relay-ai`
+service. Existing legacy entries remain untouched. Reauthorize or explicitly
+save the provider credential to publish it under the `clodex` service, verify
+the new credential, and remove the old entry separately if it is no longer
+needed. Provider removal deletes only the Clodex credential. Redundant
+non-secret deletion guards keep ambiguous deleted state from becoming readable;
+an explicit later credential save clears those guards. Unknown JSON-shaped
+values in non-OAuth keyring and helper accounts remain opaque. Historical
+`wellknown` token and OAuth access envelopes retain their existing decoding
+behavior, while structured OAuth validation applies only to OAuth accounts.
+
 ## Protocol
 
 The helper receives one of these invocations:

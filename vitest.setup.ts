@@ -1,8 +1,21 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeEach } from 'vitest';
+import { afterAll, beforeEach, vi } from 'vitest';
 import { RUN_ROOT_ENV_VAR } from './vitest.global-setup.js';
+
+const sandbox = vi.hoisted(() => ({ root: '' }));
+
+vi.mock('node:os', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  return {
+    ...actual,
+    userInfo: () => ({
+      ...actual.userInfo(),
+      homedir: sandbox.root || actual.userInfo().homedir,
+    }),
+  };
+});
 
 // Vitest evaluates this setup file once per test file, so `sandboxRoot` is private to the test
 // file currently running - no other worker or test file ever reads or writes it. That is what
@@ -10,6 +23,7 @@ import { RUN_ROOT_ENV_VAR } from './vitest.global-setup.js';
 const sandboxParent = process.env[RUN_ROOT_ENV_VAR] ?? tmpdir();
 const sandboxRoot = mkdtempSync(join(sandboxParent, 'clodex-vitest-sandbox-'));
 const sandboxHome = join(sandboxRoot, 'clodex-home');
+sandbox.root = sandboxRoot;
 
 function establishSandboxFloor(): void {
   process.env.CLODEX_HOME = sandboxHome;
