@@ -3,6 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 const LISTENER_READY_TIMEOUT_MS = 1_000;
 const LISTENER_READY_RETRY_MS = 5;
+const TCP_PROBE_TIMEOUT_MS = 50;
 
 function connectHost(address: string): string {
   if (address === '0.0.0.0') return '127.0.0.1';
@@ -16,20 +17,99 @@ export function tcpListenerUrlHost(address: string): string {
   return host.includes(':') ? `[${host}]` : host;
 }
 
-function probeTcpListener(host: string, port: number, timeoutMs: number): Promise<boolean> {
+type TcpListenerProbeResult = 'ready' | 'timeout' | 'unreachable';
+
+function probeTcpListener(
+  host: string,
+  port: number,
+  timeoutMs: number,
+): Promise<TcpListenerProbeResult> {
   return new Promise(resolve => {
     const socket = connect({ host, port });
     let settled = false;
-    const finish = (ready: boolean) => {
+    const finish = (result: TcpListenerProbeResult) => {
       if (settled) return;
       settled = true;
       socket.destroy();
-      resolve(ready);
+      resolve(result);
     };
-    socket.once('connect', () => finish(true));
-    socket.once('error', () => finish(false));
-    socket.setTimeout(timeoutMs, () => finish(false));
+    socket.once('connect', () => finish('ready'));
+    socket.once('error', error => {
+      finish(
+        (error as NodeJS.ErrnoException).code === 'ETIMEDOUT'
+          ? 'timeout'
+          : 'unreachable',
+      );
+    });
+    socket.setTimeout(timeoutMs, () => finish('timeout'));
   });
+}
+
+interface TcpListenerWaitOptions {
+  now?: () => number;
+  probe?: (
+    host: string,
+    port: number,
+    timeoutMs: number,
+  ) => Promise<TcpListenerProbeResult>;
+  retryFailure?: (result: Exclude<TcpListenerProbeResult, 'ready'>) => boolean;
+  delay?: (ms: number) => Promise<void>;
+}
+
+/**
+ * Probe every candidate once per round and return the first reachable
+ * candidate in caller-provided priority order. All retry rounds share one
+ * overall deadline.
+ */
+export async function waitForTcpListenerCandidate<T extends { port: number }>(
+  host: string,
+  candidates: readonly T[],
+  timeoutMs = LISTENER_READY_TIMEOUT_MS,
+  options: TcpListenerWaitOptions = {},
+): Promise<T | null> {
+  if (candidates.length === 0) return null;
+
+  const now = options.now ?? Date.now;
+  const probe = options.probe ?? probeTcpListener;
+  const retryFailure = options.retryFailure ?? (() => true);
+  const wait = options.delay ?? (ms => delay(ms));
+  const deadline = now() + timeoutMs;
+  let pendingCandidates = [...candidates];
+
+  do {
+    const remaining = Math.max(1, deadline - now());
+    const results = await Promise.all(
+      pendingCandidates.map(candidate => probe(
+        host,
+        candidate.port,
+        Math.min(remaining, TCP_PROBE_TIMEOUT_MS),
+      )),
+    );
+    const readyIndex = results.findIndex(result => result === 'ready');
+    if (readyIndex >= 0) return pendingCandidates[readyIndex] ?? null;
+
+    pendingCandidates = pendingCandidates.filter((_candidate, index) => {
+      const result = results[index];
+      return result !== undefined && result !== 'ready' && retryFailure(result);
+    });
+    if (pendingCandidates.length === 0) return null;
+
+    const retryDelay = Math.min(LISTENER_READY_RETRY_MS, deadline - now());
+    if (retryDelay <= 0) return null;
+    await wait(retryDelay);
+  } while (now() < deadline);
+
+  return null;
+}
+
+/** Retry a TCP probe until the listener answers or the deadline expires. */
+export async function waitForTcpListener(
+  host: string,
+  port: number,
+  timeoutMs = LISTENER_READY_TIMEOUT_MS,
+  options: TcpListenerWaitOptions = {},
+): Promise<boolean> {
+  return (await waitForTcpListenerCandidate(host, [{ port }], timeoutMs, options)) !== null;
 }
 
 async function closeAfterReadinessFailure(server: Server): Promise<void> {
@@ -68,14 +148,7 @@ export async function listenTcpServer(
   }
 
   const probeHost = connectHost(address.address);
-  const deadline = Date.now() + LISTENER_READY_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    const remaining = deadline - Date.now();
-    if (await probeTcpListener(probeHost, address.port, Math.min(remaining, 50))) {
-      return address;
-    }
-    await delay(Math.min(LISTENER_READY_RETRY_MS, Math.max(1, deadline - Date.now())));
-  }
+  if (await waitForTcpListener(probeHost, address.port)) return address;
 
   await closeAfterReadinessFailure(server);
   throw new Error(
