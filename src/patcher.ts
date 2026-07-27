@@ -18,8 +18,11 @@ import { createHash } from 'node:crypto';
 import {
   copyFileSync,
   existsSync,
+  mkdtempSync,
   mkdirSync,
   readFileSync,
+  renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -28,15 +31,17 @@ import {
   realpathSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import pc from 'picocolors';
 import * as p from '@clack/prompts';
 import { getAppHome } from './paths.js';
 import { loadPreferences } from './config.js';
 import { loadRegistry } from './registry/io.js';
+import { findModelsDevModel } from './registry/models-dev.js';
 import { findClaudeBinary, getInstalledClaudeVersion } from './launch.js';
 import { httpProxyDisplayName, httpProxyModelId } from './http-proxy/routes.js';
 import { stripOneMContextSuffix } from './context-model-id.js';
+import { getPatchReasoningCapabilities } from './provider-factory.js';
 import {
   describeModelAliasRejection,
   normalizeModelAliases,
@@ -47,6 +52,7 @@ import {
   applyClodexPatches,
   formatPatchSiteLine,
   PatchApplyError,
+  projectNativeEffort,
   PATCH_TRANSFORMS_VERSION,
   type PatchSiteResult,
   type PatchScriptModelConfig,
@@ -111,6 +117,10 @@ export interface PatchModelMeta {
   contextWindow?: number;
   /** Canonical label, e.g. `GPT-5.6 Sol (OpenAI (ChatGPT))`. */
   displayName?: string;
+  effort?: {
+    levels: string[];
+    defaultLevel: string;
+  };
 }
 
 /**
@@ -159,6 +169,8 @@ export function buildPatchModelConfig(
     else if (context !== 200_000) entry.context = context;
     const display = meta?.displayName?.trim();
     if (display) entry.display = display;
+    const effort = projectNativeEffort(meta?.effort);
+    if (effort) entry.effort = effort;
     config[id] = entry;
   }
   return {
@@ -193,7 +205,14 @@ export function computePatchConfigHash(
 ): string {
   const canonical = Object.keys(config).sort().map(key => {
     const entry = config[key]!;
-    return [key, entry.alias ?? null, entry.context ?? null, entry.display ?? null];
+    return [
+      key,
+      entry.alias ?? null,
+      entry.context ?? null,
+      entry.display ?? null,
+      entry.effort?.levels ?? null,
+      entry.effort?.defaultLevel ?? null,
+    ];
   });
   return createHash('sha256').update(JSON.stringify([transformsVersion, canonical])).digest('hex');
 }
@@ -208,10 +227,25 @@ export function buildDesiredPatchConfig(): DesiredPatchConfig {
   const meta = new Map<string, PatchModelMeta>();
   for (const provider of registry.providers) {
     for (const model of provider.modelsCache?.models ?? []) {
+      const npm = model.npm ?? provider.api.npm ?? '';
+      const upstreamModelId = model.upstreamModelId ?? model.id;
+      const modelsDev = findModelsDevModel(provider.id, model.id);
+      const effort = getPatchReasoningCapabilities(npm, upstreamModelId, {
+        providerId: provider.id,
+        apiBaseUrl: model.apiUrl ?? provider.api.url,
+        supportedParameters: model.supportedParameters,
+        reasoning: model.reasoning ?? modelsDev?.reasoning,
+        interleavedReasoningField:
+          model.interleavedReasoningField ?? modelsDev?.interleaved?.field,
+        upstreamModelId,
+      });
       meta.set(`${provider.id}:${model.id}`, {
         contextWindow: model.contextWindow && model.contextWindow > 0 ? model.contextWindow : undefined,
         // Same label `clodex server` prints at startup and `models --list` shows.
         displayName: httpProxyDisplayName(model, provider.name),
+        effort: effort.mode === 'controllable'
+          ? { levels: effort.levels, defaultLevel: effort.defaultLevel }
+          : undefined,
       });
     }
   }
@@ -364,13 +398,25 @@ export function summarizePatchResults(results: PatchSiteResult[]): string[] {
 
 // ── Apply / restore ─────────────────────────────────────────────────────────
 
-interface ApplyOutcome {
+export interface ApplyOutcome {
   ok: boolean;
   message: string;
   detailLines?: string[];
 }
 
-async function applyPatch(
+function requiredEffortPatchFailures(results: PatchSiteResult[]): PatchSiteResult[] {
+  return results.filter(result =>
+    result.status === 'FAIL'
+    && (
+      result.name.startsWith('PATCH 8a:')
+      || result.name.startsWith('PATCH 8b:')
+      || result.name.startsWith('PATCH 8c:')
+      || result.name.startsWith('PATCH 9:')
+    ),
+  );
+}
+
+export async function applyPatch(
   binaryPath: string,
   version: string,
   desired: DesiredPatchConfig,
@@ -378,31 +424,48 @@ async function applyPatch(
   opts: { trace: boolean; restoreFirst: boolean },
 ): Promise<ApplyOutcome> {
   const backup = pristineBackupPath(version, binaryPath);
-  mkdirSync(backupDir(), { recursive: true });
-
-  if (opts.restoreFirst) {
-    if (!existsSync(backup)) {
-      return { ok: false, message: `Cannot re-patch: pristine backup missing at ${backup}. Reinstall claude, then run clodex patch.` };
-    }
-    copyFileSync(backup, binaryPath);
-  } else if (!existsSync(backup)) {
-    copyFileSync(binaryPath, backup);
-  }
-  // Mirror the pristine copy to tweakcc's restore location (always from the
-  // backup, never the live binary — so it stays pristine even after patching).
-  copyFileSync(backup, join(backupDir(), 'native-binary.backup'));
-
-  // tweakcc's lib entry pulls in its interactive-picker deps (ink/react), so
-  // load it lazily — only when a patch is actually applied.
-  const { tryDetectInstallation, readContent, writeContent } = await import('tweakcc');
-
+  const backupDirectory = dirname(backup);
+  let candidateDir: string | undefined;
   let results: PatchSiteResult[];
+  let patchedSize: number;
+  let patchedSha256: string;
   try {
-    const installation = await tryDetectInstallation({ path: binaryPath });
+    mkdirSync(backupDirectory, { recursive: true });
+    if (opts.restoreFirst) {
+      if (!existsSync(backup)) {
+        return { ok: false, message: `Cannot re-patch: pristine backup missing at ${backup}. Reinstall claude, then run clodex patch.` };
+      }
+    } else if (!existsSync(backup)) {
+      copyFileSync(binaryPath, backup);
+    }
+    // Mirror the pristine copy to tweakcc's restore location (always from the
+    // backup, never the live binary — so it stays pristine after patching).
+    copyFileSync(backup, join(backupDirectory, 'native-binary.backup'));
+
+    candidateDir = mkdtempSync(join(dirname(binaryPath), '.clodex-patch-'));
+    const candidatePath = join(candidateDir, basename(binaryPath));
+    copyFileSync(opts.restoreFirst ? backup : binaryPath, candidatePath);
+
+    // tweakcc's lib entry pulls in its interactive-picker deps (ink/react), so
+    // load it lazily — only when a patch is actually applied.
+    const { tryDetectInstallation, readContent, writeContent } = await import('tweakcc');
+    const installation = await tryDetectInstallation({ path: candidatePath });
     const source = await readContent(installation);
     const patched = applyClodexPatches(source, desired.config);
     results = patched.results;
+    const failedEffortPatches = requiredEffortPatchFailures(results);
+    if (failedEffortPatches.length > 0) {
+      throw new PatchApplyError(
+        `clodex patch: required effort patches failed: ${
+          failedEffortPatches.map(result => result.name).join('; ')
+        }`,
+        results,
+      );
+    }
     await writeContent(installation, patched.content);
+    patchedSize = statSync(candidatePath).size;
+    patchedSha256 = sha256File(candidatePath);
+    renameSync(candidatePath, binaryPath);
   } catch (err) {
     const detailLines = err instanceof PatchApplyError ? summarizePatchResults(err.results) : [];
     if (opts.trace && detailLines.length) {
@@ -413,6 +476,20 @@ async function applyPatch(
       message: `Patch failed: ${err instanceof Error ? err.message : String(err)}`,
       detailLines,
     };
+  } finally {
+    if (candidateDir !== undefined) {
+      try {
+        rmSync(candidateDir, { recursive: true, force: true });
+      } catch (err) {
+        if (opts.trace) {
+          process.stderr.write(
+            `clodex patch: could not remove temporary candidate directory: ${
+              err instanceof Error ? err.message : String(err)
+            }\n`,
+          );
+        }
+      }
+    }
   }
   if (opts.trace) {
     process.stderr.write(`${summarizePatchResults(results).join('\n')}\n`);
@@ -422,8 +499,8 @@ async function applyPatch(
     binaryPath,
     claudeVersion: version,
     configHash,
-    patchedSize: statSync(binaryPath).size,
-    patchedSha256: sha256File(binaryPath),
+    patchedSize,
+    patchedSha256,
     backupPath: backup,
     patchedAt: new Date().toISOString(),
   };
@@ -499,12 +576,12 @@ export async function runPatchCommand(opts: { restore?: boolean; trace?: boolean
 
   try {
     // Never patch on top of a patch: whenever a pristine backup exists for this
-    // version and the live binary differs from it (stale clodex patch, an old
-    // relay-ai patch, or a lost manifest), restore the backup before patching.
+    // version and the live binary differs from it, build the candidate from the
+    // backup while leaving the working binary untouched until publication.
     const backup = pristineBackupPath(version, binaryPath);
     const restoreFirst = existsSync(backup) && sha256File(backup) !== sha256File(binaryPath);
     if (restoreFirst) {
-      p.log.info('Binary differs from its pristine backup — restoring it before patching fresh.');
+      p.log.info('Binary differs from its pristine backup — building a fresh patch candidate from it.');
     }
     const outcome = await applyPatch(binaryPath, version, desired, configHash, {
       trace: opts.trace ?? false,
