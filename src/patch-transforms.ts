@@ -20,6 +20,8 @@
 // as the identity (they still join the enum, validator, and context table, but
 // skip the resolver and /model picker patches).
 
+import { isReservedModelAlias } from './model-aliases.js';
+
 export interface PatchScriptModelEntry {
   alias?: string;
   context?: number;
@@ -76,7 +78,7 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
 
   // ---- derive helpers ------------------------------------------------------
   // alias -> model id (only for entries that define an alias)
-  const ALIAS_TO_ID: Record<string, string> = {};
+  const ALIAS_TO_ID: Record<string, string> = Object.create(null);
   // The name Claude Code knows a model by: its alias when it has one, else its
   // canonical id. This single value is used for the Agent-tool enum, the
   // known-alias validator, the /model picker value, and the context-window table,
@@ -84,9 +86,9 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // the proxy echoes back == the key its context window is stored under.
   const IDENTITIES: string[] = [];
   // identity -> human label for the /model picker (falls back at use site)
-  const DISPLAY_BY_IDENTITY: Record<string, string> = {};
+  const DISPLAY_BY_IDENTITY: Record<string, string> = Object.create(null);
   // lowercased alias AND id -> context-window tokens (only for models that set it)
-  const CONTEXT_BY_KEY: Record<string, number> = {};
+  const CONTEXT_BY_KEY: Record<string, number> = Object.create(null);
 
   const report: PatchSiteResult[] = [];
   const fail = (message: string): never => {
@@ -99,6 +101,12 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
       const a = String(spec.alias).trim().toLowerCase();
       if (!/^[a-z0-9][a-z0-9._-]*(\[1m\])?$/.test(a)) {
         fail('clodex patch: alias "' + spec.alias + '" is not a safe lowercase alias');
+      }
+      if (isReservedModelAlias(a)) {
+        fail('clodex patch: reserved alias "' + a + '" cannot be reassigned');
+      }
+      if (ALIAS_TO_ID[a] !== undefined) {
+        fail('clodex patch: alias "' + a + '" is assigned to multiple models');
       }
       ALIAS_TO_ID[a] = String(id);
       IDENTITIES.push(a);
