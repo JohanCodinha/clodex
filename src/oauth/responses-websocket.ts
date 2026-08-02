@@ -359,8 +359,16 @@ function normalizeToolCallJson(value: unknown): unknown {
   // summary alone, so it never re-emits that key and the chain head could
   // never match its own echo. An empty array carries no information; drop it
   // from both sides. A populated `content` is real data and still compared.
-  if (record.type === 'reasoning' && Array.isArray(record.content) && record.content.length === 0) {
-    delete out.content;
+  if (record.type === 'reasoning') {
+    if (Array.isArray(record.content) && record.content.length === 0) delete out.content;
+    // `encrypted_content` IS the reasoning item's identity, and the real state
+    // lives upstream under previous_response_id — the summary is display text.
+    // It also cannot survive the round trip intact: the SDK emits one reasoning
+    // part per summary part, but only the LAST part's `reasoning-end` carries the
+    // encrypted content, so the unsigned earlier blocks are dropped on the way
+    // back and a multi-part summary returns holding only its final part. Compare
+    // on the blob and a head can match its own echo.
+    if (typeof record.encrypted_content === 'string' && record.encrypted_content) delete out.summary;
   }
   return out;
 }
@@ -405,9 +413,57 @@ function reasoningNormalizationGap(expected: unknown, actual: unknown): string[]
   const right = actual as JsonObject;
   const blob = left.encrypted_content;
   if (typeof blob !== 'string' || !blob || blob !== right.encrypted_content) return undefined;
-  const fields = [...new Set([...Object.keys(left), ...Object.keys(right)])].sort()
-    .filter(key => canonicalJson(normalizeToolCallJson(left[key])) !== canonicalJson(normalizeToolCallJson(right[key])));
+  // Diff the NORMALIZED items. Diffing the raw ones names fields that
+  // normalization already reconciles, which points a reader at a red herring.
+  const normalizedLeft = normalizeToolCallJson(left) as JsonObject;
+  const normalizedRight = normalizeToolCallJson(right) as JsonObject;
+  const fields = [...new Set([...Object.keys(normalizedLeft), ...Object.keys(normalizedRight)])].sort()
+    .filter(key => canonicalJson(normalizedLeft[key]) !== canonicalJson(normalizedRight[key]));
   return fields.length ? fields : undefined;
+}
+
+/**
+ * Describes the SHAPE of a reasoning gap without recording any reasoning text.
+ *
+ * Naming the differing fields says a gap exists but not why. Two mechanisms can
+ * produce the same field list: one upstream reasoning item carrying several
+ * summary parts and coming back split into several items, or a single item that
+ * genuinely differs. Counting the summary/content elements on each side, plus how
+ * many consecutive reasoning items share this `encrypted_content`, separates them
+ * from the diagnostic log alone.
+ */
+function reasoningGapShape(
+  expected: unknown,
+  actual: unknown,
+  full: unknown[],
+  storedTail: unknown[],
+  index: number,
+): Record<string, unknown> {
+  const describe = (value: unknown) => {
+    const record = (value ?? {}) as JsonObject;
+    return {
+      keys: Object.keys(record).sort(),
+      summaryParts: Array.isArray(record.summary) ? record.summary.length : 0,
+      contentItems: Array.isArray(record.content) ? record.content.length : 0,
+    };
+  };
+  const blob = (expected as JsonObject).encrypted_content;
+  const runFrom = (items: unknown[], start: number) => {
+    let count = 0;
+    for (let at = start; at < items.length; at += 1) {
+      const item = items[at] as JsonObject | undefined;
+      if (conversationItemKind(item) !== 'reasoning' || item?.encrypted_content !== blob) break;
+      count += 1;
+    }
+    return count;
+  };
+  const storedStart = storedTail.findIndex(item => (item as JsonObject)?.encrypted_content === blob);
+  return {
+    expected: describe(expected),
+    actual: describe(actual),
+    clientReasoningRun: runFrom(full, index),
+    storedReasoningRun: storedStart < 0 ? 0 : runFrom(storedTail, storedStart),
+  };
 }
 
 const warnedReasoningGaps = new Set<string>();
@@ -446,6 +502,10 @@ function continuationMismatchDetails(
   entry: ConnectionEntry,
   payload: JsonObject,
   log?: (message: string) => void,
+  // Only the head clodex actually gave up on should reach stderr. Every candidate
+  // head is described in the diagnostic, and a gap on a head that lost to a better
+  // match costs nothing, so warning on those would overstate the damage.
+  warnOnGap = false,
 ): Record<string, unknown> {
   const full = inputArray(payload);
   const prefix = [...(entry.requestInput ?? []), ...(entry.expectedAssistant ?? [])];
@@ -460,7 +520,7 @@ function continuationMismatchDetails(
   const expected = mismatch < prefix.length ? prefix[mismatch] : undefined;
   const actual = mismatch < full.length ? full[mismatch] : undefined;
   const reasoningGap = reasoningNormalizationGap(expected, actual);
-  if (reasoningGap) warnReasoningNormalizationGap(reasoningGap, log);
+  if (reasoningGap && warnOnGap) warnReasoningNormalizationGap(reasoningGap, log);
   return {
     fullItems: full.length,
     expectedPrefixItems: prefix.length,
@@ -469,7 +529,14 @@ function continuationMismatchDetails(
     actualKind: actual === undefined ? 'none' : conversationItemKind(actual),
     ...(expected !== undefined ? { expectedHash: conversationItemHash(expected) } : {}),
     ...(actual !== undefined ? { actualHash: conversationItemHash(actual) } : {}),
-    ...(reasoningGap ? { reasoningNormalizationGap: reasoningGap } : {}),
+    ...(reasoningGap
+      ? {
+          reasoningNormalizationGap: reasoningGap,
+          reasoningGapShape: reasoningGapShape(
+            expected, actual, full, entry.expectedAssistant ?? [], mismatch,
+          ),
+        }
+      : {}),
   };
 }
 
@@ -478,7 +545,7 @@ function continuationMismatchSummary(
   payload: JsonObject,
   log?: (message: string) => void,
 ): string {
-  const details = continuationMismatchDetails(entry, payload, log);
+  const details = continuationMismatchDetails(entry, payload, log, true);
   return `full_items=${details.fullItems} expected_prefix_items=${details.expectedPrefixItems} `
     + `first_mismatch=${details.firstMismatch} expected=${details.expectedKind} actual=${details.actualKind}`;
 }
@@ -1452,6 +1519,25 @@ function createConnection(
  * Build a fetch transport backed by persistent, session-aware Responses sockets.
  * Each returned Response still represents exactly one AI SDK request.
  */
+/**
+ * Reads a connection-pool cap from the environment.
+ *
+ * Both pools are process-wide, so a workload that fans out into many concurrent
+ * subagent conversations can evict heads before their next turn arrives. An
+ * explicit option still wins, so tests are never perturbed by a stray variable.
+ * A malformed value is reported and ignored rather than silently reinterpreted.
+ */
+function envConnectionCap(name: string, log?: (message: string) => void): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const value = Number(raw.trim());
+  if (!Number.isInteger(value) || value < 1 || value > 1024) {
+    try { log?.(`ws: ignoring ${name}=${raw} (expected an integer between 1 and 1024)`); } catch { /* ignore */ }
+    return undefined;
+  }
+  return value;
+}
+
 export function createResponsesWebSocketFetch(
   wsUrl: string,
   log?: (message: string) => void,
@@ -1463,8 +1549,12 @@ export function createResponsesWebSocketFetch(
     idleTtlMs: options.idleTtlMs ?? RESPONSES_WS_IDLE_TTL_MS,
     nurseryIdleTtlMs: options.nurseryIdleTtlMs
       ?? Math.min(RESPONSES_WS_NURSERY_IDLE_TTL_MS, options.idleTtlMs ?? RESPONSES_WS_IDLE_TTL_MS),
-    maxConnections: options.maxConnections ?? RESPONSES_WS_MAX_CONNECTIONS,
-    maxNurseryConnections: options.maxNurseryConnections ?? RESPONSES_WS_MAX_NURSERY_CONNECTIONS,
+    maxConnections: options.maxConnections
+      ?? envConnectionCap('CLODEX_WS_MAX_CONNECTIONS', log)
+      ?? RESPONSES_WS_MAX_CONNECTIONS,
+    maxNurseryConnections: options.maxNurseryConnections
+      ?? envConnectionCap('CLODEX_WS_MAX_NURSERY_CONNECTIONS', log)
+      ?? RESPONSES_WS_MAX_NURSERY_CONNECTIONS,
     now: options.now ?? Date.now,
   };
 

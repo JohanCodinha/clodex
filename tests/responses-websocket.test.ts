@@ -1800,6 +1800,66 @@ describe('createResponsesWebSocketFetch', () => {
 
   const GAP_SUMMARY = [{ type: 'summary_text', text: 'weighing it' }];
 
+  it('continues when a multi-part reasoning summary comes back holding only its final part', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'reason hard' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-multi-summary',
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_multi' } })));
+    // Upstream ships ONE reasoning item carrying every summary part ...
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: {
+        type: 'reasoning', id: 'rs_1', encrypted_content: 'enc_multi', content: [], status: 'completed',
+        summary: [
+          { type: 'summary_text', text: 'part one' },
+          { type: 'summary_text', text: 'part two' },
+          { type: 'summary_text', text: 'part three' },
+        ],
+      },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 1,
+      item: {
+        type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'Read',
+        arguments: '{"path":"file.ts"}', status: 'completed',
+      },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_multi' } })));
+    await readAll(first);
+
+    // ... but Claude gets one thinking block per part and only the LAST carries
+    // the signature, so the SDK drops the unsigned ones and a single reasoning
+    // item comes back holding just the final summary part.
+    const echoedReasoning = [{
+      type: 'reasoning', encrypted_content: 'enc_multi',
+      summary: [{ type: 'summary_text', text: 'part three' }],
+    }];
+    const echoedCall = {
+      type: 'function_call', call_id: 'call_1', name: 'Read', arguments: '{"path":"file.ts"}',
+    };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_1', output: 'contents' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([...input, ...echoedReasoning, echoedCall, toolOutput])),
+    });
+
+    expect(fakeSockets).toHaveLength(1);
+    const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_multi');
+    expect(sent.input).toEqual([toolOutput]);
+    expect(diagnostics.at(-1)).toMatchObject({ event: 'ws_head_decision', decision: 'continuation' });
+    emitTextResponse(socket, 'resp_multi_next', 'done');
+    await readAll(second);
+  });
+
   it('warns on stderr when an identical reasoning item still fails the continuation match', async () => {
     const { stderr, diagnostics } = await runReasoningMismatch({
       accountId: 'acct-reasoning-gap',
@@ -1820,7 +1880,17 @@ describe('createResponsesWebSocketFetch', () => {
     const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
     expect(decision.decision).toBe('history_mismatch_new_head');
     expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
-      .toMatchObject({ reasoningNormalizationGap: ['content'] });
+      .toMatchObject({
+        reasoningNormalizationGap: ['content'],
+        // The shape record is what tells a later reader WHICH mechanism produced
+        // the gap without ever storing reasoning text.
+        reasoningGapShape: {
+          expected: { summaryParts: 1, contentItems: 1 },
+          actual: { summaryParts: 1, contentItems: 0 },
+          clientReasoningRun: 1,
+          storedReasoningRun: 1,
+        },
+      });
   });
 
   it('stays silent when the reasoning items are genuinely different reasoning', async () => {
@@ -1840,6 +1910,89 @@ describe('createResponsesWebSocketFetch', () => {
     const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
     expect((decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch)
       .not.toHaveProperty('reasoningNormalizationGap');
+  });
+
+  it('does not warn about a gap on a head that lost to a better match', async () => {
+    const stderr: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write')
+      .mockImplementation((chunk: unknown) => { stderr.push(String(chunk)); return true; });
+    try {
+      const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+      const input = [{ role: 'user', content: [{ type: 'input_text', text: 'inspect it' }] }];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-gap-not-selected',
+        onDiagnostic: event => diagnostics.push(event),
+      });
+
+      // Head 1 snapshots a reasoning item carrying content the echo will not repeat.
+      const first = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+      });
+      const socket1 = lastSocket();
+      socket1.emit('open');
+      socket1.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_h1' } })));
+      socket1.emit('message', Buffer.from(JSON.stringify({
+        type: 'response.output_item.done', output_index: 0,
+        item: {
+          type: 'reasoning', id: 'rs_1', encrypted_content: 'enc_1',
+          content: [{ type: 'reasoning_text', text: 'private' }], summary: GAP_SUMMARY,
+        },
+      })));
+      socket1.emit('message', Buffer.from(JSON.stringify({
+        type: 'response.output_item.done', output_index: 1,
+        item: {
+          type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'Read',
+          arguments: '{"path":"a.ts"}', status: 'completed',
+        },
+      })));
+      socket1.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_h1' } })));
+      await readAll(first);
+
+      const echo1 = { type: 'reasoning', encrypted_content: 'enc_1', summary: GAP_SUMMARY };
+      const call1 = { type: 'function_call', call_id: 'call_1', name: 'Read', arguments: '{"path":"a.ts"}' };
+      const out1 = { type: 'function_call_output', call_id: 'call_1', output: 'a' };
+      const turn2 = [...input, echo1, call1, out1];
+
+      // Head 1 cannot match, so this opens head 2 — and legitimately warns.
+      const second = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(turn2)),
+      });
+      const socket2 = lastSocket();
+      socket2.emit('open');
+      socket2.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_h2' } })));
+      socket2.emit('message', Buffer.from(JSON.stringify({
+        type: 'response.output_item.done', output_index: 0,
+        item: {
+          type: 'function_call', id: 'fc_2', call_id: 'call_2', name: 'Read',
+          arguments: '{"path":"b.ts"}', status: 'completed',
+        },
+      })));
+      socket2.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_h2' } })));
+      await readAll(second);
+      expect(stderr.join('')).toContain('identical encrypted_content');
+
+      // Clear the dedupe so a stray warning on this next turn would be visible.
+      resetReasoningGapWarningsForTests();
+      stderr.length = 0;
+
+      const call2 = { type: 'function_call', call_id: 'call_2', name: 'Read', arguments: '{"path":"b.ts"}' };
+      const out2 = { type: 'function_call_output', call_id: 'call_2', output: 'b' };
+      const third = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...turn2, call2, out2])),
+      });
+
+      const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
+      expect(decision.decision).toBe('continuation');
+      // Head 1 still carries the gap in the diagnostic record ...
+      expect((decision.heads as { mismatch: Record<string, unknown> }[])
+        .some(head => head.mismatch.reasoningNormalizationGap !== undefined)).toBe(true);
+      // ... but nothing was lost, so the terminal stays quiet.
+      expect(stderr.join('')).toBe('');
+      emitTextResponse(lastSocket(), 'resp_h2_next', 'done');
+      await readAll(third);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it('reports a repeated reasoning gap once rather than on every turn', async () => {
@@ -2353,6 +2506,76 @@ describe('createResponsesWebSocketFetch', () => {
         reason: 'nursery_lru_cap',
       }],
     });
+  });
+
+  // Both pools are process-wide, so a subagent-heavy workload can need more than
+  // the defaults. Drives the nursery cap because it is the cheaper one to fill.
+  async function fillTwoNurseryHeads(accountId: string): Promise<ResponsesWebSocketDiagnosticEvent[]> {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId,
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    for (const root of ['root one', 'root two']) {
+      const response = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload([{ role: 'user', content: [{ type: 'input_text', text: root }] }])),
+      });
+      const socket = lastSocket();
+      socket.emit('open');
+      emitTextResponse(socket, `resp_${root.replace(' ', '_')}`, 'ok');
+      await readAll(response);
+    }
+    return diagnostics;
+  }
+
+  const lastEvictions = (diagnostics: ResponsesWebSocketDiagnosticEvent[]) =>
+    (diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!.evictions ?? []) as
+      Record<string, unknown>[];
+
+  it('honors CLODEX_WS_MAX_NURSERY_CONNECTIONS', async () => {
+    process.env.CLODEX_WS_MAX_NURSERY_CONNECTIONS = '1';
+    try {
+      expect(lastEvictions(await fillTwoNurseryHeads('acct-env-nursery-cap')))
+        .toMatchObject([{ reason: 'nursery_lru_cap' }]);
+    } finally {
+      delete process.env.CLODEX_WS_MAX_NURSERY_CONNECTIONS;
+    }
+  });
+
+  it('ignores a malformed connection cap rather than reinterpreting it', async () => {
+    process.env.CLODEX_WS_MAX_NURSERY_CONNECTIONS = 'lots';
+    try {
+      // Falls back to the default of 8, so two heads coexist without eviction.
+      expect(lastEvictions(await fillTwoNurseryHeads('acct-env-nursery-bad'))).toEqual([]);
+    } finally {
+      delete process.env.CLODEX_WS_MAX_NURSERY_CONNECTIONS;
+    }
+  });
+
+  it('lets an explicit option outrank the environment', async () => {
+    process.env.CLODEX_WS_MAX_NURSERY_CONNECTIONS = '1';
+    try {
+      const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-env-nursery-override',
+        maxNurseryConnections: 8,
+        onDiagnostic: event => diagnostics.push(event),
+      });
+      for (const root of ['root one', 'root two']) {
+        const response = await wsFetch('https://x', {
+          method: 'POST', headers: {},
+          body: JSON.stringify(sessionPayload([{ role: 'user', content: [{ type: 'input_text', text: root }] }])),
+        });
+        const socket = lastSocket();
+        socket.emit('open');
+        emitTextResponse(socket, `resp_ovr_${root.replace(' ', '_')}`, 'ok');
+        await readAll(response);
+      }
+      expect(lastEvictions(diagnostics)).toEqual([]);
+    } finally {
+      delete process.env.CLODEX_WS_MAX_NURSERY_CONNECTIONS;
+    }
   });
 
   it('partitions by provider, account, model, effort, session, and credential fingerprint', () => {
