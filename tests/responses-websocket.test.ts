@@ -1575,6 +1575,320 @@ describe('createResponsesWebSocketFetch', () => {
     await readAll(second);
   });
 
+  it('continues a tool loop when the echoed arguments were sanitized of null filler', async () => {
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'read it back' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-null-filler' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_null' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_n', name: 'Read', arguments: '{"path":"file.ts","offset":null}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_null' } })));
+    await readAll(first);
+
+    // The translation layer drops the null-valued `offset` before the call
+    // reaches the client, so the echo is strictly smaller than the raw
+    // upstream arguments. The snapshot must hold the sanitized shape or the
+    // head can never match its own echo.
+    const echoedCall = { type: 'function_call', call_id: 'call_n', name: 'Read', arguments: '{"path":"file.ts"}' };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_n', output: 'contents' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput])),
+    });
+    const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_null');
+    expect(sent.input).toEqual([toolOutput]);
+    emitTextResponse(socket, 'resp_null_done', 'done');
+    await readAll(second);
+  });
+
+  it('continues when a non-required empty array was sanitized from the echoed arguments', async () => {
+    const tools = [{
+      type: 'function', name: 'WebSearch',
+      parameters: {
+        type: 'object',
+        properties: { query: { type: 'string' }, allowed_domains: { type: 'array' } },
+        required: ['query'],
+      },
+    }];
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'search' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-empty-array' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools })),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_arr' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_a', name: 'WebSearch', arguments: '{"query":"q","allowed_domains":[]}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_arr' } })));
+    await readAll(first);
+
+    const echoedCall = { type: 'function_call', call_id: 'call_a', name: 'WebSearch', arguments: '{"query":"q"}' };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_a', output: 'results' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput], { tools })),
+    });
+    const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_arr');
+    expect(sent.input).toEqual([toolOutput]);
+    emitTextResponse(socket, 'resp_arr_done', 'done');
+    await readAll(second);
+  });
+
+  it('keeps a required empty array in the snapshot and still continues', async () => {
+    const tools = [{
+      type: 'function', name: 'TodoWrite',
+      parameters: {
+        type: 'object',
+        properties: { todos: { type: 'array' } },
+        required: ['todos'],
+      },
+    }];
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'clear todos' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-required-array' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools })),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_req' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_r', name: 'TodoWrite', arguments: '{"todos":[]}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_req' } })));
+    await readAll(first);
+
+    // A required empty array survives sanitization on the way to the client,
+    // so the echo carries it and the snapshot must keep it too.
+    const echoedCall = { type: 'function_call', call_id: 'call_r', name: 'TodoWrite', arguments: '{"todos":[]}' };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_r', output: 'cleared' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput], { tools })),
+    });
+    const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_req');
+    expect(sent.input).toEqual([toolOutput]);
+    emitTextResponse(socket, 'resp_req_done', 'done');
+    await readAll(second);
+  });
+
+  it('starts a new chain when the echoed call differs in a meaningful argument value', async () => {
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'read it back' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-real-diff' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_diff' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_d', name: 'Read', arguments: '{"path":"file.ts"}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_diff' } })));
+    await readAll(first);
+
+    // A genuinely different argument value is a divergent history, not a
+    // sanitized echo: it must be rejected, or the chain would silently
+    // continue a conversation the server never had.
+    const divergedCall = { type: 'function_call', call_id: 'call_d', name: 'Read', arguments: '{"path":"other.ts"}' };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_d', output: 'contents' };
+    const fullInput = [...input, divergedCall, toolOutput];
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(fullInput)),
+    });
+    const isolated = lastSocket();
+    expect(isolated).not.toBe(socket);
+    isolated.emit('open');
+    const sent = JSON.parse(isolated.send.mock.calls[0]![0] as string);
+    expect(sent.previous_response_id).toBeUndefined();
+    expect(sent.input).toEqual(fullInput);
+    emitTextResponse(isolated, 'resp_diff_new', 'done');
+    await readAll(second);
+  });
+
+  it('starts a new chain when the echoed call carries a different call_id', async () => {
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'read it back' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-callid-diff' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_cid' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_c1', name: 'Read', arguments: '{"path":"file.ts"}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_cid' } })));
+    await readAll(first);
+
+    const divergedCall = { type: 'function_call', call_id: 'call_c2', name: 'Read', arguments: '{"path":"file.ts"}' };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_c2', output: 'contents' };
+    const fullInput = [...input, divergedCall, toolOutput];
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(fullInput)),
+    });
+    const isolated = lastSocket();
+    expect(isolated).not.toBe(socket);
+    isolated.emit('open');
+    const sent = JSON.parse(isolated.send.mock.calls[0]![0] as string);
+    expect(sent.previous_response_id).toBeUndefined();
+    expect(sent.input).toEqual(fullInput);
+    emitTextResponse(isolated, 'resp_cid_new', 'done');
+    await readAll(second);
+  });
+
+  it.each([['', 'empty'], ['   ', 'whitespace']])(
+    'continues a zero-argument tool call whose blank (%#) arguments string is echoed as {}',
+    async (blank, tag) => {
+      const input = [{ role: 'user', content: [{ type: 'input_text', text: 'ping' }] }];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: `acct-blank-${tag}` });
+      const first = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+      });
+      const socket = lastSocket();
+      socket.emit('open');
+      socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: `resp_blank_${tag}` } })));
+      socket.emit('message', Buffer.from(JSON.stringify({
+        type: 'response.output_item.done', output_index: 0,
+        item: { type: 'function_call', call_id: `call_b_${tag}`, name: 'Ping', arguments: blank },
+      })));
+      socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: `resp_blank_${tag}` } })));
+      await readAll(first);
+
+      // The client-side SDK parses a blank arguments string as `{}`, so the
+      // echo for a zero-argument tool (common for MCP tools) comes back as
+      // `"{}"`. A raw-`""` snapshot would lose the chain with the same
+      // tail-index signature as #84.
+      const echoedCall = { type: 'function_call', call_id: `call_b_${tag}`, name: 'Ping', arguments: '{}' };
+      const toolOutput = { type: 'function_call_output', call_id: `call_b_${tag}`, output: 'pong' };
+      const second = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput])),
+      });
+      const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+      expect(sent.previous_response_id).toBe(`resp_blank_${tag}`);
+      expect(sent.input).toEqual([toolOutput]);
+      emitTextResponse(socket, `resp_blank_${tag}_done`, 'done');
+      await readAll(second);
+    },
+  );
+
+  describe('mismatch diagnostics', () => {
+    /** Build a head, then replay a history that diverges at the tool call's
+     * argument value, and capture every debug line the transport emits. */
+    async function runValueMismatch(opts: {
+      accountId: string;
+      headArguments?: string;
+      replayItems?: (input: unknown[]) => unknown[];
+    }): Promise<string[]> {
+      const lines: string[] = [];
+      const input = [{ role: 'user', content: [{ type: 'input_text', text: 'read it back' }] }];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, message => lines.push(message), {
+        accountId: opts.accountId,
+      });
+      const first = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+      });
+      const socket = lastSocket();
+      socket.emit('open');
+      socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_dump' } })));
+      socket.emit('message', Buffer.from(JSON.stringify({
+        type: 'response.output_item.done', output_index: 0,
+        item: {
+          type: 'function_call', call_id: 'call_dump', name: 'Read',
+          arguments: opts.headArguments ?? '{"path":"expected.ts"}',
+        },
+      })));
+      socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_dump' } })));
+      await readAll(first);
+
+      const replay = opts.replayItems
+        ? opts.replayItems(input)
+        : [
+            ...input,
+            { type: 'function_call', call_id: 'call_dump', name: 'Read', arguments: '{"path":"actual.ts"}' },
+            { type: 'function_call_output', call_id: 'call_dump', output: 'contents' },
+          ];
+      const second = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(replay)),
+      });
+      const isolated = lastSocket();
+      expect(isolated).not.toBe(socket);
+      isolated.emit('open');
+      emitTextResponse(isolated, 'resp_dump_new', 'done');
+      await readAll(second);
+      return lines;
+    }
+
+    it('appends both item hashes to the mismatch summary line', async () => {
+      const lines = await runValueMismatch({ accountId: 'acct-diag-hashes' });
+      const summary = lines.find(line => line.includes('history mismatch starting an additional chain'));
+      expect(summary).toMatch(/expected_hash=[0-9a-f]{16} actual_hash=[0-9a-f]{16}/);
+    });
+
+    it('writes no dump lines unless CLODEX_MISMATCH_DUMP=1 is set', async () => {
+      const lines = await runValueMismatch({ accountId: 'acct-diag-gated' });
+      expect(lines.some(line => line.includes('mismatch dump'))).toBe(false);
+    });
+
+    it('dumps both divergent items in canonical bytes when opted in', async () => {
+      process.env.CLODEX_MISMATCH_DUMP = '1';
+      try {
+        const lines = await runValueMismatch({ accountId: 'acct-diag-dump' });
+        const expectedLine = lines.find(line => line.includes('mismatch dump expected['));
+        const actualLine = lines.find(line => line.includes('mismatch dump actual['));
+        expect(expectedLine).toContain('expected.ts');
+        expect(actualLine).toContain('actual.ts');
+      } finally {
+        delete process.env.CLODEX_MISMATCH_DUMP;
+      }
+    });
+
+    it('caps a dump line at 2000 characters with a truncation marker', async () => {
+      process.env.CLODEX_MISMATCH_DUMP = '1';
+      try {
+        const lines = await runValueMismatch({
+          accountId: 'acct-diag-cap',
+          headArguments: JSON.stringify({ path: 'expected.ts', blob: 'x'.repeat(5_000) }),
+        });
+        const expectedLine = lines.find(line => line.includes('mismatch dump expected['))!;
+        const dumped = expectedLine.slice(expectedLine.indexOf(']: ') + 3);
+        expect(dumped).toHaveLength(2_000);
+        expect(dumped.endsWith(' [truncated]')).toBe(true);
+      } finally {
+        delete process.env.CLODEX_MISMATCH_DUMP;
+      }
+    });
+
+    it('renders (absent) for a side whose history ends before the divergence', async () => {
+      process.env.CLODEX_MISMATCH_DUMP = '1';
+      try {
+        // The client replays a truncated history (a rewind): every comparable
+        // item matches, so the divergence is the head simply being longer.
+        const lines = await runValueMismatch({
+          accountId: 'acct-diag-absent',
+          replayItems: input => input,
+        });
+        const expectedLine = lines.find(line => line.includes('mismatch dump expected['));
+        const actualLine = lines.find(line => line.includes('mismatch dump actual['));
+        expect(expectedLine).toContain('expected.ts');
+        expect(actualLine).toContain('(absent)');
+      } finally {
+        delete process.env.CLODEX_MISMATCH_DUMP;
+      }
+    });
+  });
+
   it('validates encrypted reasoning and exact assistant text before continuing', async () => {
     const input = [{ role: 'user', content: [{ type: 'input_text', text: 'reason' }] }];
     const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-reasoning' });
