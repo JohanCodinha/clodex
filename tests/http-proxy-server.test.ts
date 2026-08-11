@@ -133,6 +133,54 @@ function adapterRequestWithResponseEvents(
   }) as unknown as typeof http.request;
 }
 
+/**
+ * Start the proxy with `route`, send one /v1/messages, and return the parsed
+ * inference-log records. Used to assert what the DIAGNOSTIC records, at the
+ * real call site — a helper that recomputes the call site's condition would
+ * pass just as happily with the condition deleted.
+ */
+async function requestLogEntriesForRoute(
+  logName: string,
+  route: Record<string, unknown>,
+): Promise<Array<Record<string, unknown>>> {
+  const certificates = ensureHttpProxyCertificates();
+  const inferenceLogPath = join(testHome, logName);
+  const proxy = await startHttpProxy({
+    routes: [route as never],
+    adapterHandle: { port: 1, token: 'adapter-local-token', close: () => {} },
+    inferenceLogPath,
+  });
+  try {
+    const body = JSON.stringify({
+      model: route.aliasId,
+      messages: [{ role: 'user', content: 'tier probe' }],
+    });
+    const secure = await connectMitm(proxy.port, certificates.caCert);
+    secure.resume();
+    secure.write([
+      'POST /v1/messages HTTP/1.1',
+      'Host: api.anthropic.com',
+      'Content-Type: application/json',
+      `Content-Length: ${Buffer.byteLength(body)}`,
+      'Connection: close',
+      '',
+      '',
+    ].join('\r\n') + body);
+    await new Promise<void>(resolve => {
+      secure.once('close', () => resolve());
+      secure.once('error', () => resolve());
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    return readFileSync(inferenceLogPath, 'utf8')
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map(line => JSON.parse(line) as Record<string, unknown>);
+  } finally {
+    await proxy.close();
+  }
+}
+
 async function adapterResponseFailureEntries(
   logName: string,
   emitEvents: (response: http.IncomingMessage) => void,
@@ -1688,4 +1736,107 @@ describe('selective HTTP proxy', () => {
       }),
     ]);
   }, 20_000);
+
+  it('records the resolved service tier for the route that carries one', async () => {
+    // The diagnostic records the tier clodex resolved for the selected route
+    // before dispatch; it deliberately does not claim wire transmission.
+    const previous = process.env['CLODEX_SERVICE_TIER'];
+    process.env['CLODEX_SERVICE_TIER'] = 'fast';
+    try {
+      const entries = await requestLogEntriesForRoute('tier-oauth-inference.jsonl', {
+        aliasId: 'clodex:openai-oauth:gpt-5.6-sol',
+        realModelId: 'gpt-5.6-sol',
+        displayName: 'Sol',
+        upstreamUrl: '',
+        apiKey: 'oauth-token',
+        modelFormat: 'openai' as const,
+        npm: '@ai-sdk/openai',
+        authType: 'oauth',
+        providerId: 'openai-oauth',
+      });
+      const request = entries.find(entry => entry.route === 'translated');
+      expect(request).toBeTruthy();
+      // Record the resolved request vocabulary: `fast` is the Codex CLI's
+      // spelling and `priority` is the tier clodex asks the SDK to serialize.
+      expect(request!.serviceTier).toBe('priority');
+    } finally {
+      if (previous === undefined) delete process.env['CLODEX_SERVICE_TIER'];
+      else process.env['CLODEX_SERVICE_TIER'] = previous;
+    }
+  });
+
+  it('requires both OAuth auth and the OpenAI SDK route before recording a tier', async () => {
+    const previous = process.env['CLODEX_SERVICE_TIER'];
+    process.env['CLODEX_SERVICE_TIER'] = 'fast';
+    try {
+      const oneFieldNegatives = [
+        {
+          logName: 'tier-api-key-negative-inference.jsonl',
+          route: {
+            aliasId: 'clodex:openai:gpt-5.6-sol',
+            realModelId: 'gpt-5.6-sol',
+            displayName: 'API-key Sol',
+            upstreamUrl: '',
+            apiKey: 'synthetic-api-key',
+            modelFormat: 'openai' as const,
+            npm: '@ai-sdk/openai',
+            authType: 'api' as const,
+            providerId: 'openai',
+          },
+        },
+        {
+          logName: 'tier-compatible-oauth-negative-inference.jsonl',
+          route: {
+            aliasId: 'clodex:compatible-oauth:gpt-5.6-sol',
+            realModelId: 'gpt-5.6-sol',
+            displayName: 'Compatible OAuth Sol',
+            upstreamUrl: '',
+            apiKey: 'synthetic-oauth-token',
+            modelFormat: 'openai' as const,
+            npm: '@ai-sdk/openai-compatible',
+            authType: 'oauth' as const,
+            providerId: 'compatible-oauth',
+          },
+        },
+      ];
+
+      for (const fixture of oneFieldNegatives) {
+        const entries = await requestLogEntriesForRoute(fixture.logName, fixture.route);
+        const request = entries.find(entry => entry.route === 'translated');
+        expect(request, fixture.logName).toBeTruthy();
+        expect(request!.serviceTier, fixture.logName).toBeUndefined();
+      }
+    } finally {
+      if (previous === undefined) delete process.env['CLODEX_SERVICE_TIER'];
+      else process.env['CLODEX_SERVICE_TIER'] = previous;
+    }
+  });
+
+  it('records no service tier on a route that cannot carry one', async () => {
+    // OAuth-only: API-key OpenAI is excluded because `priority` there is a
+    // billable surcharge, and other providers never see it. A log claiming a
+    // tier on those routes would be inventing one.
+    const previous = process.env['CLODEX_SERVICE_TIER'];
+    process.env['CLODEX_SERVICE_TIER'] = 'fast';
+    try {
+      const entries = await requestLogEntriesForRoute('tier-compatible-inference.jsonl', {
+        aliasId: 'clodex:opencode-go:kimi-k3',
+        realModelId: 'kimi-k3',
+        displayName: 'Kimi K3',
+        upstreamUrl: '',
+        apiKey: 'go-key',
+        modelFormat: 'openai' as const,
+        npm: '@ai-sdk/openai-compatible',
+        authType: 'api',
+        providerId: 'opencode-go',
+      });
+      const request = entries.find(entry => entry.route === 'translated');
+      expect(request).toBeTruthy();
+      expect(request!.serviceTier).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env['CLODEX_SERVICE_TIER'];
+      else process.env['CLODEX_SERVICE_TIER'] = previous;
+    }
+  });
+
 });
