@@ -28,7 +28,7 @@ import { spawn } from 'node:child_process';
 import { accessSync, constants as fsConstants, statSync } from 'node:fs';
 import { constants as osConstants } from 'node:os';
 import { OAUTH_ACCOUNT_ENV } from './oauth-account-selection.js';
-import { findClaudeBinary } from './launch.js';
+import { findClaudeBinary } from './claude-binary.js';
 import { waitForTcpListenerCandidate } from './listener-ready.js';
 import {
   orderWrapperServerCandidates,
