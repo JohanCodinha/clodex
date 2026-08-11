@@ -1,145 +1,205 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for coding agents and maintainers working in this repo. Read this file in full; load the
+deeper documents below only when you touch the subsystem they cover.
 
-**clodex** bridges Claude Code to OpenAI models — OpenAI API key (`openai`) or ChatGPT/Codex-plan OAuth (`openai-oauth`). It is a trimmed fork of relay-ai (full commit history preserved). Prime directive of the fork applies to future work too: the translation, caching, auto-compaction, and OAuth-continuation code took extensive real-world testing — prefer surgical changes over restructuring.
+**clodex** bridges Claude Code to OpenAI models — OpenAI API key (`openai`) or ChatGPT/Codex-plan
+OAuth (`openai-oauth`). It is a trimmed fork of relay-ai (full commit history preserved).
 
-## Release workflow
+**Prime directive.** The translation, caching, auto-compaction, and OAuth-continuation code encodes
+real production failures that are not visible in the diff. Prefer surgical changes over
+restructuring.
 
-Releases are managed by release-please from conventional commits. Write conventional commits, then push or merge them to `main`. The workflow has two jobs: a `test` job (typecheck + tests + build on Node 24 with pnpm) runs first on every push, and the `release` job `needs: test` — so nothing is tagged on a red build. release-please maintains a release PR that accumulates the generated changelog and `package.json` version bump; merging that release PR creates the `vX.Y.Z` tag and GitHub Release, then the release job rebuilds `dist/` and **stages** the npm release via trusted publishing (OIDC, `id-token: write` — no npm secret anywhere) with `npm stage publish`. (Tests gating the tag matters: an earlier design ran tests *after* release-please tagged, so a flaky test left a dangling `v1.0.1` tag with nothing on npm — the tag-then-test ordering is fixed.) Nothing goes live from CI: a maintainer must approve the staged version with 2FA — npmjs.com → package → "Staged Packages" tab → Approve, or `npm stage approve <stage-id>` (inspect first with `npm stage list` / `npm stage view` / `npm stage download`). **Do NOT run `npm publish` locally.** Manually pushing a `v*` tag no longer publishes anything; `.github/workflows/release-please.yml` is the only release path.
+## Where everything lives
 
-The release and commitlint CI jobs are guarded by `if: vars.CLODEX_PUBLISH_ENABLED == 'true'`. One-time setup in the dedicated repo (github.com/bman654/clodex): (1) the `@bman654/clodex` package (scoped — npm's name-similarity guard rejects unscoped `clodex`; `publishConfig.access: public` keeps publishes public) was created by a one-time manual `npm publish` of 0.1.0 from the repo (neither trusted publishing nor staging can do a package's *first* publish) — the sole exception to the no-local-publish rule, with the commit tagged `v0.1.0` and the release-please manifest set to `0.1.0` so the next release PR proposes 0.1.1+, (2) on npmjs.com configure the package's Trusted Publisher: GitHub Actions, owner `bman654`, repo `clodex`, workflow filename `release-please.yml`, and select the staging/publish action it offers, (3) set repository variable `CLODEX_PUBLISH_ENABLED=true`. No npm token secret is needed. The release workflow deliberately publishes in the release-please job because a tag created by the default `GITHUB_TOKEN` does not trigger another workflow.
+| Load this | When |
+| --- | --- |
+| `.claude/skills/pr-verification/SKILL.md` | Preparing a change: the bar it must clear before you open the PR. |
+| `.claude/skills/pr-review/SKILL.md` | Reviewing someone else's PR: panels, proof techniques, verdicts, merging. |
+| `.claude/docs/claude-code-internals.md` | Before asserting how Claude Code itself behaves, or re-deriving it. |
+| `.claude/docs/patcher.md` | Changing `clodex patch`, patch transforms, or backups. |
+| `.claude/docs/oauth-continuation.md` | Changing `src/oauth/`, head matching, upstream retries, WS diagnostics. |
+| `.claude/docs/translation.md` | Changing `sdk-adapter.ts`, `provider-factory.ts`, `openai-adapter.ts`. |
+| `.claude/docs/launch-and-wrapper.md` | Changing launch, bridge modes, env, server discovery, `clodex-claude`, outbound proxy. |
+| `.claude/docs/registry-and-server.md` | Changing `src/registry/`, `src/server/`, model or alias resolution. |
+| `CONTRIBUTING.md` | Outside contributors: how to scope a PR. |
+| `RELEASING.md` | Maintainers: how a release is cut and staged. |
 
-**Commit cheat sheet:** `feat:` adds a feature, `fix:` fixes behavior, and `build:`, `ci:`, `docs:`, or `chore:` cover non-feature maintenance. Add `!` after the type/scope (for example `feat!:`) or a `BREAKING CHANGE:` footer for an incompatible change. Commitlint enforces this locally through Husky's `commit-msg` hook and in CI for pull-request/push commit ranges. Husky v9 was chosen for its small, standard `prepare`-based pnpm integration; setup exits successfully when `.git` is unavailable, so CI/non-git installs are not broken.
+`.agents` is a committed symlink to `.claude`, so harnesses that look for `.agents/` find the same
+skills and docs.
 
-Version baseline: **0.1.0 was published manually** (see one-time setup above), so `.release-please-manifest.json` records `0.1.0`, the `v0.1.0` tag marks the released commit, and release-please's first PR proposes 0.1.1+ from commits after that tag. `bootstrap-sha` (a fallback used only if the release tag is missing) also fences off the inherited relay-ai/fork history so pre-fork commits are never scanned. Release-please's changelog updater prepends generated entries above the existing hand-written 0.1.0 fork entry, preserving that content rather than replacing it.
-
-Before 1.0, `bump-patch-for-minor-pre-major` makes `feat:` bump patch, ordinary `fix:` also bumps patch, and `bump-minor-pre-major` makes `!`/`BREAKING CHANGE` bump minor (for example 0.1.x → 0.2.0). Once local testing is satisfactory, land a commit on `main` whose body contains `Release-As: 1.0.0` on its own line; the next release PR proposes exactly 1.0.0, then normal conventional-commit bumping resumes.
-
-`package.json` is the single source of truth for the version (`src/constants.ts::VERSION` reads `pkg.version`). Never hardcode a version string anywhere. `dist/` is gitignored — `prepublishOnly` and release CI rebuild it; never commit build output.
-
-## Toolchain
-
-Development targets **Node 24** (`.nvmrc` pins v24.14.1; CI runs Node 24) while the published package still supports **Node >= 22** (`engines.node`) — don't use APIs newer than Node 22 in `src/`. Dev package manager is **pnpm**, pinned via `packageManager: "pnpm@10.34.5"` in package.json and activated with corepack (`corepack enable`). Dependencies are **exact-pinned** (no `^`/`~`). `pnpm-workspace.yaml` (pnpm 10's settings file) sets `minimumReleaseAge: 14400` — no direct or transitive dependency version younger than 10 days (value in minutes) can be resolved; already-locked versions install fine, but fresh resolution of a too-new version fails with `ERR_PNPM_NO_MATURE_MATCHING_VERSION`. End users still install with `npm install -g @bman654/clodex` — the dev PM does not affect consumers.
-
-## Commands
+## Toolchain and commands
 
 ```bash
-pnpm build          # compile TypeScript → dist/cli.js (tsup, ESM, shebang injected)
-pnpm test           # vitest
-pnpm typecheck      # tsc --noEmit
-pnpm dev            # watch mode
+corepack enable          # activates the pinned pnpm version
+pnpm install
+pnpm build               # compile TypeScript → dist/cli.js (tsup, ESM, shebang injected)
+pnpm test                # vitest
+pnpm typecheck           # tsc --noEmit
+pnpm dev                 # watch mode
 
-pnpm vitest run tests/patcher.test.ts   # single test file
+pnpm vitest run tests/patcher.test.ts    # a single test file
 
 # Manual testing (after pnpm build; npm link once)
-clodex --help
 clodex claude --dry-run     # full wizard, preview instead of launch, no writes
 clodex claude --trace       # debug logs to ~/.clodex/logs/
 clodex models --list        # print clodex:<provider>:<model> names + aliases
-clodex patch                # patch the Claude Code binary (see Patcher below)
+clodex patch                # patch the Claude Code binary
 clodex server               # foreground gateway
+clodex providers            # provider registry management
 clodex-claude [args...]     # second bin: launch claude bridged to a running clodex server
 ```
 
-**`claude -p` end-to-end tests are manual only — NEVER add them to the automated test suite.**
+Before opening a PR run `pnpm typecheck && pnpm test && pnpm build` — the same three the `CI / test`
+job runs on every pull request. Passing them is necessary and never sufficient; see the
+pr-verification skill.
 
-## Architecture
+Development targets **Node 24** (`.nvmrc` pins v24.14.1; CI runs 24) while the published package
+supports **Node >= 22** (`engines.node`) — don't use APIs newer than Node 22 in `src/`. Dev package
+manager is **pnpm**, pinned via `packageManager: "pnpm@10.34.5"` and activated with corepack.
+Dependencies are **exact-pinned** (no `^`/`~`). `pnpm-workspace.yaml` sets
+`minimumReleaseAge: 14400` (minutes) — no **direct or transitive** dependency version younger than
+10 days can be resolved; already-locked versions install fine, but fresh resolution of a too-new
+version fails with `ERR_PNPM_NO_MATURE_MATCHING_VERSION`. End users install with
+`npm install -g @bman654/clodex`; the dev package manager does not affect consumers.
 
-**Entry points:** `src/cli.ts` — arg parsing (`parseArgs`, `consumeBridgeModeFlag`), help texts, and dispatch for `claude`, `server`, `models`/`favorites`, `providers`, `patch` — and `src/claude-wrapper.ts` (the `clodex-claude` bin, see below). Every other module is a focused unit with no side effects at import time.
+Use `CLODEX_HOME=$(mktemp -d)` to exercise the CLI against throwaway config instead of your real
+`~/.clodex`.
 
-**Two bridge modes** (both `clodex claude` and `clodex server`):
+## Commit messages
 
-- **endpoint** — local Anthropic-format gateway (`src/proxy.ts` for the claude launch path, `src/server/` for the standalone gateway); the child gets `ANTHROPIC_BASE_URL` via `buildChildEnv()` (`src/env.ts`). With favorites, `startProxyCatalog()` serves a multi-route catalog and Claude Code's `/model` menu lists starting model + favorites.
-- **proxy** — selective MITM of `api.anthropic.com` (`src/http-proxy/`): Claude Code keeps its normal Anthropic auth; request model ids matching `clodex:{provider}:{model}` (prefix constant `HTTP_PROXY_MODEL_PREFIX` in `src/http-proxy/routes.ts`) or saved aliases (`src/model-aliases.ts`) route to OpenAI; everything else passes through untouched.
+Conventional Commits, enforced by commitlint (Husky `commit-msg` hook locally, and in CI on every
+pull request).
 
-**Bridge-mode defaults:** `resolveBridgeMode(command, explicit, {persist})` in `src/config.ts` — `claudeBridgeMode`/`serverBridgeMode` prefs. An explicit `--endpoint`/`--proxy` applies to that run only and is **never auto-persisted**; persisting requires the explicit `--save-mode` flag alongside a mode flag (`--save-mode` alone is an arg-parse error). With no flag and nothing saved, both commands default to **proxy** (works with the user's existing Claude auth; non-TTY gets the same default without prompting). `--dry-run` never persists. The former `--http-proxy` alias is removed — `--proxy` is the only spelling.
+| Prefix | Use for |
+| --- | --- |
+| `feat:` | adds a feature |
+| `fix:` | fixes behavior |
+| `docs:` | documentation only |
+| `test:` | tests only |
+| `refactor:` | no behavior change |
+| `build:` / `ci:` / `chore:` | maintenance |
 
-**Server discovery + `clodex-claude` wrapper** (`src/server-runtime.ts`, `src/wrapper-env.ts`, `src/claude-wrapper.ts`): the standalone `clodex server` command (both modes) registers itself in `~/.clodex/server-runtime.json` — an ARRAY of `{mode, port, pid, caPath (proxy only), startedAt}` records, one per running server, keyed by pid — after a successful start and removes ONLY its own record on SIGINT/SIGTERM, so a proxy server and an endpoint server can be advertised simultaneously without clobbering each other. The legacy single-object file shape is tolerated on read (wrapped as a one-element list). Read-modify-write cycles are serialized by `~/.clodex/server-runtime.lock` (same pid + staleness + ESRCH-liveness pattern as the patcher's `patch.lock`, 10s staleness; after a short bounded wait a writer proceeds lockless rather than losing its registration) and the file is replaced atomically (temp + rename). `clodex server --no-discovery` (or `CLODEX_NO_DISCOVERY=1`) opts a server out of registration entirely — e.g. an endpoint server used only as a local OpenAI-compatible API that must never co-opt wrapper discovery; the per-session MITM spawned by `clodex claude --proxy` never writes the file either. Stale detection is the READER's job: readers reject malformed records and dead pids (`kill(pid,0)`, EPERM counts as alive); writers additionally prune dead-pid records under the lock. The second bin `clodex-claude` (`dist/claude-wrapper.js`) serves both the `CLAUDE_CODE_PROCESS_WRAPPER` contract (executable first arg = claude binary path, rest passed through) and direct terminal use (binary discovered like `clodex claude`, honoring `CLODEX_CLAUDE_PATH`); it selects among live records with a deterministic policy (`orderWrapperServerCandidates`): **proxy mode preferred over endpoint** (bridging keeps Claude Code's own Anthropic auth), newest `startedAt` breaking ties within a mode. One concurrent TCP probe round covers every ordered candidate, and the highest-priority candidate that answers wins. When none answers, only probes that time out are retried under one shared 500ms deadline; definitive connection errors fail immediately. Registration happens after `listenTcpServer` confirms reachability, so a loopback refusal does not need a retry. The wrapper then launches claude with proxy env + CA (proxy-mode server), `ANTHROPIC_BASE_URL` + local API key (endpoint-mode server), or an untouched env when no live server is found — a down server must never break launching claude. Env computation is the pure `computeWrapperEnv`. **The wrapper must `exec` into claude (`process.execve`), never spawn it as a child.** Claude Code starts each background pty host with `detached: true` so the process it spawns leads its own process group, then delivers terminal resizes to that group via `process.kill(-process.pid, 'SIGWINCH')`; a wrapper that parents claude keeps the group-leader role, claude's pid stops matching its group id, the signal dies as ESRCH inside Claude Code's silent catch, and background sessions freeze at their startup size (interactive sessions hide this — there the kernel delivers SIGWINCH through the controlling terminal). `execve` is POSIX-only and needs Node 22.15, so Windows and older 22.x keep a spawn fallback; it also **aborts the process on syscall failure instead of throwing**, which is why the binary is re-checked immediately before the call rather than relied on to fall back. Any shell launcher in front of the wrapper must `exec` for the same reason. **Keep the wrapper tiny and its imports minimal — it runs for every spawned agent process.** Setup doc: `docs/background-agents.md` (shipped in the npm tarball via the `docs` entry in package.json `files`).
+Add `!` after the type (`feat!:`) or a `BREAKING CHANGE:` footer for an incompatible change.
+Hard-wrap bodies and footers at **≤100 characters per line** — commitlint's `body-max-line-length`
+is enforced by the hook and again on every push to `main`.
 
-**Translation layer** (`src/sdk-adapter.ts` + `src/provider-factory.ts`): Anthropic `/v1/messages` ↔ Vercel AI SDK, one turn per request (Claude Code owns the tool loop). This is the **single** translation path — no hand-rolled per-provider translation. Preserved hard-won behavior:
+**Your summary line is the release note.** Changelog entries are generated from commit summary
+headers. Release-please renders `type(scope): summary` as a bullet with the scope bolded and
+issue/commit links appended, but the summary text itself is carried through unchanged. Get it
+right — it is what every user reads. (The one hand-written entry, 0.1.0, predates this and is
+preserved as prose.)
 
-- Inline `role:'system'` messages remain in their original conversation positions so volatile reminders do not invalidate the stable prompt prefix.
-- On public-API OpenAI GPT-5.6+ routes, Anthropic `cache_control` blocks become explicit OpenAI cache breakpoints. ChatGPT/Codex OAuth sends a hashed Claude session-derived `prompt_cache_key` and strips Claude Code's volatile billing-attribution header from instructions, but omits `prompt_cache_options` and explicit breakpoints — those produced successful-but-empty OAuth responses in testing.
-- Cache reads and GPT-5.6 cache writes map to Anthropic `cache_read_input_tokens`/`cache_creation_input_tokens`.
-- Image blocks inside `tool_result` content are lifted out of the text-only function-output channel and delivered as real image parts on the user message that follows the tool message. Inline, a JSON.stringify'd base64 screenshot tokenizes as text at ~1.5 chars/token (200k+ tokens per screenshot — killed agents with "Prompt is too long" while the local bytes/4 estimate showed ~half the real count). `estimateAnthropicInputTokens` likewise counts each image block at a flat vision estimate instead of bytes/4 over its base64.
-- `streamAnthropicResponse` maps SDK events to Anthropic SSE, aborting after 120s without an event.
-- `modelPrefersResponsesApi()` (`provider-factory.ts`) selects `provider.responses(id)` for models that require the Responses API (GPT-5.4+, GPT-5.5, `*-codex`, o-series); `provider.chat(id)` otherwise. Originator string is `clodex`.
+Ordinary commit-body wording reaches no user-facing surface, so nobody polices it. **The exception
+is a merge commit**: `gh pr merge` without `--body ""` puts the PR title into the merge-commit body,
+and release-please parses it as a second entry — a release has shipped with a duplicate changelog
+line proving it. See `.claude/skills/pr-review/SKILL.md`.
 
-**OpenAI OAuth WebSocket continuation** (`src/oauth/responses-websocket.ts`): all ChatGPT/Codex OAuth Responses models use a persistent WebSocket transport. Connections are partitioned by provider, OAuth account, upstream model, normalized effort, and hashed Claude session. Completed responses become validated chain heads (exact text/tool/reasoning capture; function-call args compared as canonical JSON); the next request picks the longest exact-prefix head and sends `previous_response_id` + incremental input; any mismatch/failure/expiry falls back safely to full context, and `previous_response_not_found` retries once with full context before anything is emitted downstream. A transport failure also retries once with full context while no downstream bytes, model data, or accumulated output exist; buffered control frames do not close that safe window, while any model output makes the failure terminal. OAuth requires `store:false` (a `store:true` probe returns HTTP 400). **Do not restructure this file.**
+Today most summaries fail. Reviewing the generated entries in `CHANGELOG.md` against the rules below
+— 62 bullets, 60 distinct summaries once two duplicates are collapsed — **44 were judged unreadable
+to a non-technical user** and only 2 clearly passed. That judgment is a review assessment, not a
+measurement, but the direction is not in doubt.
 
-Every SDK generation entry point resolves `CLODEX_UPSTREAM_MAX_RETRIES`
-through `src/upstream-retry.ts`. Unset or malformed values leave the SDK's
-two-retry default in control; valid integers are bounded to 0–5. Five retries
-complete before the translated streaming paths' 120-second no-data timeout;
-larger integers clamp to 5 with a one-time stderr warning. This idle deadline,
-not the separate ten-minute total timeout, is the effective retry ceiling. Keep
-translated and OpenAI-format streaming and non-streaming consumers wired
-together. This policy can recover only before output begins; replay after
-partial output could duplicate content or tool calls.
+**Write the summary line for someone who uses clodex and has never read the source.** It must say
+what they can now do, what they stop seeing, or what got more reliable.
 
-Connection pools are **process-wide**, not per-partition: `maxConnections` (established, default 32) and `maxNurseryConnections` (default 8). A head starts in the nursery and is promoted to established only when it is successfully continued, so a workload that fans out into many concurrent subagent conversations — which all inherit the parent's Claude session id and therefore share one partition — can evict heads before their next turn and lose the continuation. Both caps are overridable via `CLODEX_WS_MAX_CONNECTIONS` / `CLODEX_WS_MAX_NURSERY_CONNECTIONS` (integer 1–1024; a malformed value is logged and ignored). An explicit programmatic option still outranks the environment so tests are never perturbed. Eviction reasons (`nursery_lru_cap`, `established_lru_cap`, `idle_ttl`, `nursery_idle_ttl`, `hard_ttl`) are reported in the `evictions` array on every `ws_head_decision` diagnostic — sustained `*_lru_cap` counts are the signal that a cap is too small.
+1. **Name the user-visible outcome**, not the mechanism. Replace `canonicalize`, `replay`, `strip`,
+   `snapshot`, `serialize` with what the user notices.
+2. **Say why it matters** — a concrete "so", "to prevent", "to avoid", or equivalent.
+3. **No internal vocabulary without a plain-language gloss**: module names, symbols, protocol
+   fields, `function_call`, `heads`, `nursery`, `canary`, `pty`, `stderr`, `previous_response_id`,
+   `store:false`, `cache_control`.
+4. **No implementation-only detail** — hash formats, dependency versions, test/CI fixes — unless
+   tied to a visible install or runtime result.
+5. **Self-contained.** The reader should not need the issue, the body, or the code.
+6. **The 10-second test:** could a non-technical user explain the problem solved and decide whether
+   they care, from this line alone?
+7. Conventional-commit form, lowercase imperative, **whole line ≤ 100 characters**.
 
-**Named OAuth account slots**: `clodex providers auth openai --account <name>` stores an additional ChatGPT account under a named slot with its own credential-store lineage; the default sign-in is untouched. `CLODEX_OAUTH_ACCOUNT=<name>` selects a slot at launch — the swap happens once at registry materialization (`applySelectedOAuthAccount`), so credential resolution, OAuth metadata, and refresh-token rotation all transparently use the selected account, and the WebSocket cache partition (keyed on the token's account id) stays per-account. Naming a missing slot on a provider that has slots is a hard error rather than a silent fallback to the default identity. Removing the provider queues every slot credential for deletion.
+| Don't | Do |
+| --- | --- |
+| `fix(openai): snapshot function_call arguments in the sanitized downstream shape` | `fix(oauth): improve OpenAI cache hit rate by keeping tool arguments consistent` |
+| `feat(openai): omitted-reasoning alignment and abandoned-head canary coverage` | `feat(oauth): keep long conversations working when reasoning details are omitted` |
+| `fix(openai): suppress reasoning.summary for gpt-5.3-codex-spark` | `fix(reasoning): prevent blank responses on gpt-5.3-codex-spark` |
+| `fix(proxy): isolate bridge settings from child commands` | `fix(proxy): prevent nested Claude commands from using a stale clodex connection` |
+| `fix(patcher): include transform-set version in patch config hash` | `fix(models): detect patch updates so new model settings take effect` |
 
+Prefer a scope a user recognizes (`auth`, `models`, `launch`, `images`, `openai`) over one that only
+names an internal module (`adapter`, `transport`, `sdk`) where you have the choice.
 
-On a history mismatch the head-decision log line includes `expected_hash`/`actual_hash` (SHA-256 of each side's canonical item bytes) whenever at least one side has an item at the divergent index, so same-kind mismatches are diagnosable without exposing content; `none` marks a side whose hash is unavailable. Setting `CLODEX_MISMATCH_DUMP=1` additionally writes both divergent items' canonical bytes (capped per line, `(absent)` for a side past its history's end) into the adapter debug log. **Privacy tradeoff:** the dump contains raw conversation content. Reaching disk takes a double opt-in — `--trace` **and** `CLODEX_MISMATCH_DUMP=1` — and the write path runs `redactTraceLine`, so bearer tokens and known API-key shapes are scrubbed. The exposure is the durable on-disk artifact itself: the mode-0600 file clodex prints as `Adapter debug log:`, which is the file users paste into bug reports. It is never re-printed to the terminal (`printTraceLog` reads the separate Claude Code debug log, a different file).
+## Architecture map
 
-A `function_call` echoed back with the same `call_id` and `name` as the stored head, whose items nonetheless compare unequal, is a candidate clodex normalization gap — `call_id` is the call's identity, and a genuine rewind or branch regenerates the call under a new one. Those record `toolArgumentNormalizationGap` (`tool`, `equalAfterStrip`) on the head-decision diagnostic. **Only `equalAfterStrip: true` warns on stderr** (deduplicated by tool and hard-capped, like the reasoning warning below, because the terminal is shared with Claude Code's UI): it means the two items are identical once the shared filler-strip rule is applied to `arguments`, so nothing but filler stood between the head and its own echo — the shape #84 had. **Its coverage is narrower than it looks, in two directions.** It fires when the divergent `function_call` is the *first* divergent item, with one alignment: a stored reasoning item Claude legitimately omitted (`continuationMatch`'s omitted-reasoning mode) shifts the exact divergence onto a reasoning-vs-call pair, and the canary re-aims at the first non-reasoning stored item so that omission cannot hide a fork on the very next call. Anything else diverging earlier in the history is what the mismatch reports, and the gap is never reached. And it detects only the fork half where the difference is filler the shared rule removes: if either side strips MORE than the rule does (a snapshot or a client over-stripping), the two sides are still unequal after the rule runs, so they land in the silent `false` bucket. On a turn where no head matches, every abandoned idle candidate passes through the warning path — not just the most recently used one — so a regression on an older head cannot go silent behind a newer head's ordinary mismatch; the per-tool dedup and hard cap keep stderr bounded regardless. Treat a quiet terminal as weak evidence, not proof. The warning states that observation and asks for a report rather than naming a cause, since `equalAfterStrip` cannot tell which side diverged. `false` means the difference is one the rule cannot explain — a scalar/array/malformed `arguments` that `sanitizedCallArguments` deliberately passes through, a divergence in some other item field, or a client that really did re-send a different value — which is indistinguishable from a legitimate divergence and so is counted but never warned. The `required` sets used to judge the strip are the ones the head was snapshotted under (`headRequiredToolProps`), not the replaying turn's, so a mid-session tool-schema change cannot flip the verdict. This exists because #84 was otherwise invisible without `--trace` or `--ws-diagnostics` — it presented only as a quietly larger prompt and took mining ~11k ledger records to find.
+**Entry points:** `src/cli.ts` — arg parsing (`parseArgs`, `consumeBridgeModeFlag`), help texts, and
+dispatch for `claude`, `server`, `models`/`favorites`, `providers`, `patch` — and
+`src/claude-wrapper.ts` (the `clodex-claude` bin). Every other module is a focused unit with no
+side effects at import time.
 
-A reasoning item echoed back by Claude Code that carries the same `encrypted_content` as the stored head but still fails to compare equal is a clodex normalization gap, not a divergent branch. Those warn on stderr (deduplicated and capped, since the terminal is shared with Claude Code's UI) and record `reasoningNormalizationGap` plus a `reasoningGapShape` descriptor — summary/content element counts per side and the length of the consecutive same-blob reasoning run — on the head-decision diagnostic. The shape is what distinguishes one upstream item split into several on the way back from a single item that genuinely differs.
+**Two bridge modes**, supported by both `clodex claude` and `clodex server`:
 
-**Auto-compaction / alias response-model echo (critical):** the proxy-mode MITM layer forwards request bodies **unrewritten** so responses echo the exact model id the client sent. Claude Code resolves context windows from the response `model` field but uses the request alias for preflight — substituting the canonical id in responses made patched/alias ids miss their window config, auto-compact never fired, and agents died with "Prompt is too long". Endpoint mode's synthetic `GET /v1/models` returns `context_window` per model so the status bar is accurate.
+- **endpoint** — a local Anthropic-format gateway; the child gets `ANTHROPIC_BASE_URL`.
+- **proxy** — selective MITM of `api.anthropic.com`; Claude Code keeps its normal Anthropic auth and
+  only `clodex:{provider}:{model}` ids and saved aliases route to OpenAI. **This is the default.**
 
-**Critical URL constraint:** Anthropic-passthrough base URLs must NOT include `/v1` — the Anthropic SDK appends `/v1/messages` itself.
+Details, including bridge-mode persistence rules, are in `.claude/docs/launch-and-wrapper.md`.
 
-**Provider registry** (`src/registry/`): only two providers exist — templates in `src/provider-templates.ts` (`openai` API-key template with `https://api.openai.com/v1`, and `openai-oauth`). `provider-auth.ts` implements the OpenAI device-code OAuth flow; `refresh-models.ts` fetches the model list (3-tier fetch for OAuth). Materialization (`materialize.ts`) turns registry providers into `LocalProvider`s with per-model `npm`/`baseUrl`/`upstreamModelId`.
+**The single translation path** is `src/sdk-adapter.ts` + `src/provider-factory.ts` (Anthropic
+`/v1/messages` ↔ Vercel AI SDK, one turn per request — Claude Code owns the tool loop). There is no
+hand-rolled per-provider translation; don't add one. See `.claude/docs/translation.md`.
 
-Registry writes use atomic hard-link lock publication, so the filesystem containing `CLODEX_HOME` must support hard links. A parseable lock owned by a live PID is never reclaimed based on age; contenders wait for a bounded interval and fail with the owner PID. Malformed locks and locks owned by dead PIDs remain reclaimable. This live-owner rule is what makes the final ownership check before `providers.json` publication meaningful because a concurrent process cannot invalidate a live writer between its check and rename.
+### Cross-cutting invariants that are easy to break
 
-**Config** (`src/paths.ts`, `src/config.ts`, `src/env.ts`):
+These bite from outside the subsystem that owns them, so they live here rather than in a deep doc.
 
-- Config home `~/.clodex`, override `CLODEX_HOME`.
-- Keychain service `clodex` supports chunked entries for Windows credential size limits.
-- Preferences: `lastModel`, `lastProvider`, `recentModelsByProvider`, `favoriteModels`, `modelAliases`, `claudeBridgeMode`, `serverBridgeMode`, `appPathOverrides`, `localPatchesEnabled`, `recentLaunchFolders`, `server*` settings. All writes skipped when `dryRun`.
-- `CLODEX_CLAUDE_PATH` overrides Claude Code binary discovery (`src/claude-binary.ts`, re-exported by `src/launch.ts`; the `clodex-claude` wrapper imports it directly so `launchClaude` stays out of the wrapper's chunk).
+- **Auto-compaction depends on the response-model echo.** The proxy-mode MITM forwards request
+  bodies **unrewritten** so responses echo the exact model id the client sent. Claude Code resolves
+  context windows from the response `model` field but uses the request alias for preflight —
+  substituting the canonical id in responses made patched/alias ids miss their window config,
+  auto-compact never fired, and agents died with "Prompt is too long". Endpoint mode's synthetic
+  `GET /v1/models` returns `context_window` per model so the status bar is accurate.
+- **Anthropic-passthrough base URLs must NOT include `/v1`** — the Anthropic SDK appends
+  `/v1/messages` itself.
+- **The alias IS the model identity** once a binary is patched: the short name is what lands in the
+  Agent-tool enum, is sent, is echoed, and keys the context-window map. Full rules in
+  `.claude/docs/patcher.md`.
+- **Do not restructure `src/oauth/responses-websocket.ts` or `src/sdk-adapter.ts`.** The
+  continuation and translation logic took extensive real-world testing. Surgical changes only.
+- **`~/.claude/settings.json` is never touched by clodex.** Launch config is env-var-only (plus
+  `--model`), child process only.
+- **`node-gyp-build` is a deliberate direct dependency that no clodex source imports.** Routine
+  "remove the unused dependency" cleanup breaks fresh installs. Reason in
+  `.claude/docs/patcher.md`.
+- **Every SDK generation entry point must resolve `CLODEX_UPSTREAM_MAX_RETRIES` through
+  `src/upstream-retry.ts`.** Adding a new streaming or non-streaming path without wiring it leaves
+  that path on a different retry policy than the rest. Details in
+  `.claude/docs/oauth-continuation.md`.
 
-**Patcher** (`src/patcher.ts` + `src/patch-transforms.ts` + `src/built-in-patch-proofs.ts` + `src/local-patches.ts` + `src/patch-backup.ts`): `clodex patch` uses tweakcc's programmatic API — `tweakcc` is an exact-pinned, declared runtime dependency (externalized in `tsup.config.ts`; it brings its own tree incl. `node-lief` for native repacking and `ink`/`react` for its picker, which is why `patcher.ts` loads it via lazy `import()`), never `npx` and never the network. Flow: `tryDetectInstallation({ path })` → `readContent` (extracts the bundled JS from the native binary) → `applyClodexPatches(source, config)` (in-process pure function applying the built-in PATCH 1–10 regex sites) → optional `applyLocalPatches` transaction with built-in postcondition verification → `writeContent` (repacks). Both layers return per-site OK/SKIP/FAIL results shown by `--trace`. tweakcc 4.3.0 ships no `.d.ts` despite its `types` field — `src/tweakcc.d.ts` declares the verified API surface; re-verify it when bumping the pin. `node-gyp-build` is a deliberate direct dependency even though no clodex source imports it: node-lief 1.3.1 mistakenly demoted it to a devDependency while still `require`-ing it at runtime, so fresh end-user installs resolved a node-lief that throws `Cannot find module 'node-gyp-build'` — which tweakcc's lazy loader swallows into a null and clodex surfaces as the misleading "Failed to extract JavaScript from native installation". Declaring it ourselves guarantees it lands somewhere node-lief's `require` can resolve; keep it even after node-lief fixes the packaging. The built-ins bake favorites + aliases into the Claude Code binary (model validation, `/model` listing, alias resolution, context windows via a `/*ccpatch:ctx*/`-marked map, per-model effort capabilities/defaults, and child-command network isolation). Key invariants:
+## Tests
 
-- **The alias IS the model identity in the binary.** For any favorite with an alias, the short name (`sol`) — never the canonical `clodex:<provider>:<model>` id — is what lands in the Agent-tool zod enum (PATCH 1), the known-alias validator list (PATCH 3), the `/model` picker value (PATCH 5), and the context-window map (PATCH 7). Subagent/skill/agent `model:` frontmatter is validated against that same enum, so injecting canonical ids made `model: sol` fail with InputValidationError. Favorites with no alias fall back to their canonical id as the identity (enum + validator + context map only; no resolver case, no picker entry).
-- **PATCH 6 (alias resolver switch) maps each alias to ITSELF.** The case must exist — the switch's `default:` returns null — but resolving to the canonical id would make Claude Code send one name while looking its context window up under another. That is the same mismatch as the response-echo bug above: the MITM layer resolves short alias names as request model ids and echoes bodies unrewritten, so *name in enum == name sent == name echoed == context-map key*. The map keeps the canonical id as an extra key so pre-alias lookups still hit.
-- Picker/description text uses the canonical label from `httpProxyDisplayName()` (`src/http-proxy/routes.ts`, built on `formatModelLabel`) — the same `GPT-5.6 Sol (OpenAI (ChatGPT))` string `clodex server` prints at startup and `clodex models --list` shows. Missing label → the old `Custom model (<id>)` wording.
-- `buildDesiredPatchConfig()` is disk-only (preferences + registry models cache — no network, no credentials).
-- `computePatchConfigHash` = sha256 of `[PATCH_TRANSFORMS_VERSION, key-sorted [key, alias??null, context??null, display??null, effort-levels??null, default-effort??null] array]`, plus the versioned local-module content identity only while local patches are enabled. Disabled users retain the exact historical hash shape. The manifest at `~/.clodex/patch-state.json` (binary path, claude version, config hash, patched size/sha256, backup path, pristine sha256 — the last is absent in manifests written before content-addressed backups) drives `evaluatePatchState` → `unpatched | current | stale-config | stale-binary`.
-- **PATCH 10 isolates proxy-mode bridge settings from standard child commands.** `computeWrapperEnv()` and `buildHttpProxyChildEnv()` write `CLAUDE_CODE_CLODEX_NETWORK_ENV`, a versioned compare-before-revert contract containing the external and injected values for the proxy variables, bypass lists, and `NODE_EXTRA_CA_CERTS`. The patched shared child-environment builder restores an external value only while the live value still equals what Clodex injected, so nested wrappers cannot preserve a dead bridge port and settings-level overrides remain authoritative. It always removes the contract from the child and requires both contract records to contain the same recognized keys with only string or null values. PATCH 10 remains required deliberately: publishing without it would silently reintroduce bridge settings into child commands, while a failed required patch leaves the installed binary untouched. The contract does not cover endpoint-mode `ANTHROPIC_*` variables, the separate `--bg --exec` environment path, or a plain nested `claude` launched from Bash; use `clodex-claude` when a nested client must remain bridged.
-- **Bump `PATCH_TRANSFORMS_VERSION` (`patch-transforms.ts`) in the same commit whenever the transform set changes materially** — a site added or removed, or a site's regex, replacement, or ordering changed. That hash is the manifest's only record of the transform set, so without the version folded in, a user whose favorites are unchanged would stay `current` forever and silently never receive the new transforms. A test pins a sha256 of `patch-transforms.ts` plus `network-env.ts` so the decision is forced rather than forgotten; for a comment-only edit, re-pin the digest and leave the version alone.
-- **Never patch on top of a patch, and never publish a partial patch:** `applyPatch` never writes the live binary in place. It builds into a *candidate* inside a sibling temp dir (`.clodex-patch-*` next to the binary, removed in a `finally`) and `renameSync`s it over the binary only after every *required* site applied and the repack succeeded (PATCH 4 and 5 are `required:false` and may FAIL without blocking publication) — which is what makes the "required effort patches failed" throw (PATCH 8a/8b/8c/9 FAIL) safe: the user's install is still whole. The candidate is seeded from the *established pristine bytes*, not from the live binary, whenever the live binary is not itself provably pristine — regardless of what the manifest says. **Whatever the seed, the bytes about to be patched must carry no clodex patch marker** — the live binary is checked on the bootstrap path, and a backup is checked after it is seeded, because `verifyPristineSource` only proves the *version* and a patched claude reports its version perfectly well. A poisoned backup is reachable (every clodex before content addressing snapshotted whatever was live when no backup existed, and the version-resolution bug generated exactly that state), and patching one would both double-patch the install and launder the result into a content-addressed name that is otherwise trusted on sight. That check runs **before** any write to the backup directory, so a poisoned backup can neither be adopted nor clobber the `native-binary.backup` mirror. Extraction is expensive (~250 MB), so it happens **once**: the candidate is seeded from the live binary and inspected there — a byte-identical copy, so it answers the question about the live binary, and the same extraction feeds the patch when the verdict is "unpatched". Only bytes that turn out to be unusable pay for a second seed + extract.
-- **Local patches are explicitly trusted code and an extension, never a local-only mode.** Only `~/.clodex/local-patches.mjs` (respecting `CLODEX_HOME`) is considered, and only after `--enable-local-patches` persists the opt-in; there is no cwd, package, dependency, or `node_modules` discovery. `inspectLocalPatchSource` captures and hashes the module without executing it. Actual execution happens only inside `applyPatch`, after required built-ins succeed, against their pristine-seeded output. The set is all-or-none: any load, validation, marker, transform, or post-local built-in verification failure discards every local mutation but still publishes the complete built-ins. Host-generated `/*clodex-local:<id>*/` markers are distinct from the blocking `/*ccpatch:` tier, and local transforms may not alter either prior local markers or built-in sites. Keep the module deterministic and self-contained because only its entry bytes participate in freshness.
-- **Patch-marker detection is two-tier** (`patch-backup.ts`). Only the `/*ccpatch:` comment prefix — clodex's own injected text — is allowed to *block*, and it covers everything current clodex publishes because PATCH 8a/8b/8c/9 are required and each emits one. The weaker legacy signals (PATCH 4's description text, PATCH 5's picker dedupe guard, `"clodex:` ids) only *warn*: they can in principle collide with Claude Code's own bytes, and a false positive there is **unrecoverable** — refusing to bootstrap tells the user to reinstall Claude Code, which yields the identical bytes and the identical refusal. A missed legacy patch is recoverable by comparison. Proof blocks, heuristic warns. (The gap is real but narrow: a pre-effort-sites clodex emitted `/*ccpatch:ctx*/` only when some model had a non-default context window — verified against the real 2.1.220 bundle.)
-- **Pristine backups are content-addressed** (`src/patch-backup.ts`): `~/.tweakcc/claude-<ver>-<sha256 prefix>.orig`, so one name can never hold two different contents and every backup self-validates by rehashing. Provenance rules — a backup becomes the pristine source ONLY when its provenance is established: the version tag must equal the version probed from the binary being patched, its hash must match its own name, and a legacy `claude-<ver>.orig` (no hash in the name, so possibly mislabeled by an older clodex) must additionally report that version when executed (`verifyPristineSource`). Conflicting or unverifiable backups produce a loud error, never a copy. This gate covers both consumers: `applyPatch` seeds its candidate from those bytes and renames them into place, and **`clodex patch --restore` still copies straight over the live binary** (nothing to publish atomically), so an unverified backup would be a silent downgrade either way. An already-patched binary is never snapshotted as "pristine". Legacy backups are adopted (copied to their content address) rather than orphaned — and whether the canonical name already holds the right bytes is decided from the scan's **content hash, not from `existsSync`**, so a truncated or foreign file parked there is replaced instead of adopted and published. Every write into the backup directory goes through `publishBackupFile` (temp + `rename`), because an interrupted ~250 MB `copyFileSync` would otherwise leave a truncated file under a name asserting its content hash — the one corruption content-addressing cannot notice without re-hashing. `~/.tweakcc/native-binary.backup` is still mirrored from the pristine bytes for `tweakcc --restore`.
-- **`clodex patch --restore` must work on a binary that no longer runs** — that is what a pristine backup is *for*. It resolves the version from `claude --version` when it can, and otherwise falls back to the manifest's `claudeVersion` when `manifest.binaryPath` matches the resolved install, establishing provenance without executing anything. The patch path keeps the hard `version-unknown` failure (patching is elective; restoring is the way out), and its error message names `--restore` as the recovery.
-- Binary resolution bypasses PATH shims (cmux installs a shim copy): `TWEAKCC_CC_INSTALLATION_PATH` → `~/.local/bin/claude` → `findClaudeBinary()`. **The version is probed from that resolved binary** (`getClaudeVersionForBinary`), never from `getInstalledClaudeVersion()`, whose PATH lookup can land on a different install and whose `'2.1.183'` fallback is only safe for request metadata. The version names the backup that gets restored, so borrowing it from a shim silently downgraded the user's Claude Code; an unprobeable binary is a hard error (`resolveClaudeBinaryForPatch` returns `binary-not-found` vs `version-unknown`, and the launch-time check stays non-fatal for both).
-- Concurrency lock `~/.clodex/patch.lock` (pid + 10-min staleness + ESRCH liveness); the loser skips with a notice — never blocks, corrupts, or double-patches.
-- `runLaunchPatchCheck()` in `clodex claude`: interactive y/N offer when stale; non-TTY or `--dry-run` prints a one-line stderr notice and proceeds. It may read/hash an enabled local module for freshness but must never execute it unless the user accepts the patch. Wrapped in try/catch — a patch-check failure must never break launch.
-- Context is omitted from the patch map when unknown or equal to Claude Code's 200k default; `[1m]`-suffixed model ids and explicit context are mutually exclusive in the patch transforms.
-- The per-site transforms in `patch-transforms.ts` (regexes, replacements, ordering, SKIP/FAIL semantics) are hard-won — change them only with byte-for-byte equivalence evidence on a real binary.
+`tests/` is almost all pure functions — adapter, provider factory, proxy, http-proxy routes,
+registry, config, bridge-mode persistence, help text, and patcher (config building, hash stability,
+manifest staleness, lock behavior, per-site transforms).
 
-**Server** (`src/server/`): `index.ts` loads models from the registry (`loadServerModels`), `router.ts` handles `/anthropic` (Anthropic-format; passthrough for `modelFormat:'anthropic'` with `baseUrl`, SDK adapter for `'openai'`) and `/openai/v1` (OpenAI-format via `src/openai-adapter.ts`). Wizard/quick-start settings persist to config; network mode requires a password; default port 17645 (`--port` overrides). Endpoint-mode request model resolution (`createGatewayModelCatalog` in `server/models.ts`) accepts, in precedence order: exact catalog id (and its gateway-discovery id) → unmasked gateway id when `--mask-gateway-ids` is on (`vendor-mask.ts`) → canonical `clodex:{provider}:{model}` id → saved short aliases from `clodex models --alias` (the same alias table the proxy-mode MITM resolves) → 400. Saved alias names are canonicalized to lowercase; requests use that stored spelling. Invalid, reserved, conflicting, unavailable, or catalog-colliding aliases remain preserved in config but are reported and kept out of routing. Aliases and canonical ids are accepted INPUT only — `/models` listings still advertise exactly the canonical/masked ids. Echo invariant: an aliased request's response `model` field echoes the alias verbatim (even under masking) so a patched Claude Code's context-window lookup keys match (`aliasNames` in `ServerOptions`).
+The exception is `tests/patcher-command.test.ts`, a genuine end-to-end exercise of `clodex patch`
+and the only automated coverage of `runPatchCommand`: it drives the real command against fake claude
+"binaries" (shell scripts answering `--version` and carrying a bundle payload after a sentinel) with
+tweakcc's three API calls mocked, covering version resolution, backup selection, the
+poisoned/corrupt-backup refusals, `--restore`, and the manifest without touching a real install.
 
-**Env isolation** (`src/env.ts`): `buildChildEnv()` copies `process.env`, deletes conflicting `ANTHROPIC_*`/related vars, sets `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY`/`ANTHROPIC_MODEL` for the child only. Claude Code may persist the model to `~/.claude/settings.json` itself; outside clodex's control (reset with `claude --model sonnet`).
+Interactive launch flow and real-provider behavior are verified manually.
 
-**Parent diagnostics while Claude Code runs** (`src/parent-notice.ts`): `launchClaude` mutes `process.stdout/stderr.write` for the child's whole lifetime because the child inherits the terminal, but clodex's gateway runs in the same process and produces the warnings documented above. Those sites call `emitParentNotice` — an opt-in, enumerable channel; there is no prefix rule, since a prefix would silently enrol future writers. Notices are **queued, not painted**: parent and child share one PTY with no render lock, and a live write lands mid-frame or on the prompt where it reads as typed input (both observed against real Claude Code). The queue (bounded, overflow counted) is flushed in `restore()` once the child has exited, with a synchronous `process.on('exit')` backstop; the `--debug-file` `[parent] ...` copy stays immediate. Every terminal write is guarded against an asynchronous EPIPE — a closed pipe (`clodex claude 2>&1 | head -n 1`) reports through the stream's `error` event, and an unhandled one would kill the gateway out from under a running child.
-
-**Outbound proxy** (`src/outbound-proxy.ts`): when `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` are set in clodex's environment, `installOutboundProxyDispatcher()` (called at the top of `main()`) installs undici's `EnvHttpProxyAgent` as the global fetch dispatcher, so every fetch-based call (OAuth device flow/refresh, model-list + models.dev refresh, AI-SDK upstream calls) honors them; without proxy env vars it is a no-op and nothing changes. Transports that do not use the undici dispatcher share the same resolver: the `ws`-based OAuth Responses WebSocket gets an `https-proxy-agent` CONNECT tunnel through `outboundWsProxyAgent()`, and the raw first-party passthrough creates one keep-alive `outboundHttpProxyAgent()` synchronously after the local bridge binds and reuses it for every request. If the resolved proxy URL names that same listener—by exact address, loopback alias, or a local interface behind a wildcard bind—raw passthrough warns and connects directly instead of recursively tunnelling through itself; malformed proxy URLs also warn and fall back to direct connections.
-
-**Tests** (`tests/`): almost all pure functions — adapter, provider factory, proxy, http-proxy routes, registry, config, bridge-mode persistence, patcher (config building, hash stability, manifest staleness, lock behavior, per-site patch transforms), help text. The exception is `tests/patcher-command.test.ts`, a genuine end-to-end exercise of `clodex patch` and the only automated coverage of `runPatchCommand`: it drives the real command against fake claude "binaries" (shell scripts that answer `--version` and carry a bundle payload after a sentinel) with tweakcc's three API calls mocked, so version resolution, backup selection, the poisoned/corrupt-backup refusals, `--restore`, and the manifest are all covered without touching a real install. Interactive launch flow and real-provider behavior are verified manually.
+**`claude -p` end-to-end tests are manual only — NEVER add them to the automated suite.**
 
 ## Key constraints
 
-- `~/.claude/settings.json` is never touched by clodex. Launch config is env-var-only (plus `--model`), child process only.
 - `--dry-run` skips all writes (including bridge-mode persistence).
-- The `::ts::` separator in tool_use ids encodes reasoning signatures for round-tripping; would only break if a signature literally contained `::ts::`.
-- In endpoint switch-menu mode the displayed context window reflects the **launch** model and does not update on live `/model` switch (Claude Code fetches `/v1/models` once at startup). Proxy mode + `clodex patch` reports correct per-model windows.
-- Cost display in Claude Code is always inaccurate for OpenAI models (Claude Code applies its own pricing table).
+- The `::ts::` separator in tool_use ids encodes reasoning signatures for round-tripping; would only
+  break if a signature literally contained `::ts::`.
+- In endpoint switch-menu mode the displayed context window reflects the **launch** model and does
+  not update on live `/model` switch (Claude Code fetches `/v1/models` once at startup). Proxy mode
+  + `clodex patch` reports correct per-model windows.
+- Cost display in Claude Code is always inaccurate for OpenAI models (Claude Code applies its own
+  pricing table).
 - `MAX_MODEL_CATALOG = 20` (`constants.ts`) — favorites cap and max catalog routes.
 - OpenAI catalog ids may differ from upstream API ids — `upstreamModelId` carries the real API id.
+- Never commit `dist/` (gitignored, rebuilt by CI), never hardcode a version string
+  (`package.json` is the source of truth), and never run `npm publish` locally.
