@@ -270,17 +270,82 @@ describe('bun entry module shim', () => {
     expect(shimEntryModuleName(binary)?.original).toBe('/$bunfs/root/cli');
   });
 
-  it('refuses to publish a file where the stand-in survived elsewhere', () => {
-    // The parse finds one blob; the guarantee is about the whole file. A stale copy of the blob
-    // left behind by a repack is exactly how the stand-in could outlive its own restoration.
+  it('puts the real name back over a copy of the stand-in the parse never sees', () => {
+    // The parse finds one blob; the guarantee is about the whole file. A repack rebuilds the blob
+    // elsewhere and does not necessarily write over all of the old one, so the previous module
+    // table can survive in dead space — Claude Code 2.1.233 leaves exactly one such copy. Refusing
+    // to publish cannot tell that apart from a write into a stale copy while the live blob stays
+    // shimmed, so the real name goes back over every copy and neither case can publish a stand-in.
     const blob = buildBunBlob(CURRENT_NAMES.map(name => ({ name })));
     write(Buffer.concat([blob, Buffer.alloc(32, 0x47)]));
     const shim = shimEntryModuleName(binary)!;
     const shimmed = readFileSync(binary);
     writeFileSync(binary, Buffer.concat([shimmed, Buffer.from(shim.marker)]));
 
-    expect(() => restoreEntryModuleName(binary, shim, { resign: false }))
-      .toThrow(/survived restoration/);
+    restoreEntryModuleName(binary, shim, { resign: false });
+
+    const restored = readFileSync(binary);
+    expect(restored.includes(shim.marker)).toBe(false);
+    expect(restored.subarray(restored.length - shim.original.length).toString())
+      .toBe(shim.original);
+    expect(shimEntryModuleName(binary)?.original).toBe('/$bunfs/root/cli');
+  });
+
+  it('restores every copy when a repack leaves a second, complete blob behind', () => {
+    // The failure the whole-file check was written for: two blobs, and the one the write went to is
+    // not the one Bun loads. Rewriting every copy fixes the live table too, so the outcome is a
+    // correct binary rather than a refusal that leaves the user unable to patch at all.
+    const blob = buildBunBlob(CURRENT_NAMES.map(name => ({ name })));
+    write(Buffer.concat([blob, Buffer.alloc(32, 0x47)]));
+    const shim = shimEntryModuleName(binary)!;
+    const shimmed = readFileSync(binary);
+    // A second, complete copy of the shimmed blob ahead of the live one.
+    writeFileSync(binary, Buffer.concat([shimmed, shimmed]));
+
+    restoreEntryModuleName(binary, shim, { resign: false });
+
+    const restored = readFileSync(binary);
+    expect(restored.includes(shim.marker)).toBe(false);
+    expect(restored.toString().split(shim.original).length - 1).toBe(2);
+  });
+
+  it('rewrites copies the parse never reaches, across a read boundary', () => {
+    // Production's survivor is an old module table left mid-file by a repack, not bytes at EOF, and
+    // there can be more than one. A fixture large enough to place them realistically is what pins
+    // the two properties small ones cannot: that the scan covers the whole file rather than the
+    // tail it parses the blob from, and that offsets stay correct across the 8 MiB read boundary.
+    const chunkBytes = 8 * 1024 * 1024;
+    const blob = buildBunBlob(CURRENT_NAMES.map(name => ({ name })));
+    write(Buffer.concat([Buffer.alloc(20 * 1024 * 1024, 0x41), blob]));
+    const shim = shimEntryModuleName(binary)!;
+
+    const repacked = readFileSync(binary);
+    // Further from EOF than TAIL_SCAN_BYTES, so only a whole-file scan finds it.
+    const beyondTail = 1024 * 1024;
+    // Spans the boundary between the first and second read, where the carry arithmetic applies.
+    const acrossBoundary = chunkBytes - 8;
+    repacked.write(shim.marker, beyondTail, 'latin1');
+    repacked.write(shim.marker, acrossBoundary, 'latin1');
+    writeFileSync(binary, repacked);
+
+    restoreEntryModuleName(binary, shim, { resign: false });
+
+    const restored = readFileSync(binary);
+    expect(restored.includes(shim.marker)).toBe(false);
+    for (const at of [beyondTail, acrossBoundary]) {
+      expect(restored.subarray(at, at + shim.original.length).toString()).toBe(shim.original);
+    }
+  });
+
+  it('declines to shim a binary that already carries the stand-in bytes', () => {
+    // Restoration rewrites every copy of the marker, which is only sound while every copy is one
+    // the shim wrote. Anything else is left to tweakcc's own extraction failure.
+    const marker = entryModuleShimName('/$bunfs/root/cli'.length)!;
+    const blob = buildBunBlob(CURRENT_NAMES.map(name => ({ name })));
+    write(Buffer.concat([blob, Buffer.from(marker)]));
+
+    expect(shimEntryModuleName(binary)).toBeNull();
+    expect(readFileSync(binary).includes(marker)).toBe(true);
   });
 
   it('refuses to restore over a name that is not the shim it wrote', () => {

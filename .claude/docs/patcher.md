@@ -38,8 +38,9 @@ capabilities/defaults, and child-command network isolation.
 tweakcc finds the module holding the bundle **by name**, and Claude Code 2.1.231 renamed it from
 `/$bunfs/root/src/entrypoints/cli.js` to `/$bunfs/root/cli`, which none of tweakcc's six accepted
 names match — so `readContent` threw and 2.1.231 could not be patched at all.
-The upstream list is unchanged as of tweakcc 4.3.2; `.claude/docs/claude-code-internals.md` has the
-bundle-side detail. **Delete this shim once tweakcc identifies the module by `entryPointId`.**
+tweakcc **4.3.3** added `/cli` to that list, so the shim is unnecessary from that version on;
+`.claude/docs/claude-code-internals.md` has the bundle-side detail. **Delete this shim once the
+tweakcc pin reaches 4.3.3, or once tweakcc identifies the module by `entryPointId`.**
 
 The name is used for identification only, so `shimEntryModuleName` swaps it for a stand-in of
 **identical byte length** (`/clodex--/claude` for a 16-byte original) that tweakcc does recognize,
@@ -80,10 +81,19 @@ tweakcc's own repack reads back as an ordinary module name.
   ships the literal in `__TEXT`. Candidates are therefore tried from EOF backwards and the first one
   that validates wins. `TAIL_SCAN_BYTES` is a cost bound with a hard floor: the last trailer sits
   683–802 KB from EOF on real binaries, and a window below that silently disables the shim.
-- **Restoration is proven, not assumed.** After writing the real name back, the whole file is scanned
-  for the stand-in. Locating the blob is a search, so "I wrote the name where I found the marker" is
-  weaker than it sounds — it is also true of a write into a stale copy while the live blob stays
-  shimmed. The scan is what actually holds the never-publish-the-stand-in rule up.
+- **Restoration is swept, not assumed.** Locating the blob is a search, so "I wrote the name where I
+  found the marker" is weaker than it sounds — it is also true of a write into a stale copy while the
+  live blob stays shimmed. So after the parse-directed write the whole file is scanned and the real
+  name goes back over **every** remaining copy, then a second scan proves none is left. That is what
+  holds the never-publish-the-stand-in rule up, and it does not depend on the parse having picked the
+  live blob: the stale-copy case gets the real name too.
+  Refusing to publish on any surviving copy — the earlier behaviour — could not distinguish that
+  case from a benign one, and Claude Code 2.1.233 produces the benign one on every patch: the repack
+  rebuilds the blob and does not write over all of the old table, leaving an orphan copy behind
+  while the live table is correct — one copy, ~37% into the file, on the Linux 2.1.233 binary this
+  was measured against. That refusal made 2.1.233 unpatchable.
+  Rewriting is sound only while every copy is one the shim wrote, so `shimEntryModuleName` declines a
+  binary that already carries the marker.
 - `scripts/extract-cc-bundles.mjs` needs the same shim to read a 2.1.231 bundle. It shims a **scratch
   copy**; the `.orig` backups are the only pristine bytes on the machine and nothing may write to
   them.
