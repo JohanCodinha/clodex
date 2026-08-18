@@ -190,29 +190,41 @@ function parseBunModuleNamesAtUnchecked(fd: number, offsetsAt: number): BunModul
   return { names, entryPointId, offsets: nameOffsets };
 }
 
-/**
- * Prove the stand-in is gone from the ENTIRE file, not merely from wherever the parse just looked.
- * Locating the blob is a search, and a repack can leave a stale trailer behind, so "I wrote the
- * real name back where I found the marker" is a weaker statement than it appears — it would also
- * be true of a write into a dead copy of the blob while the live one stayed shimmed. Publishing
- * that binary is the one outcome this module exists to prevent, and it costs one sequential read
- * to rule out.
- */
-function assertShimGone(fd: number, fileSize: number, marker: string): void {
+/** Every absolute offset of `marker`. A match cannot fit inside the needle-1 carry, so each is
+ * found exactly once. */
+function findStandIn(fd: number, fileSize: number, marker: string): number[] {
   const needle = Buffer.from(marker);
   const chunkBytes = 8 * 1024 * 1024;
+  const offsets: number[] = [];
   let carry = Buffer.alloc(0);
   for (let position = 0; position < fileSize;) {
     const length = Math.min(chunkBytes, fileSize - position);
     const chunk = readAt(fd, length, position);
     if (!chunk) throw new Error('could not re-read the candidate to verify the entry-module name');
     const window = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk;
-    if (window.includes(needle)) {
-      throw new Error(`the entry-module stand-in ${marker} survived restoration`);
+    const windowAt = position - carry.length;
+    for (let at = window.indexOf(needle); at >= 0; at = window.indexOf(needle, at + 1)) {
+      offsets.push(windowAt + at);
     }
     // Keep the last needle-1 bytes so a marker straddling two chunks is still seen.
     carry = Buffer.from(window.subarray(Math.max(0, window.length - (needle.length - 1))));
     position += length;
+  }
+  return offsets;
+}
+
+/**
+ * Put the real name back over EVERY copy of the stand-in, then prove none is left. A repack can
+ * leave an orphan copy in dead space (Claude Code 2.1.233 did on every run observed), and refusing
+ * to publish on one cannot be told apart from the stale-blob write that refusal was written for —
+ * rewriting fixes both. See `.claude/docs/patcher.md`.
+ */
+function restoreEveryStandIn(fd: number, fileSize: number, shim: EntryModuleShim): void {
+  const found = findStandIn(fd, fileSize, shim.marker);
+  for (const offset of found) writeNameBytes(fd, shim.original, offset);
+  // Only re-scan if something was rewritten: a first pass that found nothing has already proved it.
+  if (found.length > 0 && findStandIn(fd, fileSize, shim.marker).length > 0) {
+    throw new Error(`the entry-module stand-in ${shim.marker} survived restoration`);
   }
 }
 
@@ -284,6 +296,8 @@ export function shimEntryModuleName(path: string): EntryModuleShim | null {
     const offset = parsed.offsets[parsed.entryPointId]!;
     const marker = entryModuleShimName(Buffer.byteLength(original));
     if (marker === null) return null;
+    // Rewriting every copy on restore is only sound while every copy is one this module wrote.
+    if (findStandIn(fd, statSync(path).size, marker).length > 0) return null;
 
     writeNameBytes(fd, marker, offset);
     return { offset, original, marker };
@@ -325,7 +339,7 @@ export function restoreEntryModuleName(
       );
     }
     writeNameBytes(fd, shim.original, offset);
-    assertShimGone(fd, statSync(path).size, shim.marker);
+    restoreEveryStandIn(fd, statSync(path).size, shim);
     machO = resign && isMachO(fd);
   } finally {
     closeSync(fd);
