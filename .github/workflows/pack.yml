@@ -1,0 +1,53 @@
+# Fork-only: build an installable tarball from any ref and publish it as a release
+# asset, so machines can install a build of this fork without npm. This exists to feed
+# p16, not to be part of a contribution — it lives on `main` because GitHub dispatches
+# workflow_dispatch only from the default branch, and never on a branch proposed
+# upstream, so it stays out of every diff sent to bman654/clodex.
+#
+# The build steps mirror ci.yml exactly (Node 24, corepack, frozen lockfile) so the
+# tarball is produced by the same toolchain the maintainer's CI uses.
+name: Pack
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA to build
+        required: true
+        default: fix/entry-module-standin-2-1-233
+      tag:
+        description: Release tag to publish under (reused, so the download URL is stable)
+        required: true
+        default: p16-latest
+
+permissions:
+  contents: write
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      # Same gate as ci.yml: a tarball that fails these should never reach a machine.
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - run: npm pack
+      - name: Publish the tarball under a stable tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          built=$(git rev-parse --short HEAD)
+          # Replace the previous release so the asset URL never changes.
+          gh release delete "${{ inputs.tag }}" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "${{ inputs.tag }}" ./*.tgz \
+            --title "clodex build of ${{ inputs.ref }}" \
+            --notes "Built from \`${{ inputs.ref }}\` at $built by CI on Node 24, after typecheck, test and build."
