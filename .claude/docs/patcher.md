@@ -35,12 +35,15 @@ capabilities/defaults, and child-command network isolation.
 
 ## The entry-module shim (`bun-entry-module.ts`)
 
-tweakcc finds the module holding the bundle **by name**, and Claude Code 2.1.231 renamed it from
+tweakcc finds the module holding the bundle **by name**, and Claude Code 2.1.229 renamed it from
 `/$bunfs/root/src/entrypoints/cli.js` to `/$bunfs/root/cli`, which none of tweakcc's six accepted
-names match — so `readContent` threw and 2.1.231 could not be patched at all.
-tweakcc **4.3.3** added `/cli` to that list, so the shim is unnecessary from that version on;
-`.claude/docs/claude-code-internals.md` has the bundle-side detail. **Delete this shim once the
-tweakcc pin reaches 4.3.3, or once tweakcc identifies the module by `entryPointId`.**
+names match — so `readContent` threw and 2.1.229 and later could not be patched at all. (2.1.228 is
+the last `discoverable` release; 2.1.230 was never published.)
+tweakcc **4.3.3** added `/cli` to that list, but bumping the pin alone changes nothing: clodex
+mirrors the accepted-name list in `tweakccRecognizesModuleName` and it has no `/cli`, so the shim
+keeps firing until it is deleted. `.claude/docs/claude-code-internals.md` has the bundle-side
+detail. **Delete this shim once the tweakcc pin reaches 4.3.3, or once tweakcc identifies the module
+by `entryPointId`.**
 
 The name is used for identification only, so `shimEntryModuleName` swaps it for a stand-in of
 **identical byte length** (`/clodex--/claude` for a 16-byte original) that tweakcc does recognize,
@@ -75,7 +78,8 @@ tweakcc's own repack reads back as an ordinary module name.
   misparse returns null — leaving tweakcc's own error — instead of overwriting sixteen bytes at a
   guessed offset.
 - **More than one trailer can be in the file, so the scan validates rather than trusting position.**
-  Repacking is not size-neutral (an identity repack of 2.1.231 *shrinks* the blob by 61 bytes) and
+  Repacking is not size-neutral (an identity repack of 2.1.231 on Mach-O *shrinks* the blob by 61
+  bytes; ELF relocates instead, see below) and
   the replacement section content is written over the old, so the previous blob's trailer survives at
   a **higher** offset. Real binaries also carry a decoy `---- Bun! ----` around 55 MB — Bun's runtime
   ships the literal in `__TEXT`. Candidates are therefore tried from EOF backwards and the first one
@@ -88,13 +92,27 @@ tweakcc's own repack reads back as an ordinary module name.
   holds the never-publish-the-stand-in rule up, and it does not depend on the parse having picked the
   live blob: the stale-copy case gets the real name too.
   Refusing to publish on any surviving copy — the earlier behaviour — could not distinguish that
-  case from a benign one, and Claude Code 2.1.233 produces the benign one on every patch: the repack
-  rebuilds the blob and does not write over all of the old table, leaving an orphan copy behind
-  while the live table is correct — one copy, ~37% into the file, on the Linux 2.1.233 binary this
-  was measured against. That refusal made 2.1.233 unpatchable.
+  case from a benign one, and **every ELF build produces the benign one on every patch**. tweakcc
+  branches on container format, and only the ELF-with-a-`.bun`-section path *relocates* the section
+  to `align(nextVirtualAddress())` and repoints `BUN_COMPILED`; the original bytes are stranded
+  rather than overwritten, so the previous module table survives with one orphan copy of the
+  stand-in at its original offset, below the relocated blob, while the live table is correct.
+  Mach-O and PE assign in place and leave none. That refusal made every Linux install — x64 and
+  arm64, glibc and musl — unpatchable from clodex 2.5.2 on, for every Claude Code release since
+  2.1.229; macOS and Windows were never affected.
+  Relocation is also why an ELF candidate is ~2.4x the pristine binary (324 MB → 770 MB on
+  linux-x64 2.1.233), with roughly 2 GB live while candidate, backup and tweakcc's temp coexist.
+  That predates the shim — 2.1.228, which needs no shim at all, balloons identically — and it does
+  not compound, because the candidate is reseeded from pristine bytes on every run. Do not add a
+  size sanity bound: at 2.37x today, any plausible cap would recreate the refusal this replaced.
   Rewriting is sound only while every copy is one the shim wrote, so `shimEntryModuleName` declines a
-  binary that already carries the marker.
-- `scripts/extract-cc-bundles.mjs` needs the same shim to read a 2.1.231 bundle. It shims a **scratch
+  binary that already carries the marker. That guard cannot see a copy that arrives *after* it runs:
+  a local patch emitting the stand-in literal lands in the file at `writeContent` and is then
+  rewritten with the real name, silently. Reachable only by deliberately emitting clodex's own
+  sentinel from an opt-in local patch, but it is a fail-closed behaviour this trades away — narrow
+  both the sweep and the guard to occurrences followed by a NUL (Bun terminates every blob string;
+  a JS literal is followed by a quote).
+- `scripts/extract-cc-bundles.mjs` needs the same shim to read a 2.1.229-or-later bundle. It shims a **scratch
   copy**; the `.orig` backups are the only pristine bytes on the machine and nothing may write to
   them.
 
