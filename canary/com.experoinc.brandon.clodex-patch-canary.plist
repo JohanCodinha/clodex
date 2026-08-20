@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.experoinc.brandon.clodex-patch-canary</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/brandon/.local/bin/clodex-patch-canary-cron.sh</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/brandon</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/brandon/Library/Logs/clodex-patch-canary.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/brandon/Library/Logs/clodex-patch-canary.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/Users/brandon/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/brandon</string>
+    </dict>
+</dict>
+</plist>
