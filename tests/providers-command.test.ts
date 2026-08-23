@@ -138,6 +138,12 @@ describe('parseProvidersArgs', () => {
       removeId: 'openai',
       authMethod: 'native',
     });
+    expect(parseProvidersArgs(['auth', 'openai', '--browser'])).toEqual({
+      subcommand: 'auth',
+      showHelp: false,
+      removeId: 'openai',
+      authMethod: 'browser',
+    });
   });
 
   it('rejects the removed import subcommand', () => {
@@ -154,6 +160,7 @@ describe('parseProvidersArgs', () => {
     expect(help).toContain('providers remove');
     expect(help).toContain('refresh-models');
     expect(help).toContain('auth openai');
+    expect(help).toContain('auth openai --browser');
     expect(help).not.toContain('import');
     expect(help).toContain('built-in provider');
   });
@@ -973,6 +980,7 @@ describe('provider command cleanup reconciliation', () => {
     selectMock
       .mockResolvedValueOnce('provider:openai')
       .mockResolvedValueOnce('auth')
+      .mockResolvedValueOnce('native')
       .mockResolvedValueOnce('done');
     authenticateProviderMock.mockImplementation(async () => {
       await queueCredentialDelete(authRef);
@@ -989,6 +997,69 @@ describe('provider command cleanup reconciliation', () => {
     expect(warnMock).toHaveBeenCalledOnce();
     expect(warnMock).toHaveBeenCalledWith(
       'Credential cleanup is pending and will be retried by the next provider command.',
+    );
+  });
+});
+
+describe('hub OAuth method picker', () => {
+  let home: string;
+  const prevHome = process.env.CLODEX_HOME;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'clodex-oauth-picker-'));
+    process.env.CLODEX_HOME = home;
+    selectMock.mockReset();
+    authenticateProviderMock.mockReset();
+    logSuccessMock.mockReset();
+  });
+
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.CLODEX_HOME;
+    else process.env.CLODEX_HOME = prevHome;
+    rmSync(home, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  it('forwards the picked browser method to authenticateProvider', async () => {
+    selectMock
+      .mockResolvedValueOnce('auth-menu')
+      .mockResolvedValueOnce('browser')
+      .mockResolvedValueOnce('done');
+    authenticateProviderMock.mockResolvedValue({
+      registryProvider: openaiEntry({ id: 'openai-oauth', name: 'OpenAI (ChatGPT)' }),
+      credentialCleanupPending: false,
+    });
+
+    await expect(runProvidersCommand([])).resolves.toBe(0);
+
+    expect(authenticateProviderMock).toHaveBeenCalledOnce();
+    expect(authenticateProviderMock).toHaveBeenCalledWith(
+      'openai',
+      expect.objectContaining({ method: 'browser' }),
+    );
+  });
+
+  it('keeps device code as the picker default so Enter preserves today\'s behavior', async () => {
+    selectMock
+      .mockResolvedValueOnce('auth-menu')
+      .mockResolvedValueOnce('native')
+      .mockResolvedValueOnce('done');
+    authenticateProviderMock.mockResolvedValue({
+      registryProvider: openaiEntry({ id: 'openai-oauth', name: 'OpenAI (ChatGPT)' }),
+      credentialCleanupPending: false,
+    });
+
+    await expect(runProvidersCommand([])).resolves.toBe(0);
+
+    const pickerCall = selectMock.mock.calls[1]?.[0] as {
+      initialValue?: string;
+      options: Array<{ value: string }>;
+    };
+    expect(pickerCall.initialValue).toBe('native');
+    expect(pickerCall.options.map(option => option.value)).toEqual(['native', 'browser']);
+    expect(authenticateProviderMock).toHaveBeenCalledWith(
+      'openai',
+      expect.objectContaining({ method: 'native' }),
     );
   });
 });
