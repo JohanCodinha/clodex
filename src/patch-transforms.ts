@@ -38,7 +38,7 @@ import {
  * hash of the transform inputs to force that decision to be made rather than
  * forgotten.
  */
-export const PATCH_TRANSFORMS_VERSION = 8;
+export const PATCH_TRANSFORMS_VERSION = 9;
 
 export interface PatchScriptModelEntry {
   alias?: string;
@@ -436,6 +436,22 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // backtick so the model knows which extra names it may request and what they
   // actually are. Best-effort (cosmetic). The text is spliced into a backtick
   // template literal, so backticks and interpolation openers are stripped.
+  //
+  // The anchor ends at the template's own closing backtick and says nothing about
+  // what follows it. Through 2.1.241 the call closed immediately (`` `) ``);
+  // 2.1.242 started appending a conditional sentence to the same string
+  // (`` `+(fn()?"...":"") ``), and an anchor that insisted on the `)` read that as
+  // "not found" and silently dropped every custom model from the description the
+  // Agent tool shows.
+  //
+  // The wildcard skips backslash pairs rather than stopping at the first backtick
+  // BYTE, so it ends at the template's real close even if the description ever
+  // contains an escaped backtick. A plain `[^`]*?` would stop mid-escape there and
+  // splice the addition after the backslash, turning the once-escaped backtick into
+  // a live terminator — a syntax error in a module Bun loads at startup. No shipped
+  // release has one (checked on 2.1.208-2.1.232 and all eight 2.1.243 builds), and
+  // this keeps that corner fail-closed instead of fail-open. Constraining what
+  // FOLLOWS the template is what drifted in 2.1.242; this constrains nothing.
   // ---------------------------------------------------------------------------
   {
     const safe = (s: string) => String(s).replace(/`/g, "'").replace(/\$\{/g, '(');
@@ -445,7 +461,7 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
     }).join('; ');
     applyOnce(
       'PATCH 4: Agent tool model description',
-      /(describe\(`Optional model override for this agent[^`]*?)(`\))/,
+      /(describe\(`Optional model override for this agent(?:[^`\\]|\\.)*?)(`)/,
       (_m, body, close) =>
         body!.includes('Additional custom models')
           ? body! + close!

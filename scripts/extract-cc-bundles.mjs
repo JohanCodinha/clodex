@@ -27,9 +27,29 @@ import {
   copyFileSync,
   rmSync,
 } from 'node:fs';
+import { registerHooks } from 'node:module';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { inspectEntryModule, shimEntryModuleName } from '../src/bun-entry-module.ts';
+
+// `src/` spells its own imports the TypeScript way — `./bun-entry-module.js` for a file that is
+// really `./bun-entry-module.ts`. tsup and vitest understand that; bare `node` does not, and
+// resolves it to a file that does not exist. bun-entry-module.ts imports nothing relative, which is
+// why the static import above works; bun-bundle.ts does, so it is loaded dynamically BELOW this
+// hook — a static import would be resolved before this line ever runs. Same pattern, and the same
+// reason, as scripts/probe-patch-mechanism.mjs.
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier.startsWith('.') && specifier.endsWith('.js') && context.parentURL) {
+      const candidate = new URL(`${specifier.slice(0, -3)}.ts`, context.parentURL);
+      if (candidate.protocol === 'file:' && existsSync(candidate)) {
+        return nextResolve(candidate.href, context);
+      }
+    }
+    return nextResolve(specifier, context);
+  },
+});
+const { readClaudeBundle } = await import('../src/bun-bundle.ts');
 
 const args = process.argv.slice(2);
 if (args.includes('-h') || args.includes('--help')) {
@@ -117,7 +137,12 @@ for (const f of files) {
     }
     const inst = await tryDetectInstallation({ path: readFrom });
     if (!inst) throw new Error('tweakcc did not recognize the binary');
-    const src = await readContent(inst);
+    // Since Claude Code 2.1.242 the bundle is split across ~1,370 modules and tweakcc's
+    // `readContent` returns only the ~20 KB entry stub. Extracting that alone is worse than
+    // failing: every "I checked the bundle" claim made from it would be about 0.05% of the code.
+    // Read it the way `clodex patch` does, and fall back to tweakcc for older releases.
+    const bundle = readClaudeBundle(readFrom);
+    const src = bundle ? bundle.source : await readContent(inst);
     if (!src) throw new Error('readContent returned nothing');
     // These backups are only *named* pristine. clodex documents poisoned backups as reachable,
     // and a patched claude reports its version perfectly well — the patch marker is the only
@@ -127,7 +152,10 @@ for (const f of files) {
       console.log(`WARN ${f} carries a clodex patch marker — this backup is NOT pristine`);
     }
     writeFileSync(target, src);
-    console.log(`OK ${f} version=${inst.version} kind=${inst.kind} bytes=${src.length}`);
+    console.log(
+      `OK ${f} version=${inst.version} kind=${inst.kind} bytes=${src.length}`
+      + (bundle ? ` modules=${bundle.modules.length}` : ' modules=1 (tweakcc single-module read)'),
+    );
     ok++;
   } catch (e) {
     console.log('FAIL', f, String(e).slice(0, 200));
