@@ -142,6 +142,7 @@ export function cachedModelToLocal(
     freeStatus,
     ...projectContextStop(cached, provider.id, id),
     maxOutputTokens: cached.maxOutputTokens,
+    fastModelId: cached.fastModelId,
     supportedParameters: cached.supportedParameters,
     reasoning: cached.reasoning ?? modelsDev?.reasoning,
     interleavedReasoningField: cached.interleavedReasoningField ?? modelsDev?.interleaved?.field,

@@ -21,6 +21,7 @@ import { sendJson, readBody } from '../http-utils.js';
 import { providerDynamicHeaders } from '../github-copilot.js';
 import {
   anthropicSchemaRepairsFor,
+  applyFastModeVariant,
   relayAnthropicMessages,
   resolveOAuthRetryReplacement,
 } from '../upstream-forward.js';
@@ -325,7 +326,10 @@ async function handleAnthropicMessages(
     const betaHeaderRaw = req.headers['anthropic-beta'];
     const inboundBeta = Array.isArray(betaHeaderRaw) ? betaHeaderRaw.join(',') : betaHeaderRaw;
     const clientWantsStream = Boolean(body.stream);
-    const forwardBody: Record<string, unknown> = { ...body, model: upstreamModelId(model) };
+    const forwardBody: Record<string, unknown> = applyFastModeVariant(
+      { ...body, model: upstreamModelId(model) },
+      model.fastModelId,
+    );
     const authType = model.authType ?? 'api';
     const isOAuth = authType === 'oauth';
 

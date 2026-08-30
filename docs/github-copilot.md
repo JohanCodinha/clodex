@@ -126,10 +126,33 @@ out of the sign-in response and stores it on the provider, so those plans need n
 configuration. If your plan changes, run `clodex providers auth github-copilot` again to pick up the
 new host.
 
+## Thinking level and fast mode
+
+**Thinking level (effort).** Copilot's catalog says which levels each model accepts, and clodex
+offers exactly those in Claude Code's effort picker:
+
+- Claude models (Opus, Sonnet, Fable) are forwarded as-is, so Claude Code's own `thinking` and
+  `output_config.effort` reach the model unchanged — the same controls as against Anthropic. Haiku
+  advertises no effort levels and refuses the field, so none is offered.
+- GPT-5.x, Grok, Gemini and Kimi get the ladder Copilot lists for them (`reasoning_effort`), sent
+  as the Responses `reasoning.effort` or Chat Completions `reasoning_effort` parameter. A level a
+  model does not list is not offered and not sent.
+
+Claude Code's patched picker only bakes a ladder that includes low, medium and high; a model whose
+ladder lacks one of those (Kimi K3: low/high/max) still receives the level Claude Code sends by
+default (`high`), but the picker will not list it.
+
+**Fast mode.** Not from Claude Code: its `/fast` is an Anthropic-only feature that switches the
+session to native Opus 5 on your Claude plan (observed on Claude Code 2.1.251: "Fast mode ON ·
+model set to Opus 5"), so a Copilot model is never asked for fast mode from there. Other
+Anthropic-format clients of `clodex server --endpoint` can send `speed: "fast"`; Copilot does not
+accept that field but sells fast mode as a separate model (today only `claude-opus-4.8-fast`), so
+when the catalog has such a sibling the request is sent to it, and otherwise the field is removed
+by the self-repair above and the request runs at normal speed. Copilot's Responses endpoint rejects
+the OpenAI `service_tier` control, so clodex's `--fast` (the Codex fast tier) does not apply to
+Copilot models either.
+
 ## Support tier
 
 Community-supported: the clodex maintainer holds no Copilot account, so this integration cannot be
-exercised against the live API there. Effort selection reaches the GPT-5.x models (Responses API);
-the Claude models are forwarded untouched, so Claude Code's own thinking/effort settings apply to
-them exactly as they would against Anthropic, minus anything a given model refuses (see above).
-Chat Completions models take Copilot's defaults.
+exercised against the live API there.

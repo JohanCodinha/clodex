@@ -60,6 +60,8 @@ export interface ServerModelInfo {
   providerId?: string;
   /** Largest output the model accepts; requests above it are clamped, not refused. */
   maxOutputTokens?: number;
+  /** Upstream id to send instead when the client asks for fast mode (`speed: "fast"`). */
+  fastModelId?: string;
   /** Static headers sent on every upstream request (e.g. a plan/auth-tracking header a custom endpoint requires). */
   headers?: Record<string, string>;
   /** OAuth provider identity data (e.g. Claude Code's cliUserID/accountUUID) needed to fingerprint requests. */

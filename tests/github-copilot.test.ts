@@ -25,7 +25,16 @@ import {
 import { refreshStoredOAuthCredential } from '../src/oauth/refresh.js';
 import { supportsNativeOAuth } from '../src/oauth/types.js';
 import { isChatGptOAuthProvider } from '../src/registry/provider-kind.js';
-import { createGitHubCopilotFetch } from '../src/provider-factory.js';
+import {
+  createGitHubCopilotFetch,
+  effortProviderOptions,
+  getPatchReasoningCapabilities,
+  getReasoningCapabilities,
+} from '../src/provider-factory.js';
+import { applyFastModeVariant } from '../src/upstream-forward.js';
+import { localModelToRoute } from '../src/catalog.js';
+import { localProvidersToServerModels } from '../src/provider-catalog.js';
+import type { LocalProvider, LocalProviderModel } from '../src/types.js';
 import { getTemplateById } from '../src/provider-templates.js';
 import { fetchTemplateModels } from '../src/registry/fetch-template-models.js';
 
@@ -466,6 +475,101 @@ describe('copilot transport selection', () => {
       vi.doUnmock('@ai-sdk/openai');
       vi.resetModules();
     }
+  });
+});
+
+describe('copilot effort and fast mode from the catalog', () => {
+  const row = (id: string, extra: Record<string, unknown> = {}, supports: Record<string, unknown> = {}) => ({
+    id, name: id,
+    supported_endpoints: extra.endpoints ?? ['/chat/completions'],
+    capabilities: { type: 'chat', supports: { tool_calls: true, ...supports }, limits: { max_prompt_tokens: 100_000 } },
+  });
+  const catalog = {
+    data: [
+      row('claude-opus-5', { endpoints: ['/v1/messages', '/chat/completions'] }, { reasoning_effort: ['low', 'medium', 'high', 'xhigh', 'max'] }),
+      row('claude-haiku-4.5', { endpoints: ['/v1/messages', '/chat/completions'] }),
+      row('claude-opus-4.8', { endpoints: ['/v1/messages'] }, { reasoning_effort: ['low', 'medium', 'high'] }),
+      row('claude-opus-4.8-fast', { endpoints: ['/v1/messages'] }, { reasoning_effort: ['low', 'medium', 'high'] }),
+      row('grok-4.6', { endpoints: ['/responses'] }, { reasoning_effort: ['low', 'medium', 'high', 'xhigh'] }),
+      row('kimi-k3', {}, { reasoning_effort: ['low', 'high', 'max'] }),
+      row('gemini-3.7-flash', {}),
+    ],
+  };
+  const byId = Object.fromEntries(parseGitHubCopilotModels(catalog, '@ai-sdk/openai-compatible').map(m => [m.id, m]));
+
+  // The ladder is whatever Copilot advertises, as an identity map: Claude Code
+  // offers exactly those levels and each goes through unchanged.
+  it('turns the advertised reasoning_effort levels into a per-model effort ladder', () => {
+    expect(byId['grok-4.6']?.compatibility).toEqual({
+      reasoningEffortMap: { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh' },
+    });
+    expect(byId['grok-4.6']?.reasoning).toBe(true);
+    expect(byId['kimi-k3']?.compatibility?.reasoningEffortMap).toEqual({ low: 'low', high: 'high', max: 'max' });
+    expect(byId['gemini-3.7-flash']?.compatibility).toBeUndefined();
+    expect(byId['gemini-3.7-flash']?.reasoning).toBeUndefined();
+  });
+
+  it('lets Claude models on the Messages passthrough advertise effort, and says no for those that refuse it', () => {
+    expect(byId['claude-opus-5']?.compatibility).toEqual({
+      supportsCountTokens: false,
+      reasoningEffortMap: { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
+    });
+    expect(byId['claude-haiku-4.5']?.compatibility).toEqual({ supportsCountTokens: false, supportsReasoningEffort: false });
+    // The ladder reaches the model picker: controllable, with Copilot's levels.
+    const caps = getReasoningCapabilities('@ai-sdk/anthropic', 'claude-opus-5', { compatibility: byId['claude-opus-5']!.compatibility });
+    expect(caps.mode).toBe('controllable');
+    expect(caps.levels).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+  });
+
+  // The patcher bakes only the levels the effort mapper can express. Copilot's
+  // Claude ids are not spelled the way the Anthropic id rule expects, so
+  // without the catalog ladder Opus and Sonnet baked an empty picker.
+  it('bakes the catalog ladder for Claude models on the Messages passthrough', () => {
+    const metadata = { providerId: 'github-copilot', reasoning: true, compatibility: byId['claude-opus-5']!.compatibility };
+    expect(getPatchReasoningCapabilities('@ai-sdk/anthropic', 'claude-opus-5', metadata).levels)
+      .toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    expect(effortProviderOptions('@ai-sdk/anthropic', 'xhigh', 'claude-opus-5', metadata))
+      .toEqual({ anthropic: { thinking: { type: 'adaptive', effort: 'xhigh' } } });
+    // Haiku advertises none and refuses the field: nothing baked, nothing sent.
+    const haiku = { providerId: 'github-copilot', compatibility: byId['claude-haiku-4.5']!.compatibility };
+    expect(getPatchReasoningCapabilities('@ai-sdk/anthropic', 'claude-haiku-4.5', haiku).levels).toEqual([]);
+  });
+
+  // Grok is not an OpenAI model name, so the id-pattern rules would send no
+  // effort at all; the catalog ladder has to win in the OpenAI SDK branch.
+  it('sends the catalog effort for Responses models the id rules do not know', () => {
+    const metadata = { providerId: 'github-copilot', compatibility: byId['grok-4.6']!.compatibility };
+    expect(effortProviderOptions('@ai-sdk/openai', 'xhigh', 'grok-4.6', metadata)).toEqual({ openai: { reasoningEffort: 'xhigh' } });
+    // A level the model does not offer is not sent rather than guessed.
+    expect(effortProviderOptions('@ai-sdk/openai', 'max', 'grok-4.6', metadata)).toBeUndefined();
+    // Without a catalog ladder the OpenAI rules are untouched.
+    expect(effortProviderOptions('@ai-sdk/openai', 'high', 'gpt-5.6-sol', { providerId: 'github-copilot' })).toEqual({ openai: { reasoningEffort: 'high' } });
+    expect(effortProviderOptions('@ai-sdk/openai', 'high', 'grok-4.6', { providerId: 'github-copilot' })).toBeUndefined();
+  });
+
+  it('records the fast-mode sibling a model has, and never on the sibling itself', () => {
+    expect(byId['claude-opus-4.8']?.fastModelId).toBe('claude-opus-4.8-fast');
+    expect(byId['claude-opus-4.8-fast']?.fastModelId).toBeUndefined();
+    expect(byId['claude-opus-5']?.fastModelId).toBeUndefined();
+  });
+
+  it('routes a fast-mode request to the sibling model and drops the field the gateway rejects', () => {
+    const body = { model: 'claude-opus-4.8', speed: 'fast', messages: [] };
+    expect(applyFastModeVariant(body, 'claude-opus-4.8-fast')).toEqual({ model: 'claude-opus-4.8-fast', messages: [] });
+    // Nothing to route to, or not a fast-mode request: the body is untouched.
+    expect(applyFastModeVariant(body, undefined)).toBe(body);
+    expect(applyFastModeVariant({ model: 'claude-opus-4.8', messages: [] }, 'claude-opus-4.8-fast').model).toBe('claude-opus-4.8');
+  });
+
+  it('carries the fast-mode sibling onto proxy routes and server models', () => {
+    const model: LocalProviderModel = {
+      id: 'claude-opus-4.8', name: 'Opus 4.8', family: 'claude', brand: 'Claude', modelFormat: 'anthropic',
+      upstreamModelId: 'claude-opus-4.8', npm: '@ai-sdk/anthropic', baseUrl: 'https://api.githubcopilot.com',
+      apiBaseUrl: 'https://api.githubcopilot.com', contextWindow: 200_000, fastModelId: 'claude-opus-4.8-fast',
+    };
+    const provider: LocalProvider = { id: 'github-copilot', name: 'GitHub Copilot', apiKey: 'tok', authType: 'oauth', models: [model] };
+    expect(localModelToRoute(provider, model)?.fastModelId).toBe('claude-opus-4.8-fast');
+    expect(localProvidersToServerModels([provider])[0]?.fastModelId).toBe('claude-opus-4.8-fast');
   });
 });
 

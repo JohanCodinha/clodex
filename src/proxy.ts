@@ -24,6 +24,7 @@ import {
 } from './trace-log.js';
 import {
   anthropicSchemaRepairsFor,
+  applyFastModeVariant,
   relayAnthropicMessages,
   resolveOAuthRetryReplacement,
   UpstreamUnreachableError,
@@ -241,6 +242,8 @@ export interface ProxyRoute {
   contextWindow?: number;
   /** Largest output the model accepts; requests above it are clamped, not refused. */
   maxOutputTokens?: number;
+  /** Upstream id to send instead when the client asks for fast mode (`speed: "fast"`). */
+  fastModelId?: string;
   /** Input size above which the provider bills the whole request at a higher rate. */
   pricingBoundary?: number;
   npm?: string;      // OpenCode api.npm — when SDK-migrated, routes via the adapter
@@ -539,7 +542,7 @@ export async function startProxyCatalog(
       if (route.modelFormat === 'anthropic') {
         const betaHeaderRaw = req.headers['anthropic-beta'];
         const inboundBeta = Array.isArray(betaHeaderRaw) ? betaHeaderRaw.join(',') : betaHeaderRaw;
-        const forwardBody = { ...anthropicBody, model: route.realModelId };
+        const forwardBody = applyFastModeVariant({ ...anthropicBody, model: route.realModelId }, route.fastModelId);
         const targetUrl = `${upstreamUrl}/v1/messages`;
         const isOAuth = routeAuthType === 'oauth';
 
@@ -555,7 +558,9 @@ export async function startProxyCatalog(
           plog(() => `anthropic-oauth: model=${route.realModelId}, beta=${effectiveBeta}`);
           plog(() => `anthropic-oauth headers: user-agent=claude-cli/${CLAUDE_CODE_CLI_VERSION} x-app=cli session-header=${claudeCodeSessionId ? 'set' : 'missing'}`);
         } else {
-          plog(() => `anthropic-passthrough: model=${route.realModelId}, stream=${clientWantsStream}`);
+          plog(() => `anthropic-passthrough: model=${route.realModelId}${
+            forwardBody.model !== route.realModelId ? ` → ${String(forwardBody.model)}` : ''
+          }, stream=${clientWantsStream}`);
         }
 
         try {
