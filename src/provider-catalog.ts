@@ -398,6 +398,7 @@ export function localProvidersToServerModels(localProviders: LocalProvider[]): S
       authType: provider.authType,
       oauthAccountId: provider.oauthAccountId,
       contextWindow: model.contextWindow,
+      maxOutputTokens: model.maxOutputTokens,
       pricingBoundary: model.pricingBoundary,
       supportedParameters: model.supportedParameters,
       reasoning: model.reasoning,
