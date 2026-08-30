@@ -368,7 +368,10 @@ async function handleAnthropicMessages(
       log: message => plog(message),
       claudeCodeSessionId,
       extraHeaders: { ...model.headers, ...providerDynamicHeaders(model.providerId, forwardBody) },
-      repairs: anthropicSchemaRepairsFor(`${model.providerId ?? 'anthropic'}:${upstreamModelId(model)}`),
+      repairs: anthropicSchemaRepairsFor(
+        `${model.providerId ?? 'anthropic'}:${upstreamModelId(model)}`,
+        model.compatibility,
+      ),
       refreshToken,
       onTokenRefreshed: refreshed => { model.apiKey = refreshed; },
       // Echo the exact requested id when it differs from the upstream id, so

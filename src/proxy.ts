@@ -570,7 +570,10 @@ export async function startProxyCatalog(
             log: message => plog(message),
             claudeCodeSessionId,
             extraHeaders: { ...route.headers, ...providerDynamicHeaders(route.providerId, forwardBody) },
-            repairs: anthropicSchemaRepairsFor(`${route.providerId ?? 'anthropic'}:${route.realModelId}`),
+            repairs: anthropicSchemaRepairsFor(
+              `${route.providerId ?? 'anthropic'}:${route.realModelId}`,
+              route.compatibility,
+            ),
             refreshToken: route.refreshToken,
             onTokenRefreshed: refreshed => { route.apiKey = refreshed; },
             signal: clientAbort.signal,
