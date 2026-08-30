@@ -4,8 +4,9 @@ Guidance for coding agents and maintainers working in this repo. Read this file 
 deeper documents below only when you touch the subsystem they cover.
 
 **clodex** bridges Claude Code to non-Anthropic models — OpenAI API key (`openai`),
-ChatGPT/Codex-plan OAuth (`openai-oauth`), or the community-supported OpenCode Go (`opencode-go`)
-and GitHub Copilot (`github-copilot`) providers. Provider support tiers are documented in README.
+ChatGPT/Codex-plan OAuth (`openai-oauth`), or the community-supported OpenCode Go (`opencode-go`),
+GitHub Copilot (`github-copilot`) and OpenRouter (`openrouter`) providers. Provider support tiers
+are documented in README.
 It is a trimmed fork of relay-ai (full commit history preserved).
 
 **Prime directive.** The translation, caching, auto-compaction, and OAuth-continuation code encodes
