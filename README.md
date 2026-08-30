@@ -43,6 +43,7 @@ clodex claude                  # 5. launch Claude Code on an OpenAI model
 | OpenAI (ChatGPT / Codex plan) | OAuth | Fully supported by the clodex maintainer |
 | OpenCode Go | API key | Community-supported — maintained by its contributor |
 | [GitHub Copilot](./docs/github-copilot.md) | OAuth | Community-supported — maintained by its contributor |
+| [OpenRouter](./docs/openrouter.md) | API key | Community-supported — maintained by its contributor |
 
 **Community-supported** means the maintainer holds no account for that service,
 so it cannot be exercised against the live API here or debugged when the vendor
