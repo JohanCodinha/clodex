@@ -33,6 +33,7 @@ import {
   type ResponsesWebSocketDiagnosticEvent,
 } from '../src/oauth/responses-websocket.js';
 import { sdkUpstreamErrorDetails } from '../src/upstream-error.js';
+import { createCopilotResponsesEventNormalizer } from '../src/github-copilot.js';
 
 const WS_URL = 'wss://chatgpt.com/backend-api/codex/responses';
 
@@ -1467,6 +1468,39 @@ describe('createResponsesWebSocketFetch', () => {
       errorMessageHash: expect.stringMatching(/^[a-f0-9]{16}$/),
     }));
     expect(JSON.stringify(diagnostics)).not.toContain('sensitive backend explanation');
+  });
+
+  // GitHub Copilot's gateway rotates item_id across the events of one output
+  // item. Without repair the reasoning tracker reports anomalies and the
+  // output capture that feeds head matching never sees the text; with the
+  // per-request normalizer the ids are pinned before any reader runs.
+  it.each([
+    { label: 'without a normalizer', normalizer: undefined, pinned: false },
+    { label: 'with the Copilot normalizer', normalizer: createCopilotResponsesEventNormalizer, pinned: true },
+  ])('applies the event normalizer before any reader keys on item ids ($label)', async ({ normalizer, pinned }) => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      onDiagnostic: event => diagnostics.push(event),
+      createEventNormalizer: normalizer,
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: JSON.stringify({ store: false }) });
+    const socket = lastSocket();
+    const frames = [
+      { type: 'response.created', response: { id: 'resp_rot' } },
+      { type: 'response.output_item.added', output_index: 0, item: { id: 'rs_announced', type: 'reasoning' } },
+      { type: 'response.reasoning_summary_part.added', output_index: 0, item_id: 'rotated-1', summary_index: 0, part: { type: 'summary_text', text: '' } },
+      { type: 'response.reasoning_summary_text.delta', output_index: 0, item_id: 'rotated-2', summary_index: 0, delta: 'thinking' },
+      { type: 'response.reasoning_summary_part.done', output_index: 0, item_id: 'rotated-3', summary_index: 0, part: { type: 'summary_text', text: 'thinking' } },
+      { type: 'response.output_item.done', output_index: 0, item: { id: 'rotated-4', type: 'reasoning' } },
+      { type: 'response.completed', response: { id: 'resp_rot', output: [] } },
+    ];
+    for (const frame of frames) socket.emit('message', Buffer.from(JSON.stringify(frame)));
+    const out = await readAll(res);
+
+    const anomalies = diagnostics.filter(d => d.event === 'ws_response_protocol_anomaly');
+    if (pinned) expect(anomalies).toHaveLength(0);
+    else expect(anomalies.length).toBeGreaterThan(0);
+    expect(out.includes('"item_id":"rs_announced"')).toBe(pinned);
   });
 
   it('logs a content-free anomaly when reasoning delta has no matching start', async () => {

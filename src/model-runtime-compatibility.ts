@@ -23,6 +23,16 @@ export interface ModelRuntimeCompatibility {
   /** Whether the upstream accepts long prompt-cache retention controls. */
   supportsLongCacheRetention?: boolean;
   /**
+   * Whether to mark explicit prompt-cache breakpoints (`prompt_cache_breakpoint`
+   * parts) on Responses requests. Explicit `false` keeps the upstream on
+   * implicit caching. Breakpoint parts follow Claude Code's `cache_control`,
+   * which moves between turns, so the same developer item is serialized
+   * differently from one request to the next; a transport that continues a
+   * conversation by matching the previous request's items (the Responses
+   * WebSocket) then never matches and re-sends the whole history every turn.
+   */
+  supportsPromptCacheBreakpoints?: boolean;
+  /**
    * Whether an anthropic-format upstream implements
    * `POST /v1/messages/count_tokens`. Speaking the Messages API does not imply
    * it — OpenCode Zen documents `/v1/responses`, `/v1/chat/completions` and

@@ -48,14 +48,18 @@ list at refresh time and routes each model over the protocol that serves a codin
 | Models | Protocol | Why |
 | --- | --- | --- |
 | Claude (Opus, Sonnet, Haiku, Fable) | Anthropic Messages, forwarded as-is | Claude Code's own format: no translation, native cache breakpoints, thinking blocks round-trip |
-| GPT-5.x, Grok | Responses API | Required by these models; reasoning state and caching carry across turns |
+| GPT-5.x | Responses API **over WebSocket** | Required by these models; one socket per conversation, each turn sends only its new items (`previous_response_id`), so a long agentic session stops re-uploading its history. `CLODEX_COPILOT_WEBSOCKETS=0` falls back to plain HTTP. |
+| Grok | Responses API (HTTP) | Required by Grok; Copilot does not offer it the socket |
 | Gemini, Kimi, legacy GPT-4 | Chat Completions | The only protocol they offer |
 
 Two Copilot quirks are handled on the wire so they never reach Claude Code:
 
 - **Responses streams rotate item ids.** Every streamed event carries a different `item_id` for the
   same output item, which the OpenAI SDK cannot follow (every reasoning model died with
-  "reasoning part … not found"). Clodex pins each event to the id announced for its output index.
+  "reasoning part … not found"). Clodex pins each event to the id announced for its output index —
+  on the HTTP stream and, for the socket transport, on each frame before clodex's own continuation
+  bookkeeping reads it. Chains are connection-local on Copilot's side; a dropped socket costs one
+  full resend, after which continuation resumes.
 - **The Messages gateway trails Anthropic's schema.** It rejects newer beta flags and request fields
   (`cache_control.scope`, `diagnostics`, …) as "Extra inputs", and some models refuse `adaptive`
   thinking or an effort setting. Rather than a fixed allowlist that breaks with every Claude Code
@@ -93,6 +97,11 @@ makes sure the caching is both effective and visible:
 
 - The volatile Anthropic billing line Claude Code prepends is stripped on every translated route, so
   the request prefix stays byte-stable across turns and the server cache can actually hit.
+- The Responses models use Copilot's implicit prompt cache rather than explicit breakpoint marks:
+  breakpoints follow Claude Code's `cache_control`, which moves between turns, and an item that is
+  serialized differently from one turn to the next can never be matched by the socket's
+  continuation. Verified live: 7.2k tokens written on turn 1, read back on turn 2, on both
+  transports.
 - Streaming requests ask Copilot to report usage (`stream_options.include_usage`); without that the
   stream ends with no usage frame and cache hits would be invisible.
 - Copilot's cached-token count is mapped into the Anthropic usage shape

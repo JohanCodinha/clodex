@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
+  copilotResponsesWebSocketUrl,
+  copilotSupportsWebSocket,
   copilotTransportFor,
+  copilotWebSocketsEnabled,
+  createCopilotResponsesEventNormalizer,
   createCopilotResponsesIdState,
   createCopilotResponsesStreamNormalizer,
   isCopilotResponsesStream,
@@ -32,6 +36,7 @@ import {
   getReasoningCapabilities,
 } from '../src/provider-factory.js';
 import { applyFastModeVariant } from '../src/upstream-forward.js';
+import { translateRequest, type AnthropicRequest } from '../src/sdk-adapter.js';
 import { localModelToRoute } from '../src/catalog.js';
 import { localProvidersToServerModels } from '../src/provider-catalog.js';
 import type { LocalProvider, LocalProviderModel } from '../src/types.js';
@@ -353,7 +358,46 @@ describe('copilot request headers', () => {
 describe('copilot transport wiring', () => {
   afterEach(() => {
     vi.doUnmock('@ai-sdk/openai-compatible');
+    vi.doUnmock('@ai-sdk/openai');
+    vi.doUnmock('../src/oauth/responses-websocket.js');
     vi.resetModules();
+    delete process.env.CLODEX_COPILOT_WEBSOCKETS;
+  });
+
+  async function buildCopilotResponsesModel(preferWebSockets: boolean) {
+    vi.resetModules();
+    const wsFetch = vi.fn(async () => new Response('', { status: 200 }));
+    const createResponsesWebSocketFetch = vi.fn(() => wsFetch);
+    vi.doMock('../src/oauth/responses-websocket.js', () => ({ createResponsesWebSocketFetch }));
+    const responses = vi.fn((modelId: string) => ({ modelId }));
+    const createOpenAI = vi.fn(() => ({ responses, chat: vi.fn() }));
+    vi.doMock('@ai-sdk/openai', () => ({ createOpenAI }));
+    const { createLanguageModel } = await import('../src/provider-factory.js');
+    await createLanguageModel({
+      npm: '@ai-sdk/openai',
+      modelId: 'gpt-5.6-sol',
+      apiKey: 'copilot-token',
+      baseURL: 'https://api.business.githubcopilot.com',
+      providerId: 'github-copilot',
+      authType: 'oauth',
+      preferWebSockets,
+    });
+    return { createResponsesWebSocketFetch, options: createOpenAI.mock.calls[0]![0] as Record<string, unknown> };
+  }
+
+  it('puts WebSocket-capable Copilot Responses models on the socket transport with the frame repair', async () => {
+    const { createResponsesWebSocketFetch } = await buildCopilotResponsesModel(true);
+    expect(createResponsesWebSocketFetch).toHaveBeenCalledWith(
+      'wss://api.business.githubcopilot.com/responses',
+      undefined,
+      expect.objectContaining({ providerId: 'github-copilot', createEventNormalizer: expect.any(Function) }),
+    );
+  });
+
+  it('keeps HTTP for models without the socket endpoint and when opted out', async () => {
+    expect((await buildCopilotResponsesModel(false)).createResponsesWebSocketFetch).not.toHaveBeenCalled();
+    process.env.CLODEX_COPILOT_WEBSOCKETS = '0';
+    expect((await buildCopilotResponsesModel(true)).createResponsesWebSocketFetch).not.toHaveBeenCalled();
   });
 
   async function buildOpenAiCompatibleModel(providerId: string): Promise<Record<string, unknown>> {
@@ -412,6 +456,66 @@ describe('copilot transport selection', () => {
     expect(copilotTransportFor([])).toBeNull();
   });
 
+  it('marks Responses models Copilot also serves over WebSocket, and only those', () => {
+    const models = parseGitHubCopilotModels({
+      data: [
+        { id: 'gpt-5.6-sol', name: 'Sol', supported_endpoints: ['/responses', 'ws:/responses'],
+          capabilities: { type: 'chat', supports: { tool_calls: true } } },
+        { id: 'grok-4.6', name: 'Grok', supported_endpoints: ['/responses'],
+          capabilities: { type: 'chat', supports: { tool_calls: true } } },
+        { id: 'claude-opus-5', name: 'Opus', supported_endpoints: ['/v1/messages', 'ws:/responses'],
+          capabilities: { type: 'chat', supports: { tool_calls: true } } },
+      ],
+    }, '@ai-sdk/openai-compatible');
+    const byId = Object.fromEntries(models.map(m => [m.id, m]));
+    expect(byId['gpt-5.6-sol']?.preferWebSockets).toBe(true);
+    expect(byId['grok-4.6']?.preferWebSockets).toBeUndefined();
+    // A Messages-passthrough model never takes the Responses socket.
+    expect(byId['claude-opus-5']?.preferWebSockets).toBeUndefined();
+    expect(copilotSupportsWebSocket(['/responses'])).toBe(false);
+    expect(copilotSupportsWebSocket(undefined)).toBe(false);
+  });
+
+  // Explicit breakpoint parts follow Claude Code's cache_control, which moves
+  // between turns, so the same developer item hashes differently each request
+  // and the socket's continuation never matches its own history.
+  it('keeps Copilot Responses models on implicit caching so items stay stable across turns', () => {
+    const [sol] = parseGitHubCopilotModels({
+      data: [{ id: 'gpt-5.6-sol', name: 'Sol', supported_endpoints: ['/responses', 'ws:/responses'],
+        capabilities: { type: 'chat', supports: { tool_calls: true, reasoning_effort: ['low', 'high'] } } }],
+    }, '@ai-sdk/openai-compatible');
+    expect(sol?.compatibility).toEqual({ reasoningEffortMap: { low: 'low', high: 'high' }, supportsPromptCacheBreakpoints: false });
+
+    const body: AnthropicRequest = {
+      model: 'gpt-5.6-sol',
+      system: [{ text: 'You are terse.', cache_control: { type: 'ephemeral' } }],
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'system', content: [{ type: 'text', text: 'reminder', cache_control: { type: 'ephemeral' } }] },
+      ],
+    };
+    const withFlag = translateRequest(body, '@ai-sdk/openai', { reasoningMetadata: { compatibility: sol!.compatibility, upstreamModelId: 'gpt-5.6-sol' } });
+    // System travels as `instructions`, and the mid-conversation system turn is a plain string item.
+    expect(withFlag.instructions).toBe('You are terse.');
+    const reminder = withFlag.messages.find(m => m.role === 'system') as { content: unknown; providerOptions?: unknown };
+    expect(reminder.content).toBe('reminder');
+    expect(reminder.providerOptions).toBeUndefined();
+    expect(withFlag.providerOptions?.openai?.promptCacheOptions).toBeUndefined();
+
+    // Without the flag GPT-5.6 keeps the explicit shape (the public-API behaviour).
+    const without = translateRequest(body, '@ai-sdk/openai', { reasoningMetadata: { upstreamModelId: 'gpt-5.6-sol' } });
+    expect(without.instructions).toBeUndefined();
+    expect(without.providerOptions?.openai?.promptCacheOptions).toEqual({ mode: 'implicit', ttl: '30m' });
+  });
+
+  it('derives the WebSocket URL from the account host and honours the opt-out', () => {
+    expect(copilotResponsesWebSocketUrl('https://api.business.githubcopilot.com')).toBe('wss://api.business.githubcopilot.com/responses');
+    expect(copilotResponsesWebSocketUrl('https://api.githubcopilot.com/')).toBe('wss://api.githubcopilot.com/responses');
+    expect(copilotWebSocketsEnabled({})).toBe(true);
+    expect(copilotWebSocketsEnabled({ CLODEX_COPILOT_WEBSOCKETS: '0' })).toBe(false);
+    expect(copilotWebSocketsEnabled({ CLODEX_COPILOT_WEBSOCKETS: '1' })).toBe(true);
+  });
+
   it('routes each model to the SDK package its transport needs', () => {
     const models = parseGitHubCopilotModels({
       data: [
@@ -435,7 +539,7 @@ describe('copilot transport selection', () => {
       compatibility: { supportsCountTokens: false, supportsReasoningEffort: false },
     });
     expect(byId['grok-4.6']).toMatchObject({ modelFormat: 'openai', npm: '@ai-sdk/openai' });
-    expect(byId['grok-4.6']?.compatibility).toBeUndefined();
+    expect(byId['grok-4.6']?.compatibility).toEqual({ supportsPromptCacheBreakpoints: false });
     expect(byId['kimi-k3']).toMatchObject({ modelFormat: 'openai', npm: '@ai-sdk/openai-compatible' });
     expect(byId['ws-only']).toBeUndefined();
   });
@@ -502,6 +606,7 @@ describe('copilot effort and fast mode from the catalog', () => {
   it('turns the advertised reasoning_effort levels into a per-model effort ladder', () => {
     expect(byId['grok-4.6']?.compatibility).toEqual({
       reasoningEffortMap: { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh' },
+      supportsPromptCacheBreakpoints: false,
     });
     expect(byId['grok-4.6']?.reasoning).toBe(true);
     expect(byId['kimi-k3']?.compatibility?.reasoningEffortMap).toEqual({ low: 'low', high: 'high', max: 'max' });
@@ -808,6 +913,18 @@ describe('copilot Responses stream repair', () => {
     expect(isCopilotResponsesStream('https://api.githubcopilot.com/responses', 'text/event-stream; charset=utf-8')).toBe(true);
     expect(isCopilotResponsesStream('https://api.githubcopilot.com/responses', 'application/json')).toBe(false);
     expect(isCopilotResponsesStream('https://api.githubcopilot.com/chat/completions', 'text/event-stream')).toBe(false);
+  });
+
+  // One socket carries many responses; output indexes restart with each, so
+  // the pin table must too, or turn 2's index 0 would inherit turn 1's id.
+  it('resets the frame normalizer per response', () => {
+    const normalize = createCopilotResponsesEventNormalizer();
+    normalize({ type: 'response.created' });
+    normalize({ type: 'response.output_item.added', output_index: 0, item: { id: 'first' } });
+    expect((normalize({ type: 'response.output_text.delta', output_index: 0, item_id: 'rot' }) as { item_id: string }).item_id).toBe('first');
+    normalize({ type: 'response.created' });
+    expect((normalize({ type: 'response.output_text.delta', output_index: 0, item_id: 'rot' }) as { item_id: string }).item_id).toBe('rot');
+    expect(normalize('not an object')).toBe('not an object');
   });
 
   it('wraps a streaming Responses fetch and passes other responses through', async () => {
