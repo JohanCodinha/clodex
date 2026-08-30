@@ -38,6 +38,8 @@ export interface LocalProviderModel {
   pricingBoundary?: number;
   /** Largest output the model accepts, independent of the input window. */
   maxOutputTokens?: number;
+  /** Upstream id of this model's fast-mode variant, when the provider sells fast mode as its own model. */
+  fastModelId?: string;
   /** Provider-reported request parameters, e.g. OpenRouter supported_parameters. */
   supportedParameters?: string[];
   /** Broad model metadata: model can produce reasoning/thinking output. */

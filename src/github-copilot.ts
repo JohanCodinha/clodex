@@ -178,7 +178,7 @@ interface CopilotModelRow {
   capabilities?: {
     family?: unknown;
     type?: unknown;
-    supports?: { tool_calls?: unknown; vision?: unknown } | null;
+    supports?: { tool_calls?: unknown; vision?: unknown; reasoning_effort?: unknown } | null;
     limits?: {
       max_context_window_tokens?: unknown;
       max_prompt_tokens?: unknown;
@@ -220,26 +220,50 @@ export function copilotTransportFor(supportedEndpoints: unknown): CopilotTranspo
 }
 
 /**
+ * The effort ladder Copilot advertises for a model, as the identity map the
+ * runtime's compatibility layer understands: Claude Code offers exactly these
+ * levels and each is sent through unchanged. Absent when the catalog lists
+ * none, so the model advertises no effort control at all.
+ */
+function effortMapFor(levels: unknown): Record<string, string> | undefined {
+  if (!Array.isArray(levels)) return undefined;
+  const named = levels.filter((level): level is string => typeof level === 'string' && level.trim().length > 0);
+  if (named.length === 0) return undefined;
+  return Object.fromEntries(named.map(level => [level, level]));
+}
+
+/**
  * The per-model routing fields for a transport. The SDK package is what the
- * proxy keys its dispatch on; the anthropic entries also mark that Copilot
- * has no token-counting endpoint (so counts come from the local estimate,
- * not a 404) and that effort cannot be graded on a forwarded Messages body.
+ * proxy keys its dispatch on. The anthropic entries also mark that Copilot has
+ * no token-counting endpoint (so counts come from the local estimate, not a
+ * 404); on that transport Claude Code's own `output_config.effort` is
+ * forwarded untouched, so the ladder is whatever the catalog advertises, and a
+ * model with none (Haiku) refuses the field — clodex says so rather than
+ * offering a control that would be rejected.
  */
 function transportFields(
   transport: CopilotTransport,
   chatNpm: string,
-): Pick<CachedModel, 'modelFormat' | 'npm' | 'compatibility'> {
+  reasoningEffortMap: Record<string, string> | undefined,
+): Pick<CachedModel, 'modelFormat' | 'npm' | 'compatibility' | 'reasoning'> {
+  const effort = reasoningEffortMap
+    ? { reasoning: true, compatibility: { reasoningEffortMap } }
+    : {};
   switch (transport) {
     case 'messages':
       return {
         modelFormat: 'anthropic',
         npm: '@ai-sdk/anthropic',
-        compatibility: { supportsCountTokens: false, supportsReasoningEffort: false },
+        ...effort,
+        compatibility: {
+          supportsCountTokens: false,
+          ...(reasoningEffortMap ? { reasoningEffortMap } : { supportsReasoningEffort: false }),
+        },
       };
     case 'responses':
-      return { modelFormat: 'openai', npm: '@ai-sdk/openai' };
+      return { modelFormat: 'openai', npm: '@ai-sdk/openai', ...effort };
     case 'chat':
-      return { modelFormat: 'openai', npm: chatNpm };
+      return { modelFormat: 'openai', npm: chatNpm, ...effort };
   }
 }
 
@@ -273,6 +297,11 @@ export function parseGitHubCopilotModels(body: unknown, chatNpm: string): Cached
 
   const models: CachedModel[] = [];
   const seen = new Set<string>();
+  // Copilot sells Claude fast mode as a sibling model (`<id>-fast`); knowing
+  // the sibling lets a fast-mode request be routed to it instead of failing.
+  const ids = new Set(rows
+    .map(raw => (raw && typeof raw === 'object' ? (raw as CopilotModelRow).id : undefined))
+    .filter((id): id is string => typeof id === 'string'));
 
   for (const raw of rows) {
     if (!raw || typeof raw !== 'object') continue;
@@ -300,6 +329,8 @@ export function parseGitHubCopilotModels(body: unknown, chatNpm: string): Cached
       : (id.split(/[-/:]/)[0] ?? id);
     const vendor = typeof row.vendor === 'string' ? row.vendor.trim() : '';
     const brand = deriveBrand(family);
+    const reasoningEffortMap = effortMapFor(capabilities.supports?.reasoning_effort);
+    const fastModelId = !id.endsWith('-fast') && ids.has(`${id}-fast`) ? `${id}-fast` : undefined;
 
     seen.add(id);
     models.push({
@@ -310,10 +341,11 @@ export function parseGitHubCopilotModels(body: unknown, chatNpm: string): Cached
       brand: brand === 'Other' && vendor ? vendor : brand,
       ...(contextWindow !== undefined ? { contextWindow } : {}),
       ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+      ...(fastModelId ? { fastModelId } : {}),
       ...(capabilities.supports?.vision === true
         ? { modalities: ['text', 'image'] as ('text' | 'image')[] }
         : {}),
-      ...transportFields(transport, chatNpm),
+      ...transportFields(transport, chatNpm, reasoningEffortMap),
       // Copilot bills per plan — premium-request multipliers or usage-based
       // budgets — never a per-token rate clodex could quote. Leaving `cost`
       // unset keeps the model out of the free/paid classification rather than

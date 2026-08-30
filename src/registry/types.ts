@@ -78,6 +78,8 @@ export interface CachedModel {
   pricingBoundaryNote?: string;
   /** Largest output the model accepts, independent of the input window. */
   maxOutputTokens?: number;
+  /** Upstream id of this model's fast-mode variant, when the provider sells fast mode as its own model. */
+  fastModelId?: string;
   cost?: { input: number; output: number; cache_read?: number; cache_write?: number };
   isFree?: boolean;
   freeStatus?: FreeStatus;

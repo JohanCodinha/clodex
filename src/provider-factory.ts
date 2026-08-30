@@ -1050,6 +1050,12 @@ export function effortProviderOptions(
   }
 
   if (npm === '@ai-sdk/openai' || npm === '@ai-sdk/azure') {
+    // A catalog-declared ladder (GitHub Copilot's Grok, gpt-5-mini) wins over
+    // the id-pattern rules, which only know OpenAI's own model names.
+    if (modelId && metadata?.compatibility?.reasoningEffortMap) {
+      const reasoningEffort = compatibilityReasoningEffort(effort, modelId, metadata.compatibility);
+      return reasoningEffort ? { openai: { reasoningEffort } } : undefined;
+    }
     if (!modelId || !modelPrefersResponsesApi(modelId)) return undefined;
     const reasoningEffort = mapCodexEffortToOpenAI(effort, modelId);
     if (!reasoningEffort) return undefined;
@@ -1065,6 +1071,17 @@ export function effortProviderOptions(
   }
 
   if (npm === '@ai-sdk/anthropic' || npm === VERTEX_ANTHROPIC_NPM) {
+    // A catalog-declared ladder wins over the id-pattern rule, which only
+    // knows Anthropic's own spelling of model ids (GitHub Copilot lists
+    // `claude-opus-5` and `claude-sonnet-4.6`). On a passthrough route the
+    // client's own effort field is what reaches the wire; this shape is what
+    // the patcher consults to decide which levels to offer.
+    if (modelId && metadata?.compatibility?.reasoningEffortMap) {
+      const mapped = compatibilityReasoningEffort(effort, modelId, metadata.compatibility);
+      return mapped
+        ? { anthropic: { thinking: { type: 'adaptive', effort: mapped } } }
+        : undefined;
+    }
     if (!modelId || !isClaudeReasoningModel(modelId)) return undefined;
     const mapped = mapCodexEffortToAnthropic(effort);
     return mapped

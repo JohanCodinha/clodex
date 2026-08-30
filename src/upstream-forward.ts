@@ -377,6 +377,24 @@ export function repairFromRejection(
   return null;
 }
 
+/**
+ * Claude Code puts fast mode on the wire as `speed: "fast"` (plus a beta flag)
+ * on the same model id. Some providers sell fast mode as a separate model
+ * instead — GitHub Copilot lists `claude-opus-4.8-fast` beside
+ * `claude-opus-4.8` — so the request is sent to that variant and the field
+ * the provider would reject is dropped. Without a variant the body is
+ * returned as-is and the request degrades to normal speed once the gateway
+ * rejects the field.
+ */
+export function applyFastModeVariant(
+  body: Record<string, unknown>,
+  fastModelId: string | undefined,
+): Record<string, unknown> {
+  if (!fastModelId || body.speed !== 'fast') return body;
+  const { speed: _speed, ...rest } = body;
+  return { ...rest, model: fastModelId };
+}
+
 /** Relay an Anthropic /v1/messages response (JSON or SSE) to the client. */
 export interface RelayAnthropicOptions {
   inboundBeta?: string;
