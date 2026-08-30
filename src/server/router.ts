@@ -18,7 +18,11 @@ import {
   type OpenAiRequest,
 } from '../openai-adapter.js';
 import { sendJson, readBody } from '../http-utils.js';
-import { relayAnthropicMessages, resolveOAuthRetryReplacement } from '../upstream-forward.js';
+import {
+  anthropicSchemaRepairsFor,
+  relayAnthropicMessages,
+  resolveOAuthRetryReplacement,
+} from '../upstream-forward.js';
 import {
   anthropicPromptTooLongMessage,
   estimateAnthropicInputTokens,
@@ -359,6 +363,7 @@ async function handleAnthropicMessages(
       log: message => plog(message),
       claudeCodeSessionId,
       extraHeaders: model.headers,
+      repairs: anthropicSchemaRepairsFor(`${model.providerId ?? 'anthropic'}:${upstreamModelId(model)}`),
       refreshToken,
       onTokenRefreshed: refreshed => { model.apiKey = refreshed; },
       // Echo the exact requested id when it differs from the upstream id, so
