@@ -2,6 +2,9 @@ import type { LocalProvider } from './types.js';
 
 const OAUTH_FAVORITE_NAMES: Record<string, string> = {
   'openai-oauth': 'OpenAI OAuth (ChatGPT)',
+  // Already names its auth; the generic " OAuth" suffix below would read as
+  // "GitHub Copilot OAuth", which is not what anyone calls it.
+  'github-copilot': 'GitHub Copilot',
 };
 
 export function favoriteProviderDisplayName(

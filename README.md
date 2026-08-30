@@ -42,6 +42,7 @@ clodex claude                  # 5. launch Claude Code on an OpenAI model
 | OpenAI | API key | Fully supported by the clodex maintainer |
 | OpenAI (ChatGPT / Codex plan) | OAuth | Fully supported by the clodex maintainer |
 | OpenCode Go | API key | Community-supported — maintained by its contributor |
+| [GitHub Copilot](./docs/github-copilot.md) | OAuth | Community-supported — maintained by its contributor |
 
 **Community-supported** means the maintainer holds no account for that service,
 so it cannot be exercised against the live API here or debugged when the vendor
@@ -276,13 +277,14 @@ Two things worth knowing about the numbers:
 | Subcommand | Effect |
 | --- | --- |
 | *(none)* | Provider hub wizard |
-| `add` | Add OpenAI or OpenCode Go with an API key, or sign in with ChatGPT |
+| `add` | Add OpenAI or OpenCode Go with an API key, or sign in with ChatGPT or GitHub Copilot |
 | `auth openai` | Sign in with ChatGPT/Codex-plan OAuth (device code; `--browser` for workspaces that disable device codes) |
+| `auth github-copilot` | Sign in with your GitHub Copilot plan (device code at github.com/login/device) |
 | `list` | Show configured providers |
 | `remove <id>` | Remove a provider by id |
 | `refresh-models [id]` | Update cached model lists |
 
-Providers supported: `openai` (API key, platform.openai.com), `openai-oauth` (ChatGPT/Codex plan), and `opencode-go` (OpenCode Go API key). OpenCode Go exposes its Anthropic Messages and Chat Completions models; Responses-only entries are intentionally excluded. See [OpenCode Go provider](docs/opencode-go.md).
+Providers supported: `openai` (API key, platform.openai.com), `openai-oauth` (ChatGPT/Codex plan), `opencode-go` (OpenCode Go API key), and `github-copilot` (GitHub Copilot plan). OpenCode Go exposes its Anthropic Messages and Chat Completions models; Responses-only entries are intentionally excluded. See [OpenCode Go provider](docs/opencode-go.md). GitHub Copilot exposes whichever chat models your plan entitles you to — Anthropic, OpenAI and Google alike — over one Chat Completions endpoint. See [GitHub Copilot provider](docs/github-copilot.md).
 
 ### Root
 

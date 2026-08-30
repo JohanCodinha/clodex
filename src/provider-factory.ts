@@ -15,6 +15,12 @@ import {
 } from './oauth/claude-identity.js';
 import { isCredentialBearingHeader } from './credential-headers.js';
 import {
+  GITHUB_COPILOT_PROVIDER_ID,
+  createCopilotResponsesStreamNormalizer,
+  githubCopilotDynamicHeadersForBody,
+  isCopilotResponsesStream,
+} from './github-copilot.js';
+import {
   transformOpenAiCompatibleRequestBody,
   type ModelRuntimeCompatibility,
 } from './model-runtime-compatibility.js';
@@ -51,6 +57,45 @@ const fetchWithoutCredentialHeaders: typeof fetch = (input, init) => {
   }
   return fetch(input, { ...init, headers });
 };
+
+/**
+ * The Copilot transport: the SDK's fetch, plus what a static header map and a
+ * stock SDK cannot do for this upstream.
+ *
+ * Outbound, two headers depend on the payload rather than the account.
+ * `x-initiator` is the one with a bill attached: Claude Code drives many
+ * upstream turns per user message, and GitHub meters premium requests by
+ * user-initiated turn, so a tool-loop continuation reported as user-initiated
+ * charges the allowance for work asked for once. `copilot-vision-request` is
+ * required for an image to be read rather than rejected.
+ *
+ * Inbound, a Responses stream has its rotating item ids pinned so the SDK can
+ * follow it (see github-copilot.ts).
+ */
+export function createGitHubCopilotFetch(baseFetch?: typeof fetch): typeof fetch {
+  return async (input, init) => {
+    const headers = new Headers(
+      init?.headers ?? (input instanceof Request ? input.headers : undefined),
+    );
+    for (const [name, value] of Object.entries(githubCopilotDynamicHeadersForBody(init?.body))) {
+      headers.set(name, value);
+    }
+    // Resolved per request, not captured at construction: the language model
+    // is built once and cached, so a transport swapped in later still applies.
+    const response = await (baseFetch ?? fetch)(input, { ...init, headers });
+    // Copilot rotates item ids across Responses stream events, which the SDK
+    // cannot follow; pin them in flight. See github-copilot.ts.
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (response.body && isCopilotResponsesStream(url, response.headers.get('content-type'))) {
+      return new Response(response.body.pipeThrough(createCopilotResponsesStreamNormalizer()), {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      });
+    }
+    return response;
+  };
+}
 
 /**
  * True when a model id must use the OpenAI/xAI Responses API instead of
@@ -167,6 +212,18 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
   if (npm === '@ai-sdk/openai') {
     const { createOpenAI } = await import('@ai-sdk/openai');
     const useResponsesEndpoint = shouldUseOpenAiResponsesEndpoint(modelId);
+    // Copilot's Responses-only models (GPT-5.x, Grok). Same OpenAI SDK, but
+    // against Copilot's host with the Copilot token and editor headers — the
+    // OAuth arm below is the ChatGPT Codex backend and must not catch these.
+    if (spec.providerId === GITHUB_COPILOT_PROVIDER_ID) {
+      const copilot = createOpenAI({
+        apiKey,
+        ...(baseURL ? { baseURL } : {}),
+        ...(spec.headers ? { headers: spec.headers } : {}),
+        fetch: createGitHubCopilotFetch(),
+      });
+      return useResponsesEndpoint ? copilot.responses(modelId) : copilot.chat(modelId);
+    }
     const tokenAccountId = spec.authType === 'oauth'
       ? extractOpenAiAccountId({ access_token: apiKey })?.trim()
       : undefined;
@@ -253,6 +310,20 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
       name: spec.providerId ?? 'openai-compatible',
       baseURL: baseURL ?? '',
       ...(spec.authType !== 'none' && apiKey.trim() ? { apiKey } : {}),
+      ...(spec.providerId === GITHUB_COPILOT_PROVIDER_ID
+        ? {
+            fetch: createGitHubCopilotFetch(),
+            // Ask for usage on streams (stream_options.include_usage).
+            // Without it Copilot ends the stream with no usage frame, so the
+            // client falls back to a local input estimate and never sees the
+            // cached-token count — cache hits become invisible and the
+            // context/cost display drifts. Copilot-only: other compatible
+            // upstreams have not been verified to accept stream_options.
+            includeUsage: true,
+          }
+        : {}),
+      // Last so an anonymous provider keeps credential stripping even if it
+      // ever shares an id with a credentialed one.
       ...(spec.authType === 'none' ? { fetch: fetchWithoutCredentialHeaders } : {}),
       ...(spec.headers ? { headers: spec.headers } : {}),
       ...(spec.compatibility

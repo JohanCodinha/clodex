@@ -2,6 +2,7 @@
 
 import { TEST_TIMEOUT_MS } from '../constants.js';
 import { OPENCODE_GO_PROVIDER_ID } from '../data/opencode-go-models.js';
+import { GITHUB_COPILOT_PROVIDER_ID, parseGitHubCopilotModels } from '../github-copilot.js';
 import { deriveBrand } from '../models.js';
 import { resolveContextWindow } from '../context-window.js';
 import type { ProviderTemplate } from '../provider-templates.js';
@@ -391,11 +392,18 @@ export async function fetchTemplateModels(
       // Failed to parse, use empty object
     }
 
-    const discovered = parseModelList(
-      json,
-      template.npm,
-      template.id === OPENCODE_GO_PROVIDER_ID,
-    );
+    // Copilot does not answer in the OpenAI `{ data: [{ id }] }` shape the
+    // shared parser reads: its context window, tool support, and model type
+    // all sit under `capabilities`. Through the generic parser every Copilot
+    // model would arrive with no context window, and the context window is
+    // what drives Claude Code's auto-compaction.
+    const discovered = template.id === GITHUB_COPILOT_PROVIDER_ID
+      ? parseGitHubCopilotModels(json, template.npm)
+      : parseModelList(
+          json,
+          template.npm,
+          template.id === OPENCODE_GO_PROVIDER_ID,
+        );
     const models = applyTemplateModelMetadata(template, discovered);
     if (models.length === 0) {
       // An allowlist template can end up empty for two very different reasons,

@@ -1,6 +1,8 @@
 // oauth/refresh.ts — refresh OAuth tokens before inference
 
+import { refreshGitHubCopilotToken } from './github-copilot.js';
 import { refreshOpenAiAccessToken } from './openai.js';
+import { GITHUB_COPILOT_PROVIDER_ID } from '../github-copilot.js';
 import type { StoredOAuthCredential } from './types.js';
 import { accessTokenIsExpiring, NATIVE_OAUTH_PROVIDER_IDS, oauthCredentialNeedsRefresh, tokensToStoredCredential } from './types.js';
 
@@ -25,6 +27,10 @@ export async function refreshStoredOAuthCredential(
   let tokens;
   if (providerId === 'openai' || providerId === 'openai-oauth') {
     tokens = await refreshOpenAiAccessToken(cred.refresh);
+  } else if (providerId === GITHUB_COPILOT_PROVIDER_ID) {
+    // `refresh` holds the long-lived GitHub OAuth token, which mints a new
+    // Copilot API token without any user interaction.
+    tokens = await refreshGitHubCopilotToken(cred.refresh);
   } else {
     throw new Error(`OAuth refresh not implemented for provider "${providerId}"`);
   }

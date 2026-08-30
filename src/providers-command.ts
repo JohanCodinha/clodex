@@ -27,7 +27,13 @@ import { loadRegistry } from './registry/io.js';
 import { withProviderMutationLock } from './registry/lock.js';
 import type { RegistryProvider } from './registry/types.js';
 import { refreshAllProviderModels, refreshProviderModelsWithCredential } from './registry/refresh-models.js';
-import { authenticateProvider, providerAuthHelpText, validateOAuthAccountName, type ProviderAuthMethod } from './registry/provider-auth.js';
+import {
+  authenticateProvider,
+  providerAuthHelpText,
+  supportsBrowserSignIn,
+  validateOAuthAccountName,
+  type ProviderAuthMethod,
+} from './registry/provider-auth.js';
 import { supportsNativeOAuth } from './oauth/types.js';
 import { browseAllModels } from './prompts.js';
 import {
@@ -406,8 +412,14 @@ function providerLabel(name: string, modelCount: number, enabled: boolean): stri
   return `${fmtEnabledStar(enabled)} ${fmtProvider(name)} ${pc.dim(`(${modelCount} model${modelCount === 1 ? '' : 's'})`)}`;
 }
 
-/** Interactive method picker; Enter keeps the device-code default. Null = cancelled. */
-export async function promptOAuthMethod(): Promise<ProviderAuthMethod | null> {
+/**
+ * Interactive method picker; Enter keeps the device-code default. Null = cancelled.
+ *
+ * Providers with only one sign-in path skip the question entirely rather than
+ * offering a browser option that would be refused a moment later.
+ */
+export async function promptOAuthMethod(providerId?: string): Promise<ProviderAuthMethod | null> {
+  if (providerId !== undefined && !supportsBrowserSignIn(providerId)) return 'native';
   const choice = await p.select({
     message: 'How do you want to sign in?',
     initialValue: 'native' as ProviderAuthMethod,
@@ -635,11 +647,15 @@ async function runProvidersAddWithCleanupState(
   const configuredIds = providers.map(provider => provider.id);
   const options: Array<{ value: string; label: string; hint: string }> = [];
 
-  if (!configuredIds.includes('openai-oauth')) {
+  for (const template of listVisibleOAuthTemplates(configuredIds)) {
     options.push({
-      value: 'oauth',
-      label: 'Sign in with ChatGPT (Plus/Pro plan)',
-      hint: 'OAuth (device code or browser) — no API key needed',
+      value: `oauth:${template.id}`,
+      label: template.id === 'openai-oauth'
+        ? 'Sign in with ChatGPT (Plus/Pro plan)'
+        : `Sign in with ${template.name}`,
+      hint: supportsBrowserSignIn(template.id)
+        ? 'OAuth (device code or browser) — no API key needed'
+        : 'OAuth (device code) — no API key needed',
     });
   }
   for (const template of listRegistryAddableTemplates(providers)) {
@@ -666,10 +682,11 @@ async function runProvidersAddWithCleanupState(
     return 0;
   }
 
-  if (choice === 'oauth') {
-    const method = await promptOAuthMethod();
+  if (typeof choice === 'string' && choice.startsWith('oauth:')) {
+    const providerId = choice.slice('oauth:'.length);
+    const method = await promptOAuthMethod(providerId);
     if (method === null) return 0;
-    return runProvidersAuthWithCleanupState('openai', method, cleanupState);
+    return runProvidersAuthWithCleanupState(providerId, method, cleanupState);
   }
   if (typeof choice === 'string' && choice.startsWith('api:')) {
     return runTemplateAddFlow(choice.slice('api:'.length), cleanupState);
@@ -838,7 +855,7 @@ async function runProviderDetail(id: string): Promise<'back' | 'removed'> {
   }
 
   if (action === 'auth') {
-    const method = await promptOAuthMethod();
+    const method = await promptOAuthMethod(id);
     if (method === null) return 'back';
     await runWithCredentialCleanup(state =>
       runProvidersAuthWithCleanupState(id, method, state));
@@ -970,9 +987,19 @@ export async function runProvidersHub(): Promise<number> {
     }
 
     const configuredIds = new Set(entries.map(entry => entry.id));
-    if (listVisibleOAuthTemplates(configuredIds).length > 0) {
-      options.push({ value: 'auth-menu', label: '→ Sign in with ChatGPT (OAuth)', hint: 'device code or browser' });
-    } else if (configuredIds.has('openai-oauth')) {
+    const signInTemplates = listVisibleOAuthTemplates(configuredIds);
+    if (signInTemplates.length > 0) {
+      options.push({
+        value: 'auth-menu',
+        label: `→ Sign in with ${signInTemplates.map(t => t.name).join(' or ')} (OAuth)`,
+        hint: 'device code',
+      });
+    }
+    // Independent of the sign-in entry above, not an `else`: once a second
+    // OAuth provider exists, "some provider is still unconfigured" no longer
+    // implies "ChatGPT is unconfigured", and chaining them would hide the
+    // named-account action from every user who has ChatGPT but not Copilot.
+    if (configuredIds.has('openai-oauth')) {
       options.push({
         value: 'auth-account',
         label: '→ Add another ChatGPT account',
@@ -1000,10 +1027,19 @@ export async function runProvidersHub(): Promise<number> {
       continue;
     }
     if (choice === 'auth-menu') {
-      const method = await promptOAuthMethod();
+      const templates = listVisibleOAuthTemplates(configuredIds);
+      const target = templates.length === 1
+        ? templates[0]!.id
+        : await p.select({
+            message: 'Which account do you want to sign in with?',
+            options: templates.map(t => ({ value: t.id, label: t.name, hint: t.id })),
+          });
+      if (p.isCancel(target)) continue;
+      const providerId = String(target);
+      const method = await promptOAuthMethod(providerId);
       if (method === null) continue;
       await runWithCredentialCleanup(state =>
-        runProvidersAuthWithCleanupState('openai', method, state));
+        runProvidersAuthWithCleanupState(providerId, method, state));
       continue;
     }
     if (choice === 'auth-account') {
@@ -1020,7 +1056,7 @@ export async function runProvidersHub(): Promise<number> {
         },
       });
       if (p.isCancel(name)) continue;
-      const accountMethod = await promptOAuthMethod();
+      const accountMethod = await promptOAuthMethod('openai');
       if (accountMethod === null) continue;
       await runWithCredentialCleanup(state =>
         runProvidersAuthWithCleanupState('openai', accountMethod, state, String(name)));

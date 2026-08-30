@@ -8,6 +8,12 @@ import {
   OPENCODE_GO_PROVIDER_ID,
   OPENCODE_GO_PROVIDER_NAME,
 } from './data/opencode-go-models.js';
+import {
+  GITHUB_COPILOT_API_BASE_URL,
+  GITHUB_COPILOT_PROVIDER_ID,
+  GITHUB_COPILOT_PROVIDER_NAME,
+  githubCopilotStaticHeaders,
+} from './github-copilot.js';
 
 export type ProviderAuthType = 'api' | 'oauth' | 'none';
 export type ProviderModelSource = 'api-list' | 'static-seed' | 'manual-only';
@@ -162,6 +168,26 @@ export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
     npm: '@ai-sdk/openai',
     signupUrl: 'https://chatgpt.com',
     modelSource: 'api-list',
+    supported: true,
+  },
+  {
+    id: GITHUB_COPILOT_PROVIDER_ID,
+    name: GITHUB_COPILOT_PROVIDER_NAME,
+    authType: 'oauth',
+    npm: '@ai-sdk/openai-compatible',
+    // Copilot speaks Chat Completions for every model it serves, including the
+    // Anthropic and Google ones, so there is a single wire format here.
+    defaultBaseUrl: GITHUB_COPILOT_API_BASE_URL,
+    // `/models`, not `/v1/models`: the Copilot API is unversioned in the path
+    // and answers 404 on the shared default.
+    modelsPath: '/models',
+    signupUrl: 'https://github.com/features/copilot',
+    modelSource: 'api-list',
+    headers: githubCopilotStaticHeaders(),
+    // Copilot bills a subscription with per-model premium-request multipliers,
+    // not per token. Layering the global per-token pricing cache over these
+    // models would quote a price the user is never charged.
+    preserveModelPricing: true,
     supported: true,
   },
 ];

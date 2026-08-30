@@ -1,4 +1,4 @@
-// provider-auth.ts — clodex providers auth (native OpenAI device-code flow)
+// provider-auth.ts — clodex providers auth (native OpenAI / GitHub Copilot device-code flows)
 
 import { printOAuthBrowserPanel, printOAuthStepsPanel } from '../ui.js';
 import pc from 'picocolors';
@@ -12,7 +12,9 @@ import {
 } from '../env.js';
 import { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
 import { credentialInstanceAuthRef } from '../credential-helper.js';
+import { runGitHubCopilotDeviceCodeFlow } from '../oauth/github-copilot.js';
 import { runOpenAiBrowserFlow, runOpenAiDeviceCodeFlow } from '../oauth/openai.js';
+import { GITHUB_COPILOT_PROVIDER_ID, GITHUB_COPILOT_PROVIDER_NAME } from '../github-copilot.js';
 import {
   supportsNativeOAuth,
   tokensToStoredCredential,
@@ -74,36 +76,66 @@ const OPENAI_DISPLAY = 'OpenAI ChatGPT Plus/Pro';
 const PROVIDER_DISPLAY: Record<NativeOAuthProviderId, string> = {
   openai: OPENAI_DISPLAY,
   'openai-oauth': OPENAI_DISPLAY,
+  [GITHUB_COPILOT_PROVIDER_ID]: GITHUB_COPILOT_PROVIDER_NAME,
 };
+
+/**
+ * Providers offering the browser (PKCE) alternative to a device code.
+ *
+ * GitHub's device flow is not restricted the way a ChatGPT workspace admin can
+ * restrict OpenAI's, so Copilot has no reason to carry a second sign-in path —
+ * and offering `--browser` for it would advertise a flow that does not exist.
+ */
+const BROWSER_SIGN_IN_PROVIDERS = new Set<string>(['openai', 'openai-oauth']);
+
+export function supportsBrowserSignIn(providerId: string): boolean {
+  return BROWSER_SIGN_IN_PROVIDERS.has(providerId);
+}
 
 function openBrowser(url: string): void {
   open(url).catch(() => {});
 }
 
-async function runNativeDeviceCode(providerId: NativeOAuthProviderId): Promise<StoredOAuthCredential> {
+/** A completed sign-in: the credential to store, plus any account-specific API host. */
+interface NativeSignIn {
+  credential: StoredOAuthCredential;
+  /** Copilot business/enterprise plans answer on their own host. */
+  apiUrl?: string;
+}
+
+async function runNativeDeviceCode(providerId: NativeOAuthProviderId): Promise<NativeSignIn> {
   const label = PROVIDER_DISPLAY[providerId];
   printOAuthStepsPanel(`${label} — Sign in`, label);
 
   const spinner = p.spinner();
   spinner.start('Waiting for authorization...');
 
+  const announce = ({ url, userCode }: { url: string; userCode: string }) => {
+    spinner.stop('');
+    p.log.info(`Visit: ${pc.cyan(url)}`);
+    p.log.info(`Enter code: ${pc.bold(userCode)}`);
+    openBrowser(url);
+    spinner.start('Waiting for authorization...');
+  };
+
   try {
-    const { tokens, accountId } = await runOpenAiDeviceCodeFlow(({ url, userCode }) => {
-      spinner.stop('');
-      p.log.info(`Visit: ${pc.cyan(url)}`);
-      p.log.info(`Enter code: ${pc.bold(userCode)}`);
-      openBrowser(url);
-      spinner.start('Waiting for authorization...');
-    });
+    if (providerId === GITHUB_COPILOT_PROVIDER_ID) {
+      const { tokens, accountId, apiUrl } = await runGitHubCopilotDeviceCodeFlow(announce);
+      spinner.stop(pc.green(
+        accountId ? `Signed in to GitHub Copilot as ${accountId}` : 'Signed in to GitHub Copilot',
+      ));
+      return { credential: tokensToStoredCredential(tokens, undefined, accountId), apiUrl };
+    }
+    const { tokens, accountId } = await runOpenAiDeviceCodeFlow(announce);
     spinner.stop(pc.green('Signed in to OpenAI ChatGPT'));
-    return tokensToStoredCredential(tokens, undefined, accountId);
+    return { credential: tokensToStoredCredential(tokens, undefined, accountId) };
   } catch (err) {
     spinner.stop('');
     throw err;
   }
 }
 
-async function runNativeBrowserSignIn(providerId: NativeOAuthProviderId): Promise<StoredOAuthCredential> {
+async function runNativeBrowserSignIn(providerId: NativeOAuthProviderId): Promise<NativeSignIn> {
   const label = PROVIDER_DISPLAY[providerId];
   printOAuthBrowserPanel(`${label} — Sign in`, label);
 
@@ -118,7 +150,7 @@ async function runNativeBrowserSignIn(providerId: NativeOAuthProviderId): Promis
       spinner.start('Waiting for sign-in in your browser...');
     });
     spinner.stop(pc.green('Signed in to OpenAI ChatGPT'));
-    return tokensToStoredCredential(tokens, undefined, accountId);
+    return { credential: tokensToStoredCredential(tokens, undefined, accountId) };
   } catch (err) {
     spinner.stop('');
     throw err;
@@ -136,7 +168,8 @@ async function upsertOAuthAccountSlot(
     const entry = registry.providers.find(pr => pr.id === registryId);
     if (!entry) {
       throw new Error(
-        `Provider "${registryId}" is not configured yet — run the default sign-in first: clodex providers auth openai`,
+        `Provider "${registryId}" is not configured yet — run the default sign-in first: `
+        + `clodex providers auth ${registryId}`,
       );
     }
     const previousAuthRef = getOAuthAccountSlot(entry, account)?.authRef;
@@ -199,6 +232,7 @@ async function upsertOAuthProvider(
   providerId: string,
   authRef: string,
   expectedAuthRef: string | undefined,
+  apiUrl?: string,
 ): Promise<RegistryProvider> {
   return withRegistryWriteLock(async () => {
     const registryId = toOAuthRegistryId(providerId);
@@ -229,7 +263,10 @@ async function upsertOAuthProvider(
         authType: 'oauth',
         api: {
           npm: template.npm,
-          url: template.defaultBaseUrl ?? '',
+          // The sign-in's own answer wins over the template default: a Copilot
+          // business or enterprise plan is served from its own host, and the
+          // individual-plan default answers 401 for those accounts.
+          url: apiUrl ?? template.defaultBaseUrl ?? '',
           ...(template.headers ? { headers: template.headers } : {}),
         },
         addedAt: new Date().toISOString(),
@@ -271,6 +308,12 @@ async function upsertOAuthProvider(
       delete entry.refreshedAt;
     }
 
+    // A re-sign-in is also how a plan change (individual -> business) reaches
+    // the stored record, so adopt the host this sign-in reported.
+    if (apiUrl && entry.api.url !== apiUrl) {
+      entry = { ...entry, api: { ...entry.api, url: apiUrl } };
+    }
+
     const idx = registry.providers.findIndex(provider => provider.id === registryId);
     if (idx >= 0) registry.providers[idx] = entry;
     else registry.providers.push(entry);
@@ -291,6 +334,7 @@ async function persistNativeOAuthCredential(
   providerId: string,
   cred: StoredOAuthCredential,
   accountName?: string,
+  apiUrl?: string,
 ): Promise<{ registryProvider: RegistryProvider; credentialCleanupPending: boolean }> {
   const registryId = toOAuthRegistryId(providerId);
   const account = accountName
@@ -307,13 +351,14 @@ async function persistNativeOAuthCredential(
         }
         if (accountName && !existing) {
           throw new Error(
-            `Provider "${registryId}" is not configured yet — run the default sign-in first: clodex providers auth openai`,
+            `Provider "${registryId}" is not configured yet — run the default sign-in first: `
+            + `clodex providers auth ${registryId}`,
           );
         }
         if (accountName && existing?.authType !== 'oauth') {
           throw new Error(
             `Provider "${registryId}" does not currently have a default OAuth sign-in — `
-            + 'run clodex providers auth openai without --account first.',
+            + `run clodex providers auth ${registryId} without --account first.`,
           );
         }
         return accountName
@@ -342,7 +387,7 @@ async function persistNativeOAuthCredential(
       }
       return accountName
         ? upsertOAuthAccountSlot(registryId, accountName, authRef, existingAuthRef)
-        : upsertOAuthProvider(providerId, authRef, existingAuthRef);
+        : upsertOAuthProvider(providerId, authRef, existingAuthRef, apiUrl);
     });
   });
 
@@ -368,7 +413,15 @@ export async function authenticateProvider(
   const accountName = options.account === undefined ? undefined : validateOAuthAccountName(options.account);
 
   if (!supportsNativeOAuth(providerId)) {
-    throw new Error('OAuth sign-in is only available for openai (ChatGPT Plus/Pro).');
+    throw new Error(
+      'OAuth sign-in is only available for openai (ChatGPT Plus/Pro) and github-copilot.',
+    );
+  }
+
+  if (options.method === 'browser' && !supportsBrowserSignIn(providerId)) {
+    throw new Error(
+      `${PROVIDER_DISPLAY[providerId]} signs in with a device code only — re-run without --browser.`,
+    );
   }
 
   if (accountName) {
@@ -379,13 +432,14 @@ export async function authenticateProvider(
     const existing = loadRegistryStrict().providers.find(provider => provider.id === registryId);
     if (!existing) {
       throw new Error(
-        `Provider "${registryId}" is not configured yet — run the default sign-in first: clodex providers auth openai`,
+        `Provider "${registryId}" is not configured yet — run the default sign-in first: `
+        + `clodex providers auth ${registryId}`,
       );
     }
     if (existing.authType !== 'oauth') {
       throw new Error(
         `Provider "${registryId}" does not currently have a default OAuth sign-in — `
-        + 'run clodex providers auth openai without --account first.',
+        + `run clodex providers auth ${registryId} without --account first.`,
       );
     }
   }
@@ -401,10 +455,10 @@ export async function authenticateProvider(
     );
   }
 
-  const cred = options.method === 'browser'
+  const { credential: cred, apiUrl } = options.method === 'browser'
     ? await runNativeBrowserSignIn(providerId)
     : await runNativeDeviceCode(providerId);
-  const persisted = await persistNativeOAuthCredential(providerId, cred, accountName);
+  const persisted = await persistNativeOAuthCredential(providerId, cred, accountName, apiUrl);
 
   const refreshSpinner = p.spinner();
   refreshSpinner.start('Refreshing model list...');
@@ -456,17 +510,20 @@ ${pc.bold('Usage:')}
   clodex providers auth openai
   clodex providers auth openai --browser
   clodex providers auth openai --account work
+  clodex providers auth github-copilot
 
 ${pc.bold('Device code (works on SSH/VPS):')}
-  openai   ChatGPT Plus/Pro (device code at auth.openai.com/codex/device)
+  openai           ChatGPT Plus/Pro (device code at auth.openai.com/codex/device)
+  github-copilot   GitHub Copilot (device code at github.com/login/device)
 
 ${pc.bold('Browser sign-in:')}
   --browser   sign in through your browser instead of a device code — use this
               when your workspace admin has disabled device code authorization.
               Needs a local browser, so it does not work over plain SSH.
+              OpenAI only; GitHub Copilot always uses the device code.
 
 ${pc.bold('Named accounts:')}
-  --account <name>   store an additional ChatGPT account under a named slot
-                     (the default sign-in is untouched). Select one at launch:
+  --account <name>   store an additional account under a named slot (the
+                     default sign-in is untouched). Select one at launch:
                      CLODEX_OAUTH_ACCOUNT=work clodex claude`;
 }

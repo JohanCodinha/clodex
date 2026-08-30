@@ -26,9 +26,32 @@ describe('provider templates', () => {
     expect(getTemplateById('groq')).toBeUndefined();
   });
 
-  it('lists only the OpenAI OAuth template for discovery surfaces', () => {
-    expect(listVisibleOAuthTemplates().map(t => t.id)).toEqual(['openai-oauth']);
+  it('lists the OAuth templates for discovery surfaces', () => {
+    expect(listVisibleOAuthTemplates().map(t => t.id)).toEqual(['github-copilot', 'openai-oauth']);
     expect(listVisibleOAuthTemplates(['openai-oauth']).map(t => t.id)).not.toContain('openai-oauth');
+    expect(listVisibleOAuthTemplates(['github-copilot']).map(t => t.id)).not.toContain('github-copilot');
+  });
+
+  it('points GitHub Copilot at its own unversioned models path and editor headers', () => {
+    const template = getTemplateById('github-copilot')!;
+    expect(template.authType).toBe('oauth');
+    expect(template.npm).toBe('@ai-sdk/openai-compatible');
+    expect(template.defaultBaseUrl).toBe('https://api.githubcopilot.com');
+    // /v1/models — the shared default — is a 404 on the Copilot API.
+    expect(template.modelsPath).toBe('/models');
+    expect(template.headers).toMatchObject({
+      'copilot-integration-id': 'vscode-chat',
+      'editor-version': expect.stringContaining('vscode/'),
+    });
+    // A bearer token baked into stored headers would outlive its ~30 minutes.
+    expect(Object.keys(template.headers ?? {}).map(k => k.toLowerCase())).not.toContain('authorization');
+    // Copilot bills premium requests, not tokens: no per-token price applies.
+    expect(template.preserveModelPricing).toBe(true);
+  });
+
+  it('keeps GitHub Copilot out of the API-key add list', () => {
+    expect(listSupportedTemplates().map(t => t.id)).not.toContain('github-copilot');
+    expect(listAddableTemplates([]).map(t => t.id)).not.toContain('github-copilot');
   });
 
   it('excludes already-configured providers from addable list', () => {
