@@ -38,6 +38,15 @@ export interface ResponsesWebSocketFetchOptions {
   now?: () => number;
   /** Opt-in structured transport diagnostics; never receives conversation content. */
   onDiagnostic?: (event: ResponsesWebSocketDiagnosticEvent) => void;
+  /**
+   * Per-request repair applied to every parsed frame before this client keys
+   * any bookkeeping on it and before the frame reaches the SDK. Exists for
+   * upstreams whose frames are not self-consistent — GitHub Copilot's
+   * gateway rotates `item_id` across the events of one output item — so the
+   * continuation and reasoning trackers below see the ids they expect.
+   * Called once per request; the returned function keeps that request's state.
+   */
+  createEventNormalizer?: () => (event: unknown) => unknown;
 }
 
 export interface ResponsesWebSocketDiagnosticEvent extends Record<string, unknown> {
@@ -92,6 +101,8 @@ interface RequestContext {
   recentUpstreamEventTypes: string[];
   emittedProtocolAnomalies: Set<string>;
   emitDiagnostic?: (event: { event: string } & Record<string, unknown>) => void;
+  /** See ResponsesWebSocketFetchOptions.createEventNormalizer. */
+  normalizeEvent?: (event: unknown) => unknown;
   entry?: ConnectionEntry;
   createReplacement: () => ConnectionEntry;
   abortCleanup?: () => void;
@@ -1547,6 +1558,9 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
     flushPending(ctx);
     return;
   }
+  // Ahead of every reader of the frame: the trackers, the output capture that
+  // feeds head matching, and the downstream stream all key on item ids.
+  if (ctx.normalizeEvent) event = ctx.normalizeEvent(event);
 
   const type = eventType(event);
   trackReasoningProtocol(entry, ctx, event, type);
@@ -2171,6 +2185,7 @@ export function createResponsesWebSocketFetch(
           emitDiagnostic: options.onDiagnostic
             ? event => emitDiagnostic(options, event, diagnosticCorrelation)
             : undefined,
+          normalizeEvent: options.createEventNormalizer?.(),
           createReplacement: () => createConnection(
             WebSocket as unknown as WebSocketConstructor,
             wsUrl,

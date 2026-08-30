@@ -563,6 +563,7 @@ export function translateRequest(
 
   const upstreamModelId = options?.reasoningMetadata?.upstreamModelId ?? body.model;
   const supportsExplicitOpenAiCaching = !options?.openAiOAuth
+    && options?.reasoningMetadata?.compatibility?.supportsPromptCacheBreakpoints !== false
     && supportsOpenAiPromptCacheBreakpoints(upstreamModelId);
 
   // Keep related requests in one cache partition. Prefer Claude Code's stable

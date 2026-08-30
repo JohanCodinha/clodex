@@ -16,6 +16,9 @@ import {
 import { isCredentialBearingHeader } from './credential-headers.js';
 import {
   GITHUB_COPILOT_PROVIDER_ID,
+  copilotResponsesWebSocketUrl,
+  copilotWebSocketsEnabled,
+  createCopilotResponsesEventNormalizer,
   createCopilotResponsesStreamNormalizer,
   githubCopilotDynamicHeadersForBody,
   isCopilotResponsesStream,
@@ -216,11 +219,26 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
     // against Copilot's host with the Copilot token and editor headers — the
     // OAuth arm below is the ChatGPT Codex backend and must not catch these.
     if (spec.providerId === GITHUB_COPILOT_PROVIDER_ID) {
+      // Models Copilot also serves over the Responses WebSocket keep the
+      // conversation on one socket and send only each turn's new items, the
+      // same continuation clodex uses for the Codex backend. The socket
+      // client parses frames before the SDK sees them, so Copilot's rotating
+      // item ids are pinned there too; the Copilot wrapper still supplies the
+      // per-request headers, which reach the upgrade.
+      const useWebSocket = useResponsesEndpoint && spec.preferWebSockets && baseURL && copilotWebSocketsEnabled();
+      const transport = useWebSocket
+        ? createResponsesWebSocketFetch(copilotResponsesWebSocketUrl(baseURL), spec.onDebug, {
+            providerId: GITHUB_COPILOT_PROVIDER_ID,
+            accountId: spec.oauthAccountId,
+            onDiagnostic: spec.onWebSocketDiagnostic,
+            createEventNormalizer: createCopilotResponsesEventNormalizer,
+          })
+        : undefined;
       const copilot = createOpenAI({
         apiKey,
         ...(baseURL ? { baseURL } : {}),
         ...(spec.headers ? { headers: spec.headers } : {}),
-        fetch: createGitHubCopilotFetch(),
+        fetch: createGitHubCopilotFetch(transport),
       });
       return useResponsesEndpoint ? copilot.responses(modelId) : copilot.chat(modelId);
     }

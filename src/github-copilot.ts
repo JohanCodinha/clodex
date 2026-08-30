@@ -210,6 +210,15 @@ export type CopilotTransport = 'messages' | 'responses' | 'chat';
  * takes Chat Completions. A row that lists endpoints but none clodex speaks
  * is hidden rather than left to fail at first use.
  */
+/**
+ * Whether Copilot also serves this model over the Responses WebSocket
+ * transport (`ws:/responses`), where a conversation continues on one socket
+ * instead of re-sending its history every turn.
+ */
+export function copilotSupportsWebSocket(supportedEndpoints: unknown): boolean {
+  return Array.isArray(supportedEndpoints) && supportedEndpoints.includes('ws:/responses');
+}
+
 export function copilotTransportFor(supportedEndpoints: unknown): CopilotTransport | null {
   if (!Array.isArray(supportedEndpoints)) return 'chat';
   const endpoints = new Set(supportedEndpoints.filter((e): e is string => typeof e === 'string'));
@@ -261,7 +270,14 @@ function transportFields(
         },
       };
     case 'responses':
-      return { modelFormat: 'openai', npm: '@ai-sdk/openai', ...effort };
+      // Implicit caching only: explicit breakpoint parts move with Claude
+      // Code's cache_control between turns and defeat WebSocket continuation.
+      return {
+        modelFormat: 'openai',
+        npm: '@ai-sdk/openai',
+        ...effort,
+        compatibility: { ...effort.compatibility, supportsPromptCacheBreakpoints: false },
+      };
     case 'chat':
       return { modelFormat: 'openai', npm: chatNpm, ...effort };
   }
@@ -316,6 +332,7 @@ export function parseGitHubCopilotModels(body: unknown, chatNpm: string): Cached
     if (typeof policyState === 'string' && policyState !== 'enabled') continue;
     const transport = copilotTransportFor(row.supported_endpoints);
     if (transport === null) continue;
+    const preferWebSockets = transport === 'responses' && copilotSupportsWebSocket(row.supported_endpoints);
 
     const limits = capabilities.limits ?? undefined;
     // Prefer the prompt ceiling over the total window: the total counts output
@@ -342,6 +359,7 @@ export function parseGitHubCopilotModels(body: unknown, chatNpm: string): Cached
       ...(contextWindow !== undefined ? { contextWindow } : {}),
       ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
       ...(fastModelId ? { fastModelId } : {}),
+      ...(preferWebSockets ? { preferWebSockets } : {}),
       ...(capabilities.supports?.vision === true
         ? { modalities: ['text', 'image'] as ('text' | 'image')[] }
         : {}),
@@ -394,6 +412,11 @@ export function normalizeCopilotResponsesEvent<T extends CopilotResponsesEvent>(
   state: CopilotResponsesIdState,
 ): T {
   if (typeof event.type !== 'string') return event;
+  // A WebSocket carries many responses; output indexes restart with each.
+  if (event.type === 'response.created') {
+    state.byIndex.clear();
+    return event;
+  }
   const index = typeof event.output_index === 'number' ? event.output_index : undefined;
 
   if (event.type === 'response.output_item.added') {
@@ -454,6 +477,28 @@ export function normalizeCopilotResponsesSseLine(line: string, state: CopilotRes
   const normalized = normalizeCopilotResponsesEvent(parsed, state);
   if (normalized === parsed) return line;
   return `data: ${JSON.stringify(normalized)}${ending}`;
+}
+
+/**
+ * The same repair for the WebSocket transport, where the client parses frames
+ * itself and keys its continuation bookkeeping on item ids before anything
+ * reaches the SDK. One normalizer per request; state resets per response.
+ */
+export function createCopilotResponsesEventNormalizer(): (event: unknown) => unknown {
+  const state = createCopilotResponsesIdState();
+  return event => (event && typeof event === 'object'
+    ? normalizeCopilotResponsesEvent(event as CopilotResponsesEvent, state)
+    : event);
+}
+
+/** `https://host` → `wss://host/responses`, the WebSocket form of the Responses endpoint. */
+export function copilotResponsesWebSocketUrl(baseUrl: string): string {
+  return `${baseUrl.replace(/^http/i, 'ws').replace(/\/$/, '')}/responses`;
+}
+
+/** Set `CLODEX_COPILOT_WEBSOCKETS=0` to keep Copilot's Responses models on plain HTTP. */
+export function copilotWebSocketsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.CLODEX_COPILOT_WEBSOCKETS !== '0';
 }
 
 /** A byte transform that repairs a Copilot Responses SSE stream in flight. */
