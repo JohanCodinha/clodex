@@ -1110,7 +1110,7 @@ describe('providers add menu', () => {
     vi.restoreAllMocks();
   });
 
-  it('offers every OAuth sign-in followed by the OpenAI and OpenCode Go API keys', async () => {
+  it('offers every OAuth sign-in followed by the API-key templates', async () => {
     selectMock.mockResolvedValue('noop');
 
     await runProvidersAdd();
@@ -1121,6 +1121,7 @@ describe('providers add menu', () => {
       'oauth:openai-oauth',
       'api:openai',
       'api:opencode-go',
+      'api:openrouter',
     ]);
   });
 
@@ -1158,7 +1159,9 @@ describe('providers add menu', () => {
     await expect(runProvidersAdd()).resolves.toBe(0);
 
     const options = selectMock.mock.calls[0]?.[0].options.map((option: { value: string }) => option.value);
-    expect(options).toEqual(['oauth:github-copilot', 'oauth:openai-oauth', 'api:openai']);
+    expect(options).toEqual([
+      'oauth:github-copilot', 'oauth:openai-oauth', 'api:openai', 'api:openrouter',
+    ]);
     expect(passwordMock).not.toHaveBeenCalled();
     expect(addTemplateMock).not.toHaveBeenCalled();
   });
@@ -1210,6 +1213,7 @@ describe('providers add menu', () => {
       'oauth:openai-oauth',
       'api:openai',
       'api:opencode-go',
+      'api:openrouter',
     ]);
   });
 

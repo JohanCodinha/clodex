@@ -14,6 +14,13 @@ import {
   GITHUB_COPILOT_PROVIDER_NAME,
   githubCopilotStaticHeaders,
 } from './github-copilot.js';
+import {
+  OPENROUTER_API_BASE_URL,
+  OPENROUTER_MODELS_PATH,
+  OPENROUTER_PROVIDER_ID,
+  OPENROUTER_PROVIDER_NAME,
+  verifyOpenRouterCredential,
+} from './openrouter.js';
 
 export type ProviderAuthType = 'api' | 'oauth' | 'none';
 export type ProviderModelSource = 'api-list' | 'static-seed' | 'manual-only';
@@ -168,6 +175,29 @@ export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
     npm: '@ai-sdk/openai',
     signupUrl: 'https://chatgpt.com',
     modelSource: 'api-list',
+    supported: true,
+  },
+  {
+    id: OPENROUTER_PROVIDER_ID,
+    name: OPENROUTER_PROVIDER_NAME,
+    authType: 'api',
+    // Every OpenRouter model is reached as Anthropic Messages, including the
+    // OpenAI, Google and Chinese ones: the gateway translates in both
+    // directions, so Claude Code's own request — cache breakpoints, tool
+    // blocks, thinking blocks — is forwarded rather than rewritten.
+    npm: '@ai-sdk/anthropic',
+    defaultBaseUrl: OPENROUTER_API_BASE_URL,
+    modelsPath: OPENROUTER_MODELS_PATH,
+    signupUrl: 'https://openrouter.ai/settings/keys',
+    modelSource: 'api-list',
+    // `/models` answers without authentication, so the shared api-list flow
+    // cannot validate a pasted key; probe an authenticated endpoint instead.
+    verifyCredential: verifyOpenRouterCredential,
+    // OpenRouter publishes exact per-model prices, cache rates included, and
+    // prices the same model differently per upstream provider. The global
+    // pricing cache would replace those with a guess keyed on the bare model
+    // name.
+    preserveModelPricing: true,
     supported: true,
   },
   {

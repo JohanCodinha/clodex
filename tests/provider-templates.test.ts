@@ -9,13 +9,13 @@ import {
 import { fetchTemplateModels } from '../src/registry/fetch-template-models.js';
 
 describe('provider templates', () => {
-  it('offers OpenAI and OpenCode Go API-key templates as addable', () => {
-    expect(listSupportedTemplates().map(t => t.id)).toEqual(['openai', 'opencode-go']);
+  it('offers OpenAI, OpenCode Go and OpenRouter API-key templates as addable', () => {
+    expect(listSupportedTemplates().map(t => t.id)).toEqual(['openai', 'opencode-go', 'openrouter']);
   });
 
   it('filters templates by search query', () => {
     const templates = listSupportedTemplates();
-    expect(filterTemplates(templates, 'open').map(t => t.id)).toEqual(['openai', 'opencode-go']);
+    expect(filterTemplates(templates, 'open').map(t => t.id)).toEqual(['openai', 'opencode-go', 'openrouter']);
     expect(filterTemplates(templates, 'groq')).toEqual([]);
   });
 
@@ -55,9 +55,9 @@ describe('provider templates', () => {
   });
 
   it('excludes already-configured providers from addable list', () => {
-    expect(listAddableTemplates(['openai']).map(t => t.id)).toEqual(['opencode-go']);
-    expect(listAddableTemplates(['openai', 'opencode-go']).map(t => t.id)).toEqual([]);
-    expect(listAddableTemplates([]).map(t => t.id)).toEqual(['openai', 'opencode-go']);
+    expect(listAddableTemplates(['openai']).map(t => t.id)).toEqual(['opencode-go', 'openrouter']);
+    expect(listAddableTemplates(['openai', 'opencode-go', 'openrouter']).map(t => t.id)).toEqual([]);
+    expect(listAddableTemplates([]).map(t => t.id)).toEqual(['openai', 'opencode-go', 'openrouter']);
   });
 });
 
