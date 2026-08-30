@@ -4,6 +4,7 @@ import type { ServerResponse } from 'node:http';
 import { sanitizeCredential } from './server/auth.js';
 import { CLAUDE_CODE_USER_AGENT } from './oauth/claude-identity.js';
 import { isCredentialBearingHeader } from './credential-headers.js';
+import type { ModelRuntimeCompatibility } from './model-runtime-compatibility.js';
 
 export function anthropicUpstreamHeaders(
   apiKey: string,
@@ -164,20 +165,41 @@ export interface AnthropicSchemaRepairs {
    * the round-trip and the sticky per-session rejection that follows.
    */
   systemTurnsUnsupported: boolean;
+  /**
+   * The upstream refused Claude Code's deferred tool definitions — the
+   * placeholder entry that stands in for tools it will load on demand.
+   * Dropping the placeholder costs dynamic tool loading and keeps every tool
+   * actually present in the request, which is the difference between a
+   * degraded session and no session at all.
+   */
+  deferredToolsUnsupported: boolean;
 }
 
 const schemaRepairMemos = new Map<string, AnthropicSchemaRepairs>();
 
-/** The repair memo for one upstream model, created empty on first use. */
-export function anthropicSchemaRepairsFor(key: string): AnthropicSchemaRepairs {
+/**
+ * The repair memo for one upstream model, created on first use.
+ *
+ * Every field starts false and is learned from a rejection, except the ones a
+ * catalog can state outright. `honorsAdaptiveThinking: false` is knowable in
+ * advance precisely because it is NOT rejected — the upstream answers 200 and
+ * ignores the field — so seeding it here is the only point at which that
+ * knowledge can reach the request. Seeding on creation keeps it idempotent and
+ * leaves a memo that has since learned more from rejections untouched.
+ */
+export function anthropicSchemaRepairsFor(
+  key: string,
+  compatibility?: ModelRuntimeCompatibility,
+): AnthropicSchemaRepairs {
   let memo = schemaRepairMemos.get(key);
   if (!memo) {
     memo = {
       betaFlags: new Set(),
       fields: [],
-      adaptiveThinkingUnsupported: false,
+      adaptiveThinkingUnsupported: compatibility?.honorsAdaptiveThinking === false,
       effortUnsupported: false,
       systemTurnsUnsupported: false,
+      deferredToolsUnsupported: false,
     };
     schemaRepairMemos.set(key, memo);
   }
@@ -255,6 +277,12 @@ export function removeRejectedField(
 }
 
 const ADAPTIVE_THINKING_UNSUPPORTED = /adaptive thinking is not supported/i;
+/**
+ * A gateway that does not implement Claude Code's tool deferral. It sees a
+ * `tools[]` shorter than the set the model may call and rejects the request
+ * outright, naming the feature rather than a field.
+ */
+const DEFERRED_TOOLS_UNSUPPORTED = /deferred (?:custom )?tools?\b|tools omitted from tools\[\]/i;
 const REASONING_EFFORT_UNSUPPORTED = /does not support reasoning effort|invalid_reasoning_effort/i;
 // The second form arrives JSON-encoded, so the quotes may be escaped.
 const SYSTEM_TURN_UNSUPPORTED = /role 'system' is not supported|unexpected role \\?"system\\?"/i;
@@ -271,18 +299,72 @@ const FALLBACK_THINKING_BUDGET = 16_384;
 const MIN_THINKING_BUDGET = 1_024;
 
 /**
+ * Budget standing in for each adaptive effort level.
+ *
+ * Adaptive thinking carries the level in `effort`, a budgeted block carries it
+ * in `budget_tokens`, so a conversion that ignored `effort` would collapse
+ * every level a client offers onto one budget — the menu would still list its
+ * levels and all of them would think the same amount.
+ *
+ * Every level a provider catalog can advertise is listed, not just Anthropic's
+ * own low/medium/high: Copilot models ship ladders including `minimal`,
+ * `xhigh` and `max`, and an unlisted level falling back to the default budget
+ * would make `xhigh` think LESS than `high`. Budgets rise with the level so
+ * the ordering a user sees is the ordering they get.
+ */
+const EFFORT_THINKING_BUDGETS: Record<string, number> = {
+  minimal: 2_048,
+  low: 4_096,
+  medium: 16_384,
+  high: 32_768,
+  xhigh: 49_152,
+  max: 65_536,
+};
+
+/** Levels that ask for no thinking at all, rather than for some budget. */
+const NO_THINKING_EFFORTS = new Set(['none', 'off']);
+
+/**
+ * The effort level an adaptive request is asking for.
+ *
+ * Claude Code sends the level in `output_config.effort` and leaves the
+ * thinking block itself bare (`{ type: "adaptive" }`), so reading only the
+ * block would treat every level as unspecified and give them all the same
+ * budget. Both spellings are read, the block first, so a client that does put
+ * `effort` on the block is still honoured.
+ */
+function adaptiveEffort(
+  body: Record<string, unknown>,
+  thinking: { effort?: unknown },
+): string | undefined {
+  const config = body.output_config;
+  const fromConfig = config && typeof config === 'object'
+    ? (config as { effort?: unknown }).effort
+    : undefined;
+  const value = typeof thinking.effort === 'string' ? thinking.effort : fromConfig;
+  return typeof value === 'string' ? value.toLowerCase() : undefined;
+}
+
+/**
  * Replace `thinking: { type: "adaptive" }` with a budgeted `enabled` block the
- * model accepts. The budget must leave room under max_tokens; when it cannot,
+ * model accepts, preserving the requested effort level as a proportional
+ * budget. The budget must leave room under max_tokens; when it cannot,
  * thinking is removed together with the clear-thinking context edit that
  * only makes sense with it.
  */
 function replaceAdaptiveThinking(body: Record<string, unknown>): Record<string, unknown> {
-  const thinking = body.thinking as { type?: unknown } | undefined;
+  const thinking = body.thinking as { type?: unknown; effort?: unknown } | undefined;
   if (!thinking || typeof thinking !== 'object' || thinking.type !== 'adaptive') return body;
   const maxTokens = typeof body.max_tokens === 'number' ? body.max_tokens : undefined;
-  const budget = Math.min(FALLBACK_THINKING_BUDGET, (maxTokens ?? Infinity) - 1);
-  if (budget >= MIN_THINKING_BUDGET) {
-    return { ...body, thinking: { type: 'enabled', budget_tokens: budget } };
+  const effort = adaptiveEffort(body, thinking);
+  // A budget is a request TO think, so a level asking for none cannot be
+  // expressed as one — the smallest budget still thinks.
+  if (!effort || !NO_THINKING_EFFORTS.has(effort)) {
+    const requested = (effort ? EFFORT_THINKING_BUDGETS[effort] : undefined) ?? FALLBACK_THINKING_BUDGET;
+    const budget = Math.min(requested, (maxTokens ?? Infinity) - 1);
+    if (budget >= MIN_THINKING_BUDGET) {
+      return { ...body, thinking: { type: 'enabled', budget_tokens: budget } };
+    }
   }
   const { thinking: _thinking, ...rest } = body;
   return removeClearThinkingEdits(rest);
@@ -299,6 +381,25 @@ function removeClearThinkingEdits(body: Record<string, unknown>): Record<string,
     return rest;
   }
   return { ...body, context_management: { ...management, edits } };
+}
+
+/**
+ * Drop the deferred tool definitions, keeping every eagerly-declared tool.
+ *
+ * Claude Code marks a deferred entry with `defer_loading` and sends one
+ * placeholder standing in for the tools it would load on demand. An upstream
+ * that cannot honour that rejects the whole request, so the placeholder is
+ * removed and the session continues with the tools that are actually present.
+ * `tools` itself is never removed — it is structural — and a request whose
+ * every tool is deferred is left alone rather than sent with an empty list.
+ */
+function removeDeferredTools(body: Record<string, unknown>): Record<string, unknown> {
+  const tools = body.tools;
+  if (!Array.isArray(tools)) return body;
+  const kept = tools.filter(tool =>
+    !(tool && typeof tool === 'object' && (tool as { defer_loading?: unknown }).defer_loading));
+  if (kept.length === tools.length || kept.length === 0) return body;
+  return { ...body, tools: kept };
 }
 
 function removeEffort(body: Record<string, unknown>): Record<string, unknown> {
@@ -318,6 +419,7 @@ export function applyAnthropicSchemaRepairs(
   let next = body;
   for (const field of repairs.fields) next = removeRejectedField(next, field);
   if (repairs.adaptiveThinkingUnsupported) next = replaceAdaptiveThinking(next);
+  if (repairs.deferredToolsUnsupported) next = removeDeferredTools(next);
   if (repairs.effortUnsupported) next = removeEffort(next);
   if (repairs.systemTurnsUnsupported) next = removeSystemTurns(next);
   let beta = inboundBeta;
@@ -365,6 +467,13 @@ export function repairFromRejection(
     if (pruned !== body) {
       repairs.effortUnsupported = true;
       return { body: pruned, inboundBeta, description: 'output_config.effort' };
+    }
+  }
+  if (DEFERRED_TOOLS_UNSUPPORTED.test(errorBody)) {
+    const pruned = removeDeferredTools(body);
+    if (pruned !== body) {
+      repairs.deferredToolsUnsupported = true;
+      return { body: pruned, inboundBeta, description: 'deferred tool definitions' };
     }
   }
   if (SYSTEM_TURN_UNSUPPORTED.test(errorBody)) {

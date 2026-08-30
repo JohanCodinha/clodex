@@ -680,6 +680,161 @@ describe('relayAnthropicMessages self-repair', () => {
     expect(tiny!.body.context_management).toEqual({ edits: [{ type: 'clear_tool_uses_20250919' }] });
   });
 
+  // Adaptive thinking carries its level in `effort`; a budgeted block carries
+  // it in `budget_tokens`. A conversion that dropped the level would leave the
+  // client offering three thinking levels that all think the same amount.
+  it.each([
+    ['minimal', 2_048],
+    ['low', 4_096],
+    ['medium', 16_384],
+    ['high', 32_768],
+    ['xhigh', 49_152],
+    ['max', 65_536],
+  ])('converts adaptive effort %s to a proportional budget', (effort, expected) => {
+    const repairs = anthropicSchemaRepairsFor(`memo:effort-${effort}`);
+    const repaired = repairFromRejection(
+      { model: 'm', messages: [], max_tokens: 200_000, thinking: { type: 'adaptive', effort } },
+      undefined, '{"error":{"message":"adaptive thinking is not supported on this model"}}', repairs,
+    );
+    expect(repaired?.body.thinking).toEqual({ type: 'enabled', budget_tokens: expected });
+  });
+
+  // Claude Code puts the level in output_config and leaves the thinking block
+  // bare, so reading only the block gave every level the same budget.
+  it('reads the effort level from output_config, where Claude Code sends it', () => {
+    const repairs = anthropicSchemaRepairsFor('memo:effort-config');
+    const repaired = repairFromRejection(
+      {
+        model: 'm', messages: [], max_tokens: 64_000,
+        thinking: { type: 'adaptive' }, output_config: { effort: 'high' },
+      },
+      undefined, '{"error":{"message":"adaptive thinking is not supported on this model"}}', repairs,
+    );
+    expect(repaired?.body.thinking).toEqual({ type: 'enabled', budget_tokens: 32_768 });
+  });
+
+  // Copilot ladders really do advertise `none`. The smallest budget still
+  // thinks, so a level asking for none can only be expressed by removing the
+  // block — together with the context edit that only makes sense with it.
+  it.each(['none', 'off'])('removes thinking entirely for effort %s', effort => {
+    const repairs = anthropicSchemaRepairsFor(`memo:effort-${effort}`);
+    const repaired = repairFromRejection(
+      {
+        model: 'm', messages: [], max_tokens: 64_000, thinking: { type: 'adaptive' },
+        output_config: { effort },
+        context_management: { edits: [{ type: 'clear_thinking_20251015' }] },
+      },
+      undefined, '{"error":{"message":"adaptive thinking is not supported on this model"}}', repairs,
+    );
+    expect('thinking' in repaired!.body).toBe(false);
+    expect('context_management' in repaired!.body).toBe(false);
+  });
+
+  // An unlisted level must not land below a level beneath it in the menu.
+  it('never lets a higher effort level think less than a lower one', () => {
+    const budgetFor = (effort: string) => {
+      const repairs = anthropicSchemaRepairsFor(`memo:order-${effort}`);
+      const repaired = repairFromRejection(
+        { model: 'm', messages: [], max_tokens: 200_000, thinking: { type: 'adaptive' }, output_config: { effort } },
+        undefined, '{"error":{"message":"adaptive thinking is not supported on this model"}}', repairs,
+      );
+      return (repaired!.body.thinking as { budget_tokens: number }).budget_tokens;
+    };
+    const ladder = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map(budgetFor);
+    expect(ladder).toEqual([...ladder].sort((a, b) => a - b));
+    expect(new Set(ladder).size).toBe(ladder.length);
+  });
+
+  it('still clamps a high-effort budget under max_tokens', () => {
+    const repairs = anthropicSchemaRepairsFor('memo:effort-clamped');
+    const repaired = repairFromRejection(
+      { model: 'm', messages: [], max_tokens: 8_000, thinking: { type: 'adaptive', effort: 'high' } },
+      undefined, '{"error":{"message":"adaptive thinking is not supported on this model"}}', repairs,
+    );
+    expect(repaired?.body.thinking).toEqual({ type: 'enabled', budget_tokens: 7_999 });
+  });
+
+  // An upstream that ignores adaptive thinking answers 200, so no rejection
+  // ever teaches the memo. The catalog states it and the memo starts seeded.
+  it('converts adaptive thinking up front when the catalog says it is ignored', async () => {
+    const fetchMock = vi.fn(async () => ok());
+    vi.stubGlobal('fetch', fetchMock);
+    const res = makeRes();
+    await relayAnthropicMessages(
+      res as never, 'https://openrouter.ai/api/v1/messages',
+      { model: 'm', messages: [], max_tokens: 64_000, thinking: { type: 'adaptive', effort: 'high' } },
+      'tok', false,
+      { repairs: anthropicSchemaRepairsFor('openrouter:seeded', { honorsAdaptiveThinking: false }) },
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(fetchMock.mock.calls[0]![1]!.body)).thinking)
+      .toEqual({ type: 'enabled', budget_tokens: 32_768 });
+  });
+
+  it('forwards adaptive thinking untouched when the catalog says nothing', async () => {
+    const fetchMock = vi.fn(async () => ok());
+    vi.stubGlobal('fetch', fetchMock);
+    const res = makeRes();
+    await relayAnthropicMessages(
+      res as never, 'https://gateway.example.com/v1/messages',
+      { model: 'm', messages: [], max_tokens: 64_000, thinking: { type: 'adaptive', effort: 'high' } },
+      'tok', false,
+      { repairs: anthropicSchemaRepairsFor('other:unseeded') },
+    );
+    expect(JSON.parse(String(fetchMock.mock.calls[0]![1]!.body)).thinking)
+      .toEqual({ type: 'adaptive', effort: 'high' });
+  });
+
+  // OpenRouter's verbatim rejection for a non-Anthropic model. Anthropic
+  // models on the same gateway DO honour deferral, so this is learned per
+  // model from the 400 rather than declared for the provider.
+  const deferralRejection = '{"error":{"message":"Deferred custom tools are only supported on '
+    + 'Anthropic models and on Anthropic-compatible provider endpoints that implement deferral. '
+    + 'Other endpoints cannot call tools omitted from tools[]. Received google/gemini-2.5-flash."}}';
+
+  it('drops the deferred tool placeholder and keeps every eager tool', () => {
+    const repairs = anthropicSchemaRepairsFor('openrouter:google/gemini-2.5-flash');
+    const repaired = repairFromRejection(
+      {
+        model: 'm', messages: [], max_tokens: 1_000,
+        tools: [
+          { name: 'Bash', input_schema: {}, eager_input_streaming: true },
+          { name: 'DeferredToolPlaceholder', input_schema: {}, defer_loading: true },
+          { name: 'NotDeferred', input_schema: {}, defer_loading: false },
+          { name: 'Read', input_schema: {}, eager_input_streaming: true },
+        ],
+      },
+      undefined, deferralRejection, repairs,
+    );
+    expect((repaired?.body.tools as Array<{ name: string }>).map(t => t.name))
+      .toEqual(['Bash', 'NotDeferred', 'Read']);
+    expect(repairs.deferredToolsUnsupported).toBe(true);
+  });
+
+  // Sending an empty tools[] would be a different request, not a repaired one.
+  it('leaves a request alone when every tool is deferred', () => {
+    const repairs = anthropicSchemaRepairsFor('memo:all-deferred');
+    expect(repairFromRejection(
+      { model: 'm', messages: [], tools: [{ name: 'Only', defer_loading: true }] },
+      undefined, deferralRejection, repairs,
+    )).toBeNull();
+    expect(repairs.deferredToolsUnsupported).toBe(false);
+  });
+
+  it('applies a learned deferral repair to later requests without another 400', async () => {
+    const fetchMock = vi.fn(async () => ok());
+    vi.stubGlobal('fetch', fetchMock);
+    const repairs = anthropicSchemaRepairsFor('memo:deferral-learned');
+    repairs.deferredToolsUnsupported = true;
+    await relayAnthropicMessages(
+      makeRes() as never, 'https://openrouter.ai/api/v1/messages',
+      { model: 'm', messages: [], tools: [{ name: 'Bash' }, { name: 'Placeholder', defer_loading: true }] },
+      'tok', false, { repairs },
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(fetchMock.mock.calls[0]![1]!.body)).tools).toEqual([{ name: 'Bash' }]);
+  });
+
   // Claude Code's mid-conversation system turn is a beta Anthropic honours;
   // Copilot's gateway rejects the role. Claude Code's own fallback is to
   // resend without the turn, so the relay does the same and remembers it.

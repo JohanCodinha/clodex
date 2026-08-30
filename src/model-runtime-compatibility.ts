@@ -43,6 +43,23 @@ export interface ModelRuntimeCompatibility {
    * endpoint that does implement it is unaffected.
    */
   supportsCountTokens?: boolean;
+  /**
+   * Whether the upstream acts on `thinking: { type: "adaptive" }`.
+   *
+   * Distinct from the other flags here, which describe what an upstream
+   * REJECTS. A gateway that translates Anthropic requests for models with no
+   * adaptive mode of their own can answer 200 and simply drop the field:
+   * measured against OpenRouter, an adaptive request and a no-thinking request
+   * produce the same token counts, while an `enabled` block with a budget
+   * scales them (67 -> 534 thinking tokens for a 1k -> 6k budget). Silence,
+   * not a 400, so the rejection-driven repair below never learns it and every
+   * thinking level a client offers would quietly do nothing.
+   *
+   * Explicit `false` converts adaptive requests to a budgeted block up front.
+   * Unset keeps forwarding them untouched, so Anthropic itself and any gateway
+   * that does implement adaptive thinking are unaffected.
+   */
+  honorsAdaptiveThinking?: boolean;
 }
 
 export type OpenAiCompatibleRequestBody = Record<string, unknown>;
