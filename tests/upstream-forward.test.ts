@@ -1,11 +1,17 @@
 // tests/upstream-forward.test.ts
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { Writable, type Transform } from 'node:stream';
 import {
+  anthropicSchemaRepairsFor,
+  anthropicSseModelRewrite,
   anthropicUpstreamHeaders,
   fetchWithOAuthRetry,
-  anthropicSseModelRewrite,
+  parseExtraInputField,
   relayAnthropicMessages,
+  removeRejectedField,
+  repairFromRejection,
+  resetAnthropicSchemaRepairsForTests,
+  stripUnsupportedBetaFlags,
 } from '../src/upstream-forward.js';
 
 describe('anthropicUpstreamHeaders', () => {
@@ -462,5 +468,248 @@ describe('relayAnthropicMessages streaming', () => {
     await done;
 
     expect(res.body()).toBe(SSE);
+  });
+});
+
+
+describe('Anthropic-compatible gateway schema repairs', () => {
+  // Copilot's /v1/messages accepts a subset of Claude Code's beta flags and
+  // names the rest in a 400. The set Claude Code sends grows every release,
+  // so the relay drops exactly what the upstream rejected and retries once.
+  it('strips exactly the beta flags an Anthropic-compatible upstream rejected', () => {
+    const body = JSON.stringify({ type: 'error', error: { type: 'invalid_request_error',
+      message: 'unsupported beta header(s): advisor-tool-2026-03-01, effort-2025-11-24' } });
+    expect(stripUnsupportedBetaFlags(
+      'interleaved-thinking-2025-05-14,advisor-tool-2026-03-01,effort-2025-11-24', body,
+    )).toEqual({
+      remaining: 'interleaved-thinking-2025-05-14',
+      removed: ['advisor-tool-2026-03-01', 'effort-2025-11-24'],
+    });
+    // Everything rejected: retry with no beta header at all.
+    expect(stripUnsupportedBetaFlags('advisor-tool-2026-03-01', body)?.remaining).toBe('');
+    // An unrelated 400, or one naming flags that were never sent, is not retried.
+    expect(stripUnsupportedBetaFlags('interleaved-thinking-2025-05-14', body)).toBeNull();
+    expect(stripUnsupportedBetaFlags('advisor-tool-2026-03-01', '{"error":{"message":"max_tokens too large"}}')).toBeNull();
+  });
+
+  // Copilot's gateway trails Anthropic's schema and reports each unknown
+  // field as a pydantic "Extra inputs" error, one occurrence per 400. The
+  // repair removes the field from every object under the same parent key so
+  // one retry clears all of them.
+  it('strips a rejected field from every object of that shape', () => {
+    const body = {
+      model: 'claude-opus-5',
+      system: [
+        { type: 'text', text: 'a' },
+        { type: 'text', text: 'b', cache_control: { type: 'ephemeral', scope: 'global' } },
+      ],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral', ttl: '1h', scope: 'global' } }] }],
+      tools: [{ name: 'Read', input_schema: {}, cache_control: { type: 'ephemeral', scope: 'global' } }],
+      context_management: { edits: [] },
+    };
+    const err = '{"type":"error","error":{"type":"invalid_request_error","message":"system.1.cache_control.ephemeral.scope: Extra inputs are not permitted"}}';
+    const field = parseExtraInputField(body, err);
+    expect(field).toEqual({ parentKey: 'cache_control', leaf: 'scope' });
+    const out = removeRejectedField(body, field!) as typeof body;
+    expect(out.system[1]!.cache_control).toEqual({ type: 'ephemeral' });
+    expect(out.messages[0]!.content[0]!.cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+    expect(out.tools[0]!.cache_control).toEqual({ type: 'ephemeral' });
+    // Untouched: other fields, and the original body itself.
+    expect(out.context_management).toEqual({ edits: [] });
+    expect(body.system[1]!.cache_control).toEqual({ type: 'ephemeral', scope: 'global' });
+
+    // A top-level field.
+    const top = parseExtraInputField(body, '{"error":{"message":"context_management: Extra inputs are not permitted"}}');
+    expect(top).toEqual({ parentKey: null, leaf: 'context_management' });
+    const topOut = removeRejectedField(body, top!);
+    expect('context_management' in topOut).toBe(false);
+    expect(topOut.system).toEqual(body.system);
+  });
+
+  // A 400 naming a field the request cannot function without is a broken
+  // upstream, not a schema gap. Repairing it would also be remembered by the
+  // memo and strip that field from every later request on the route.
+  it.each(['model', 'messages', 'max_tokens', 'stream', 'system', 'tools'])(
+    'never strips the structural field %s, even when the upstream names it',
+    field => {
+      const body = { model: 'm', messages: [], max_tokens: 1, stream: true, system: 's', tools: [] };
+      expect(parseExtraInputField(body, `{"error":{"message":"${field}: Extra inputs are not permitted"}}`)).toBeNull();
+    },
+  );
+
+  it('does not retry an unrelated 400 or one naming a field that is absent', () => {
+    const body = { model: 'm', messages: [] };
+    expect(parseExtraInputField(body, '{"error":{"message":"max_tokens: Input should be greater than 0"}}')).toBeNull();
+    // Named but absent: nothing to remove, so the same body comes back.
+    const absent = parseExtraInputField(body, '{"error":{"message":"thinking.budget_tokens: Extra inputs are not permitted"}}');
+    expect(removeRejectedField(body, absent!)).toBe(body);
+  });
+
+  it('lets a provider that names its own User-Agent keep it on the Messages passthrough', () => {
+    const editor = { 'user-agent': 'SomeEditor/1.0', 'editor-version': 'vscode/1.99.3' };
+    const copilot = anthropicUpstreamHeaders('tok', true, undefined, 'oauth', 'sess-1', editor);
+    expect(copilot['user-agent']).toBe('SomeEditor/1.0');
+    expect(copilot['User-Agent']).toBeUndefined();
+    expect(copilot['x-app']).toBeUndefined();
+    expect(copilot['X-Claude-Code-Session-Id']).toBeUndefined();
+    expect(copilot.Authorization).toBe('Bearer tok');
+    expect(copilot['x-api-key']).toBeUndefined();
+    // The Anthropic OAuth passthrough is unchanged.
+    const anthropic = anthropicUpstreamHeaders('tok', true, undefined, 'oauth', 'sess-1');
+    expect(anthropic['User-Agent']).toBeTruthy();
+    expect(anthropic['x-app']).toBe('cli');
+    expect(anthropic['X-Claude-Code-Session-Id']).toBe('sess-1');
+  });
+
+});
+
+describe('relayAnthropicMessages self-repair', () => {
+  const makeRes = () => {
+    const chunks: Buffer[] = [];
+    let status = 0;
+    const res = {
+      writeHead(code: number) { status = code; return res; },
+      write(chunk: unknown) { chunks.push(Buffer.from(chunk as Buffer)); return true; },
+      end(chunk?: unknown) { if (chunk) chunks.push(Buffer.from(chunk as Buffer)); res.finished = true; },
+      destroy() {}, on() { return res; }, once() { return res; }, emit() { return false; }, removeListener() { return res; },
+      finished: false,
+      body: () => Buffer.concat(chunks).toString('utf8'),
+      status: () => status,
+    };
+    return res;
+  };
+  const anthropicError = (message: string) =>
+    new Response(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message } }), {
+      status: 400, headers: { 'content-type': 'application/json' },
+    });
+  const ok = () => new Response(JSON.stringify({ id: 'msg_1', type: 'message', model: 'claude-opus-5', content: [] }), {
+    status: 200, headers: { 'content-type': 'application/json' },
+  });
+  const body = () => ({
+    model: 'claude-opus-5',
+    system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral', scope: 'global' } }],
+    messages: [{ role: 'user', content: 'hi' }],
+    thinking: { type: 'adaptive' },
+    diagnostics: { x: 1 },
+  });
+
+  beforeEach(() => resetAnthropicSchemaRepairsForTests());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('repairs each rejection in turn, then sends later requests right the first time', async () => {
+    const sent: Array<{ body: Record<string, unknown>; beta: string | null }> = [];
+    const answers = [
+      anthropicError('unsupported beta header(s): advisor-tool-2026-03-01'),
+      anthropicError('system.0.cache_control.ephemeral.scope: Extra inputs are not permitted'),
+      anthropicError('diagnostics: Extra inputs are not permitted'),
+      anthropicError('adaptive thinking is not supported on this model'),
+      ok(),
+      ok(),
+    ];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      sent.push({ body: JSON.parse(String(init.body)), beta: new Headers(init.headers).get('anthropic-beta') });
+      return answers.shift()!;
+    }));
+    const repairs = anthropicSchemaRepairsFor('github-copilot:claude-opus-5');
+
+    const first = makeRes();
+    await relayAnthropicMessages(first as never, 'https://api.githubcopilot.com/v1/messages', body(), 'tok', false, {
+      inboundBeta: 'interleaved-thinking-2025-05-14,advisor-tool-2026-03-01',
+      authType: 'oauth',
+      repairs,
+    });
+    expect(first.status()).toBe(200);
+    expect(sent).toHaveLength(5);
+    // Each retry carries every repair learned so far.
+    expect(sent[4]!.beta).toBe('interleaved-thinking-2025-05-14');
+    expect((sent[4]!.body.system as Array<{ cache_control: unknown }>)[0]!.cache_control).toEqual({ type: 'ephemeral' });
+    expect('diagnostics' in sent[4]!.body).toBe(false);
+    // Adaptive thinking the model lacks becomes a budgeted block, not nothing.
+    expect(sent[4]!.body.thinking).toEqual({ type: 'enabled', budget_tokens: 16_384 });
+
+    // The next request on this model needs no round-trips at all.
+    const second = makeRes();
+    await relayAnthropicMessages(second as never, 'https://api.githubcopilot.com/v1/messages', body(), 'tok', false, {
+      inboundBeta: 'interleaved-thinking-2025-05-14,advisor-tool-2026-03-01',
+      authType: 'oauth',
+      repairs,
+    });
+    expect(second.status()).toBe(200);
+    expect(sent).toHaveLength(6);
+    expect(sent[5]!.beta).toBe('interleaved-thinking-2025-05-14');
+    expect(sent[5]!.body.thinking).toEqual({ type: 'enabled', budget_tokens: 16_384 });
+    expect('diagnostics' in sent[5]!.body).toBe(false);
+  });
+
+  it('returns an unrepairable 400 to the client unchanged', async () => {
+    const fetchMock = vi.fn(async () => anthropicError('max_tokens: Input should be greater than 0'));
+    vi.stubGlobal('fetch', fetchMock);
+    const res = makeRes();
+    await relayAnthropicMessages(res as never, 'https://api.githubcopilot.com/v1/messages', body(), 'tok', false, {
+      authType: 'oauth',
+      repairs: anthropicSchemaRepairsFor('github-copilot:claude-opus-5'),
+    });
+    expect(res.status()).toBe(400);
+    expect(res.body()).toContain('max_tokens');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not repair at all without a memo (native Anthropic passthrough)', async () => {
+    const fetchMock = vi.fn(async () => anthropicError('diagnostics: Extra inputs are not permitted'));
+    vi.stubGlobal('fetch', fetchMock);
+    const res = makeRes();
+    await relayAnthropicMessages(res as never, 'https://api.anthropic.com/v1/messages', body(), 'tok', false, { authType: 'oauth' });
+    expect(res.status()).toBe(400);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the thinking budget under max_tokens, and drops thinking with its context edit when it cannot', () => {
+    const repairs = anthropicSchemaRepairsFor('github-copilot:claude-haiku-4.5');
+    const small = repairFromRejection(
+      { model: 'm', messages: [], max_tokens: 4_000, thinking: { type: 'adaptive' } },
+      undefined, '{"error":{"message":"adaptive thinking is not supported on this model"}}', repairs,
+    );
+    expect(small?.body.thinking).toEqual({ type: 'enabled', budget_tokens: 3_999 });
+
+    const tiny = repairFromRejection(
+      { model: 'm', messages: [], max_tokens: 512, thinking: { type: 'adaptive' },
+        context_management: { edits: [{ type: 'clear_thinking_20251015' }, { type: 'clear_tool_uses_20250919' }] } },
+      undefined, '{"error":{"message":"adaptive thinking is not supported on this model"}}', repairs,
+    );
+    expect('thinking' in tiny!.body).toBe(false);
+    expect(tiny!.body.context_management).toEqual({ edits: [{ type: 'clear_tool_uses_20250919' }] });
+  });
+
+  // Claude Code's mid-conversation system turn is a beta Anthropic honours;
+  // Copilot's gateway rejects the role. Claude Code's own fallback is to
+  // resend without the turn, so the relay does the same and remembers it.
+  it.each([
+    "role 'system' is not supported on this model",
+    'messages: Unexpected role "system". The Messages API accepts a top-level `system` parameter, not "system" as an input message role.',
+  ])('drops system-role turns when the upstream rejects them: %s', message => {
+    const repairs = anthropicSchemaRepairsFor('github-copilot:claude-sonnet-4.6');
+    const repaired = repairFromRejection(
+      { model: 'm', system: 'top', messages: [
+        { role: 'user', content: 'hi' }, { role: 'system', content: 'notice' }, { role: 'assistant', content: 'ok' },
+      ] },
+      undefined, JSON.stringify({ error: { message } }), repairs,
+    );
+    expect(repaired?.description).toBe('mid-conversation system turn');
+    expect((repaired!.body.messages as Array<{ role: string }>).map(m => m.role)).toEqual(['user', 'assistant']);
+    expect(repaired!.body.system).toBe('top');
+    expect(repairs.systemTurnsUnsupported).toBe(true);
+  });
+
+  it('drops effort only when the upstream names it, and keeps other output_config keys', () => {
+    const repairs = anthropicSchemaRepairsFor('github-copilot:claude-haiku-4.5');
+    const repaired = repairFromRejection(
+      { model: 'm', messages: [], output_config: { effort: 'low', format: { type: 'json' } } },
+      undefined,
+      '{"error":{"message":"output_config.effort \\"low\\" was provided, but model claude-haiku-4.5 does not support reasoning effort","code":"invalid_reasoning_effort"}}',
+      repairs,
+    );
+    expect(repaired?.description).toBe('output_config.effort');
+    expect(repaired?.body.output_config).toEqual({ format: { type: 'json' } });
+    expect(repairs.effortUnsupported).toBe(true);
   });
 });

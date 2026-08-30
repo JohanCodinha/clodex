@@ -23,6 +23,15 @@ export function anthropicUpstreamHeaders(
         ),
       )
     : extraHeaders;
+  // The Claude Code identity trio exists for the Anthropic OAuth passthrough.
+  // A provider whose static headers already name a User-Agent (GitHub Copilot
+  // identifies as an editor) is presenting itself as a different client;
+  // stacking Claude Code's identity on top would send two conflicting
+  // User-Agent spellings and Anthropic-only headers to a host that is not
+  // Anthropic.
+  const declaresOwnIdentity = Object.keys(forwardedExtraHeaders ?? {})
+    .some(name => name.toLowerCase() === 'user-agent');
+  const claudeIdentity = isOAuth && !declaresOwnIdentity;
   const headers: Record<string, string> = {
     ...forwardedExtraHeaders,
     'Content-Type': 'application/json',
@@ -33,8 +42,8 @@ export function anthropicUpstreamHeaders(
           Authorization: `Bearer ${key}`,
           ...(isOAuth ? {} : { 'x-api-key': key }),
         }),
-    ...(isOAuth ? { 'User-Agent': CLAUDE_CODE_USER_AGENT, 'x-app': 'cli' } : {}),
-    ...(isOAuth && claudeCodeSessionId ? { 'X-Claude-Code-Session-Id': claudeCodeSessionId } : {}),
+    ...(claudeIdentity ? { 'User-Agent': CLAUDE_CODE_USER_AGENT, 'x-app': 'cli' } : {}),
+    ...(claudeIdentity && claudeCodeSessionId ? { 'X-Claude-Code-Session-Id': claudeCodeSessionId } : {}),
     ...(stream ? { Accept: 'text/event-stream' } : {}),
   };
   if (inboundBeta) {
@@ -95,6 +104,279 @@ export async function fetchWithOAuthRetry<TResponse extends {
   return { response, apiKey: refreshed, refreshed: true };
 }
 
+/**
+ * Parse an Anthropic-format "unsupported beta header(s): a, b" 400 and remove
+ * the named flags from the outbound header. Returns null when the body is not
+ * that error or names nothing that was actually sent, so an unrelated 400 is
+ * never retried.
+ */
+export function stripUnsupportedBetaFlags(
+  inboundBeta: string,
+  errorBody: string,
+): { remaining: string; removed: string[] } | null {
+  const match = /unsupported beta header\(s\):\s*([^"\n}]+)/i.exec(errorBody);
+  if (!match) return null;
+  const rejected = new Set(match[1]!.split(',').map(s => s.trim()).filter(Boolean));
+  const sent = inboundBeta.split(',').map(s => s.trim()).filter(Boolean);
+  const removed = sent.filter(flag => rejected.has(flag));
+  if (removed.length === 0) return null;
+  return { remaining: sent.filter(flag => !rejected.has(flag)).join(','), removed };
+}
+
+/** Upper bound on schema-repair retries for one request. */
+const MAX_SCHEMA_REPAIRS = 6;
+
+function isAnthropicHost(url: string): boolean {
+  try {
+    return new URL(url).hostname === 'api.anthropic.com';
+  } catch {
+    return false;
+  }
+}
+
+/** One request field an upstream declared unknown: the key that holds it and the key itself. */
+export interface RejectedField {
+  parentKey: string | null;
+  leaf: string;
+}
+
+/**
+ * What one upstream has rejected so far, remembered for the process lifetime
+ * so every request after the first is sent in the shape the upstream accepts
+ * instead of re-discovering it three round-trips at a time.
+ */
+export interface AnthropicSchemaRepairs {
+  betaFlags: Set<string>;
+  fields: RejectedField[];
+  /**
+   * The upstream refused `thinking: { type: "adaptive" }` for this model.
+   * Adaptive becomes a budgeted `enabled` block rather than nothing: the
+   * model does think, and Claude Code's request assumes it does (its
+   * clear-thinking context edit is only valid with thinking on).
+   */
+  adaptiveThinkingUnsupported: boolean;
+  /** The upstream refused `output_config.effort` for this model. */
+  effortUnsupported: boolean;
+  /**
+   * The upstream refused a `{ role: "system" }` turn inside `messages` — a
+   * Claude Code beta Anthropic honours. Claude Code's own fallback on that
+   * rejection is to resend without the turn; doing it here saves the client
+   * the round-trip and the sticky per-session rejection that follows.
+   */
+  systemTurnsUnsupported: boolean;
+}
+
+const schemaRepairMemos = new Map<string, AnthropicSchemaRepairs>();
+
+/** The repair memo for one upstream model, created empty on first use. */
+export function anthropicSchemaRepairsFor(key: string): AnthropicSchemaRepairs {
+  let memo = schemaRepairMemos.get(key);
+  if (!memo) {
+    memo = {
+      betaFlags: new Set(),
+      fields: [],
+      adaptiveThinkingUnsupported: false,
+      effortUnsupported: false,
+      systemTurnsUnsupported: false,
+    };
+    schemaRepairMemos.set(key, memo);
+  }
+  return memo;
+}
+
+export function resetAnthropicSchemaRepairsForTests(): void {
+  schemaRepairMemos.clear();
+}
+
+/**
+ * Top-level fields a request cannot function without. A 400 naming one of
+ * these is a broken upstream, not a schema gap: honouring it would strip the
+ * field from every later request too, via the memo, and brick the route for
+ * the life of the process. Such a 400 is returned to the client unchanged.
+ */
+const STRUCTURAL_FIELDS = new Set(['model', 'messages', 'max_tokens', 'stream', 'system', 'tools']);
+
+/**
+ * Parse a pydantic-style "<path>: Extra inputs are not permitted" 400 into the
+ * field it names. The path is one occurrence
+ * (`system.2.cache_control.ephemeral.scope`); segments that name a union
+ * variant rather than a real key (`ephemeral`) are skipped while walking the
+ * body to find the key that actually holds the field.
+ */
+export function parseExtraInputField(body: Record<string, unknown>, errorBody: string): RejectedField | null {
+  const match = /"?([A-Za-z0-9_.\[\]-]+)"?\s*:\s*Extra inputs are not permitted/.exec(errorBody);
+  if (!match) return null;
+  const segments = match[1]!.split('.').filter(Boolean);
+  const leaf = segments[segments.length - 1];
+  if (!leaf) return null;
+  if (segments.length === 1 && STRUCTURAL_FIELDS.has(leaf)) return null;
+  let node: unknown = body;
+  let parentKey: string | null = null;
+  for (const segment of segments.slice(0, -1)) {
+    if (Array.isArray(node)) {
+      const index = Number(segment);
+      if (!Number.isInteger(index) || index < 0 || index >= node.length) break;
+      node = node[index];
+      continue;
+    }
+    if (node && typeof node === 'object' && segment in (node as Record<string, unknown>)) {
+      node = (node as Record<string, unknown>)[segment];
+      parentKey = segment;
+    }
+  }
+  return { parentKey, leaf };
+}
+
+/**
+ * Remove a rejected field from every object that sits under the same parent
+ * key — the upstream reports one occurrence per 400, but the same field
+ * appears under every sibling of that shape (every cache_control block).
+ * Returns the body untouched (same reference) when nothing was removed.
+ */
+export function removeRejectedField(
+  body: Record<string, unknown>,
+  field: RejectedField,
+): Record<string, unknown> {
+  let removed = 0;
+  const prune = (value: unknown, key: string | null): unknown => {
+    if (Array.isArray(value)) return value.map(item => prune(item, key));
+    if (!value || typeof value !== 'object') return value;
+    const record = value as Record<string, unknown>;
+    const here = key === field.parentKey && field.leaf in record;
+    if (here) removed += 1;
+    return Object.fromEntries(
+      Object.entries(record)
+        .filter(([k]) => !(here && k === field.leaf))
+        .map(([k, v]) => [k, prune(v, k)] as const),
+    );
+  };
+  const pruned = prune(body, null) as Record<string, unknown>;
+  return removed === 0 ? body : pruned;
+}
+
+const ADAPTIVE_THINKING_UNSUPPORTED = /adaptive thinking is not supported/i;
+const REASONING_EFFORT_UNSUPPORTED = /does not support reasoning effort|invalid_reasoning_effort/i;
+// The second form arrives JSON-encoded, so the quotes may be escaped.
+const SYSTEM_TURN_UNSUPPORTED = /role 'system' is not supported|unexpected role \\?"system\\?"/i;
+
+function removeSystemTurns(body: Record<string, unknown>): Record<string, unknown> {
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return body;
+  const kept = messages.filter(m => !(m && typeof m === 'object' && (m as { role?: unknown }).role === 'system'));
+  return kept.length === messages.length ? body : { ...body, messages: kept };
+}
+
+/** Budget for the `enabled` block that replaces an unsupported `adaptive` one. */
+const FALLBACK_THINKING_BUDGET = 16_384;
+const MIN_THINKING_BUDGET = 1_024;
+
+/**
+ * Replace `thinking: { type: "adaptive" }` with a budgeted `enabled` block the
+ * model accepts. The budget must leave room under max_tokens; when it cannot,
+ * thinking is removed together with the clear-thinking context edit that
+ * only makes sense with it.
+ */
+function replaceAdaptiveThinking(body: Record<string, unknown>): Record<string, unknown> {
+  const thinking = body.thinking as { type?: unknown } | undefined;
+  if (!thinking || typeof thinking !== 'object' || thinking.type !== 'adaptive') return body;
+  const maxTokens = typeof body.max_tokens === 'number' ? body.max_tokens : undefined;
+  const budget = Math.min(FALLBACK_THINKING_BUDGET, (maxTokens ?? Infinity) - 1);
+  if (budget >= MIN_THINKING_BUDGET) {
+    return { ...body, thinking: { type: 'enabled', budget_tokens: budget } };
+  }
+  const { thinking: _thinking, ...rest } = body;
+  return removeClearThinkingEdits(rest);
+}
+
+function removeClearThinkingEdits(body: Record<string, unknown>): Record<string, unknown> {
+  const management = body.context_management as { edits?: unknown } | undefined;
+  if (!management || typeof management !== 'object' || !Array.isArray(management.edits)) return body;
+  const edits = management.edits.filter(edit =>
+    !(edit && typeof edit === 'object' && String((edit as { type?: unknown }).type ?? '').startsWith('clear_thinking')));
+  if (edits.length === management.edits.length) return body;
+  if (edits.length === 0) {
+    const { context_management: _management, ...rest } = body;
+    return rest;
+  }
+  return { ...body, context_management: { ...management, edits } };
+}
+
+function removeEffort(body: Record<string, unknown>): Record<string, unknown> {
+  const config = body.output_config;
+  if (!config || typeof config !== 'object' || !('effort' in (config as Record<string, unknown>))) return body;
+  const { effort: _effort, ...restConfig } = config as Record<string, unknown>;
+  const { output_config: _config, ...rest } = body;
+  return Object.keys(restConfig).length > 0 ? { ...rest, output_config: restConfig } : rest;
+}
+
+/** Apply everything a memo has learned to a fresh request. */
+export function applyAnthropicSchemaRepairs(
+  body: Record<string, unknown>,
+  inboundBeta: string | undefined,
+  repairs: AnthropicSchemaRepairs,
+): { body: Record<string, unknown>; inboundBeta: string | undefined } {
+  let next = body;
+  for (const field of repairs.fields) next = removeRejectedField(next, field);
+  if (repairs.adaptiveThinkingUnsupported) next = replaceAdaptiveThinking(next);
+  if (repairs.effortUnsupported) next = removeEffort(next);
+  if (repairs.systemTurnsUnsupported) next = removeSystemTurns(next);
+  let beta = inboundBeta;
+  if (beta && repairs.betaFlags.size > 0) {
+    beta = beta.split(',').map(f => f.trim()).filter(f => f && !repairs.betaFlags.has(f)).join(',') || undefined;
+  }
+  return { body: next, inboundBeta: beta };
+}
+
+/**
+ * Work out the single repair one 400 asks for, record it in the memo, and
+ * return the request to send instead — or null when the 400 is not one the
+ * relay knows how to repair (so it reaches the client unchanged).
+ */
+export function repairFromRejection(
+  body: Record<string, unknown>,
+  inboundBeta: string | undefined,
+  errorBody: string,
+  repairs: AnthropicSchemaRepairs,
+): { body: Record<string, unknown>; inboundBeta: string | undefined; description: string } | null {
+  if (inboundBeta) {
+    const beta = stripUnsupportedBetaFlags(inboundBeta, errorBody);
+    if (beta) {
+      for (const flag of beta.removed) repairs.betaFlags.add(flag);
+      return { body, inboundBeta: beta.remaining || undefined, description: `beta flags ${beta.removed.join(',')}` };
+    }
+  }
+  const field = parseExtraInputField(body, errorBody);
+  if (field) {
+    const pruned = removeRejectedField(body, field);
+    if (pruned !== body) {
+      repairs.fields.push(field);
+      return { body: pruned, inboundBeta, description: `field ${field.parentKey ? `${field.parentKey}.` : ''}${field.leaf}` };
+    }
+    return null;
+  }
+  if (ADAPTIVE_THINKING_UNSUPPORTED.test(errorBody) && 'thinking' in body) {
+    const repaired = replaceAdaptiveThinking(body);
+    if (repaired === body) return null;
+    repairs.adaptiveThinkingUnsupported = true;
+    return { body: repaired, inboundBeta, description: 'adaptive thinking (using a budget instead)' };
+  }
+  if (REASONING_EFFORT_UNSUPPORTED.test(errorBody)) {
+    const pruned = removeEffort(body);
+    if (pruned !== body) {
+      repairs.effortUnsupported = true;
+      return { body: pruned, inboundBeta, description: 'output_config.effort' };
+    }
+  }
+  if (SYSTEM_TURN_UNSUPPORTED.test(errorBody)) {
+    const pruned = removeSystemTurns(body);
+    if (pruned !== body) {
+      repairs.systemTurnsUnsupported = true;
+      return { body: pruned, inboundBeta, description: 'mid-conversation system turn' };
+    }
+  }
+  return null;
+}
+
 /** Relay an Anthropic /v1/messages response (JSON or SSE) to the client. */
 export interface RelayAnthropicOptions {
   inboundBeta?: string;
@@ -105,6 +387,13 @@ export interface RelayAnthropicOptions {
   refreshToken?: (rejectedAccessToken: string) => Promise<string | null>;
   onTokenRefreshed?: (token: string) => void;
   onUpstreamError?: (statusCode: number, body: string) => void;
+  /**
+   * Repair memo for this upstream model. When set, a 400 that names an
+   * unsupported beta flag, an unknown request field, or an unsupported
+   * thinking/effort control is repaired and retried, and the repair is
+   * remembered so later requests are sent right the first time.
+   */
+  repairs?: AnthropicSchemaRepairs;
   signal?: AbortSignal;
   /**
    * Echo this exact model id in the relayed response instead of the upstream's.
@@ -190,27 +479,66 @@ export async function relayAnthropicMessages(
   clientWantsStream: boolean,
   options: RelayAnthropicOptions = {},
 ): Promise<void> {
+  // Anthropic itself accepts everything Claude Code sends; repairs exist for
+  // the gateways that only approximate its API, so the native passthrough
+  // keeps forwarding requests byte-for-byte (CLAUDE.md).
+  const repairs = options.repairs && !isAnthropicHost(messagesUrl) ? options.repairs : undefined;
+  const learned = repairs
+    ? applyAnthropicSchemaRepairs(body, options.inboundBeta, repairs)
+    : { body, inboundBeta: options.inboundBeta };
+  let inboundBeta = learned.inboundBeta;
+  let forwardBody = learned.body;
   const doFetch = (key: string) => fetch(messagesUrl, {
     method: 'POST',
     headers: anthropicUpstreamHeaders(
       key,
       clientWantsStream,
-      options.inboundBeta,
+      inboundBeta,
       options.authType,
       options.claudeCodeSessionId,
       options.extraHeaders,
     ),
-    body: JSON.stringify(body),
+    body: JSON.stringify(forwardBody),
     signal: options.signal,
   });
 
   let upstreamRes: Response;
+  let effectiveKey = apiKey;
   try {
     const retryResult = await fetchWithOAuthRetry(apiKey, doFetch, options.refreshToken);
     upstreamRes = retryResult.response;
+    effectiveKey = retryResult.apiKey;
     if (retryResult.refreshed) options.onTokenRefreshed?.(retryResult.apiKey);
   } catch (err) {
     throw new UpstreamUnreachableError(err);
+  }
+
+  // An Anthropic-compatible gateway that is not Anthropic (GitHub Copilot's
+  // /v1/messages) trails Anthropic's request schema and names what it does
+  // not understand in its 400: beta flags it does not support, request fields
+  // it treats as "Extra inputs", and thinking/effort controls a given model
+  // lacks. Those sets grow with every Claude Code release, so no fixed
+  // allowlist survives. Instead, drop exactly what the upstream rejected and
+  // send once more, a bounded number of times, remembering each repair.
+  // Removing a field the gateway declares unknown cannot change what it would
+  // have done with the rest of the request.
+  if (repairs) {
+    for (let attempt = 0; attempt < MAX_SCHEMA_REPAIRS && upstreamRes.status === 400; attempt += 1) {
+      const errBody = await upstreamRes.text();
+      const repair = repairFromRejection(forwardBody, inboundBeta, errBody, repairs);
+      if (!repair) {
+        upstreamRes = new Response(errBody, { status: 400, headers: upstreamRes.headers });
+        break;
+      }
+      options.log?.(`anthropic upstream rejected ${repair.description}; retrying without it`);
+      inboundBeta = repair.inboundBeta;
+      forwardBody = repair.body;
+      try {
+        upstreamRes = await doFetch(effectiveKey);
+      } catch (err) {
+        throw new UpstreamUnreachableError(err);
+      }
+    }
   }
 
   if (!upstreamRes.ok) {

@@ -23,6 +23,7 @@ import {
   writeWebSocketDiagnosticLog,
 } from './trace-log.js';
 import {
+  anthropicSchemaRepairsFor,
   relayAnthropicMessages,
   resolveOAuthRetryReplacement,
   UpstreamUnreachableError,
@@ -561,6 +562,7 @@ export async function startProxyCatalog(
             log: message => plog(message),
             claudeCodeSessionId,
             extraHeaders: route.headers,
+            repairs: anthropicSchemaRepairsFor(`${route.providerId ?? 'anthropic'}:${route.realModelId}`),
             refreshToken: route.refreshToken,
             onTokenRefreshed: refreshed => { route.apiKey = refreshed; },
             signal: clientAbort.signal,
