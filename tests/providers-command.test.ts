@@ -165,10 +165,10 @@ describe('parseProvidersArgs', () => {
     expect(help).toContain('built-in provider');
   });
 
-  it('mentions only openai in auth help', () => {
+  it('documents every provider that can actually sign in, and no others', () => {
     const help = providerAuthHelpText();
     expect(help).toContain('openai');
-    expect(help).not.toContain('github-copilot');
+    expect(help).toContain('github-copilot');
     expect(help).not.toContain('xai');
   });
 
@@ -1023,6 +1023,7 @@ describe('hub OAuth method picker', () => {
   it('forwards the picked browser method to authenticateProvider', async () => {
     selectMock
       .mockResolvedValueOnce('auth-menu')
+      .mockResolvedValueOnce('openai-oauth')
       .mockResolvedValueOnce('browser')
       .mockResolvedValueOnce('done');
     authenticateProviderMock.mockResolvedValue({
@@ -1034,7 +1035,7 @@ describe('hub OAuth method picker', () => {
 
     expect(authenticateProviderMock).toHaveBeenCalledOnce();
     expect(authenticateProviderMock).toHaveBeenCalledWith(
-      'openai',
+      'openai-oauth',
       expect.objectContaining({ method: 'browser' }),
     );
   });
@@ -1042,6 +1043,7 @@ describe('hub OAuth method picker', () => {
   it('keeps device code as the picker default so Enter preserves today\'s behavior', async () => {
     selectMock
       .mockResolvedValueOnce('auth-menu')
+      .mockResolvedValueOnce('openai-oauth')
       .mockResolvedValueOnce('native')
       .mockResolvedValueOnce('done');
     authenticateProviderMock.mockResolvedValue({
@@ -1051,14 +1053,36 @@ describe('hub OAuth method picker', () => {
 
     await expect(runProvidersCommand([])).resolves.toBe(0);
 
-    const pickerCall = selectMock.mock.calls[1]?.[0] as {
+    const pickerCall = selectMock.mock.calls[2]?.[0] as {
       initialValue?: string;
       options: Array<{ value: string }>;
     };
     expect(pickerCall.initialValue).toBe('native');
     expect(pickerCall.options.map(option => option.value)).toEqual(['native', 'browser']);
     expect(authenticateProviderMock).toHaveBeenCalledWith(
-      'openai',
+      'openai-oauth',
+      expect.objectContaining({ method: 'native' }),
+    );
+  });
+
+  it('skips the method question for a provider with only a device-code flow', async () => {
+    selectMock
+      .mockResolvedValueOnce('auth-menu')
+      .mockResolvedValueOnce('github-copilot')
+      .mockResolvedValueOnce('done');
+    authenticateProviderMock.mockResolvedValue({
+      registryProvider: openaiEntry({ id: 'github-copilot', name: 'GitHub Copilot' }),
+      credentialCleanupPending: false,
+    });
+
+    await expect(runProvidersCommand([])).resolves.toBe(0);
+
+    // Third select is the hub again, not a browser/device-code question that
+    // would offer a sign-in path GitHub Copilot does not have.
+    expect(selectMock.mock.calls[2]?.[0].options.map((option: { value: string }) => option.value))
+      .not.toContain('browser');
+    expect(authenticateProviderMock).toHaveBeenCalledWith(
+      'github-copilot',
       expect.objectContaining({ method: 'native' }),
     );
   });
@@ -1086,13 +1110,18 @@ describe('providers add menu', () => {
     vi.restoreAllMocks();
   });
 
-  it('offers ChatGPT OAuth followed by OpenAI and OpenCode Go API keys', async () => {
+  it('offers every OAuth sign-in followed by the OpenAI and OpenCode Go API keys', async () => {
     selectMock.mockResolvedValue('noop');
 
     await runProvidersAdd();
 
     const options = selectMock.mock.calls[0]?.[0].options.map((option: { value: string }) => option.value);
-    expect(options).toEqual(['oauth', 'api:openai', 'api:opencode-go']);
+    expect(options).toEqual([
+      'oauth:github-copilot',
+      'oauth:openai-oauth',
+      'api:openai',
+      'api:opencode-go',
+    ]);
   });
 
   it('adds OpenCode Go through the shared API-key flow', async () => {
@@ -1129,7 +1158,7 @@ describe('providers add menu', () => {
     await expect(runProvidersAdd()).resolves.toBe(0);
 
     const options = selectMock.mock.calls[0]?.[0].options.map((option: { value: string }) => option.value);
-    expect(options).toEqual(['oauth', 'api:openai']);
+    expect(options).toEqual(['oauth:github-copilot', 'oauth:openai-oauth', 'api:openai']);
     expect(passwordMock).not.toHaveBeenCalled();
     expect(addTemplateMock).not.toHaveBeenCalled();
   });
@@ -1176,7 +1205,12 @@ describe('providers add menu', () => {
     await expect(runProvidersAdd()).resolves.toBe(0);
 
     const options = selectMock.mock.calls[0]?.[0].options.map((option: { value: string }) => option.value);
-    expect(options).toEqual(['oauth', 'api:openai', 'api:opencode-go']);
+    expect(options).toEqual([
+      'oauth:github-copilot',
+      'oauth:openai-oauth',
+      'api:openai',
+      'api:opencode-go',
+    ]);
   });
 
   it('reports pending cleanup after an API-key provider is committed', async () => {

@@ -24,6 +24,7 @@ import { anthropicErrorType, upstreamHttpStatus } from './upstream-error.js';
 import { upstreamMaxRetries } from './upstream-retry.js';
 import { emitParentNotice } from './parent-notice.js';
 import { CLAUDE_CODE_BILLING_HEADER_PREFIX } from './oauth/claude-identity.js';
+import { GITHUB_COPILOT_PROVIDER_ID } from './github-copilot.js';
 
 export { silenceSdkWarnings };
 
@@ -622,9 +623,14 @@ export function translateRequest(
  * log grows into a confident lie about what went on the wire.
  */
 export function isOpenAiOAuthRoute(
-  route: { npm?: string; authType?: string } | undefined,
+  route: { npm?: string; authType?: string; providerId?: string } | undefined,
 ): boolean {
-  return route?.npm === '@ai-sdk/openai' && route.authType === 'oauth';
+  // GitHub Copilot's Responses models are OAuth + @ai-sdk/openai too, but they
+  // talk to Copilot's own host, not the ChatGPT Codex backend this flag selects
+  // (instructions field, WebSocket transport, service tier, no output limit).
+  return route?.npm === '@ai-sdk/openai'
+    && route.authType === 'oauth'
+    && route.providerId !== GITHUB_COPILOT_PROVIDER_ID;
 }
 
 const SERVICE_TIERS = new Set(['auto', 'default', 'flex', 'priority']);

@@ -62,6 +62,7 @@ import { withResponsesWebSocketDiagnosticContext } from './oauth/responses-webso
 import { resolveContextWindow } from './context-window.js';
 import { listenTcpServer } from './listener-ready.js';
 import type { ModelRuntimeCompatibility } from './model-runtime-compatibility.js';
+import { providerDynamicHeaders } from './github-copilot.js';
 
 type ProxyLog = (message: string | (() => string)) => void;
 
@@ -563,7 +564,7 @@ export async function startProxyCatalog(
             authType: routeAuthType,
             log: message => plog(message),
             claudeCodeSessionId,
-            extraHeaders: route.headers,
+            extraHeaders: { ...route.headers, ...providerDynamicHeaders(route.providerId, forwardBody) },
             repairs: anthropicSchemaRepairsFor(`${route.providerId ?? 'anthropic'}:${route.realModelId}`),
             refreshToken: route.refreshToken,
             onTokenRefreshed: refreshed => { route.apiKey = refreshed; },

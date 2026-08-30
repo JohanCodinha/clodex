@@ -18,6 +18,7 @@ import {
   type OpenAiRequest,
 } from '../openai-adapter.js';
 import { sendJson, readBody } from '../http-utils.js';
+import { providerDynamicHeaders } from '../github-copilot.js';
 import {
   anthropicSchemaRepairsFor,
   relayAnthropicMessages,
@@ -362,7 +363,7 @@ async function handleAnthropicMessages(
       authType,
       log: message => plog(message),
       claudeCodeSessionId,
-      extraHeaders: model.headers,
+      extraHeaders: { ...model.headers, ...providerDynamicHeaders(model.providerId, forwardBody) },
       repairs: anthropicSchemaRepairsFor(`${model.providerId ?? 'anthropic'}:${upstreamModelId(model)}`),
       refreshToken,
       onTokenRefreshed: refreshed => { model.apiKey = refreshed; },

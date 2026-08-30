@@ -457,9 +457,11 @@ ${pc.bold('Options:')}
   --version    Show version
 
 ${pc.bold('Providers:')}
-  openai         OpenAI API key (platform.openai.com)
-  openai-oauth   ChatGPT/Codex plan OAuth — sign in with clodex providers auth openai
-  opencode-go    OpenCode Go API key — add with clodex providers add
+  openai           OpenAI API key (platform.openai.com)
+  openai-oauth     ChatGPT/Codex plan OAuth — sign in with clodex providers auth openai
+  opencode-go      OpenCode Go API key — add with clodex providers add
+  github-copilot   GitHub Copilot plan OAuth — sign in with
+                   clodex providers auth github-copilot
 
 ${pc.bold('Model switching:')}
   Run clodex models to save favorites (max ${MAX_MODEL_CATALOG}).
