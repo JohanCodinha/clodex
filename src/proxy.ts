@@ -238,6 +238,8 @@ export interface ProxyRoute {
   apiKey: string;
   modelFormat: 'anthropic' | 'openai';
   contextWindow?: number;
+  /** Largest output the model accepts; requests above it are clamped, not refused. */
+  maxOutputTokens?: number;
   /** Input size above which the provider bills the whole request at a higher rate. */
   pricingBoundary?: number;
   npm?: string;      // OpenCode api.npm — when SDK-migrated, routes via the adapter
@@ -621,6 +623,7 @@ export async function startProxyCatalog(
             openAiOAuth,
             claudeSessionId,
             maxTools: maxToolsForNpm(route.npm),
+            maxOutputTokens: route.maxOutputTokens,
             reasoningMetadata: {
               providerId: route.providerId,
               apiBaseUrl: route.baseURL,

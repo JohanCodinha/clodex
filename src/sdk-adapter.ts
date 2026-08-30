@@ -86,6 +86,13 @@ export interface TranslateRequestOptions {
   reasoningMetadata?: ReasoningMetadata;
   /** ChatGPT Codex OAuth requires instructions and manages its own output limit. */
   openAiOAuth?: boolean;
+  /**
+   * The model's own output ceiling from the provider catalog. Claude Code asks
+   * for a generous max_tokens (32k+) regardless of model; an upstream whose cap
+   * is lower rejects that request outright instead of capping it, so the
+   * requested value is clamped here — the only place every SDK route passes.
+   */
+  maxOutputTokens?: number;
   /** Fallback session identity from X-Claude-Code-Session-Id. Body metadata wins. */
   claudeSessionId?: string;
   /** Hard cap on tools sent to the provider (e.g. Groq: 128). Excess tools are silently dropped. */
@@ -494,6 +501,18 @@ function isClaudeCodeStructuredOutputCompactRequest(body: AnthropicRequest): boo
   return text.includes(COMPACT_TEXT_ONLY_START) && text.includes(COMPACT_TEXT_ONLY_END);
 }
 
+/**
+ * Clamp the client's requested max_tokens to the model's known output ceiling.
+ * Only an explicit client request is ever clamped: when the client omits
+ * max_tokens the provider's own default stands, and a catalog without a cap
+ * changes nothing.
+ */
+function clampMaxOutputTokens(requested?: number, cap?: number): number | undefined {
+  if (requested === undefined) return undefined;
+  if (cap === undefined || cap <= 0) return requested;
+  return Math.min(requested, cap);
+}
+
 export function translateRequest(
   body: AnthropicRequest,
   npm: string,
@@ -577,7 +596,9 @@ export function translateRequest(
     allowSystemInMessages: true,
     tools: translateTools(upstreamTools.length ? upstreamTools : undefined, npm),
     toolChoice: compactRequest ? 'none' : translateToolChoice(body.tool_choice),
-    maxOutputTokens: options?.openAiOAuth ? undefined : body.max_tokens,
+    maxOutputTokens: options?.openAiOAuth
+      ? undefined
+      : clampMaxOutputTokens(body.max_tokens, options?.maxOutputTokens),
     temperature: body.temperature,
     providerOptions,
   };

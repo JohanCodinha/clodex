@@ -58,6 +58,8 @@ export interface ServerModelInfo {
   providerLabel?: string;
   /** Provider id for filtering. */
   providerId?: string;
+  /** Largest output the model accepts; requests above it are clamped, not refused. */
+  maxOutputTokens?: number;
   /** Static headers sent on every upstream request (e.g. a plan/auth-tracking header a custom endpoint requires). */
   headers?: Record<string, string>;
   /** OAuth provider identity data (e.g. Claude Code's cliUserID/accountUUID) needed to fingerprint requests. */

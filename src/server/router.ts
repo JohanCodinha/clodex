@@ -432,6 +432,7 @@ async function handleAnthropicMessages(
         upstreamModelId: upstreamModelId(model),
       },
       maxTools: npmMaxTools,
+      maxOutputTokens: model.maxOutputTokens,
     });
     const clientWantsStream = Boolean(body.stream);
     // Use the display name in the response model field when masking is on — Claude
