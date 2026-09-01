@@ -56,8 +56,18 @@ import {
  * 2.8.1-patched Windows binary does is not measured. The bump is for every install
  * that still starts: a patch written the old way carries stale bytecode beside
  * patched source, and on 2.1.246 that stale bytecode runs.
+ *
+ * 11 — two sites stopped recognising Claude Code 2.1.257, each on all eight
+ * published builds. PATCH 7's anchor hardcoded the context-window resolver's
+ * parameter NAMES, and 2.1.257 minified the same function as `(e,n)` instead of
+ * `(e,t)`. PATCH 10 required the child-env builder to spell every one of five
+ * scrubbed environment variable names, and 2.1.257 replaced a run of per-name
+ * reads with a set-membership test that spells `CLAUDE_BG_PTY_AUTH` nowhere.
+ * An install patched by an older clodex is not wrong, but it was produced by a
+ * transform set whose anchors are narrower, so it re-reads as stale rather than
+ * current.
  */
-export const PATCH_TRANSFORMS_VERSION = 10;
+export const PATCH_TRANSFORMS_VERSION = 11;
 
 export interface PatchScriptModelEntry {
   alias?: string;
@@ -500,28 +510,39 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // lowercased model string — alias and id are both in the table, so it hits
   // pre- or post-alias-resolution.
   //
-  // Anchor: the resolver's exact body shape. Identifiers are wildcarded (they
-  // churn per build); the (e,t) arity + 3-statement shape matches once.
+  // Anchor: the resolver's exact body shape. EVERY identifier is wildcarded,
+  // including the two PARAMETER names — the minifier renames those per build
+  // too. Claude Code 2.1.252 spelled the resolver `(e,t)` and 2.1.257 spelled
+  // the same function `(e,n)`, which is exactly how a hardcoded `(e,t)` came to
+  // fail on all eight published builds at once. What still pins the site is the
+  // shape, not the spelling: two parameters, both threaded unchanged into the
+  // two calls, around a 3-statement body. That matches once per bundle.
+  //
+  // The injected lookup reads the model string out of the FIRST parameter, so
+  // the snippet has to be built around whatever this build named it.
   // ---------------------------------------------------------------------------
   if (Object.keys(CONTEXT_BY_KEY).length) {
     const MARKER = '/*ccpatch:ctx*/';
-    const SNIPPET =
-      MARKER + 'var _ccw=(' + JSON.stringify(CONTEXT_BY_KEY) + ')[String(e||"").trim().toLowerCase()];if(_ccw!==void 0)return _ccw;';
+    const snippetFor = (modelParam: string) =>
+      MARKER + 'var _ccw=(' + JSON.stringify(CONTEXT_BY_KEY) + ')[String(' + modelParam + '||"").trim().toLowerCase()];if(_ccw!==void 0)return _ccw;';
 
     if (js.includes(MARKER)) {
       // Re-patching an already-patched binary: refresh the baked table in place
-      // so a MODEL_CONFIG edit takes effect without a restore first.
+      // so a MODEL_CONFIG edit takes effect without a restore first. The name in
+      // the snippet already there is the one this binary's resolver declares —
+      // reusing it is what keeps a refresh from rewriting `n` back to `e` and
+      // leaving a lookup on an identifier that is not in scope.
       applyOnce(
         'PATCH 7: per-model context window (refresh)',
-        /\/\*ccpatch:ctx\*\/var _ccw=\(\{[^{}]*\}\)\[[^\]]*\];if\(_ccw!==void 0\)return _ccw;/,
-        () => SNIPPET,
+        /\/\*ccpatch:ctx\*\/var _ccw=\(\{[^{}]*\}\)\[String\(([\w$]+)\|\|""\)\.trim\(\)\.toLowerCase\(\)\];if\(_ccw!==void 0\)return _ccw;/,
+        (_m, modelParam) => snippetFor(modelParam!),
         { required: true, noopIsSkip: true }
       );
     } else {
       applyOnce(
         'PATCH 7: per-model context window',
-        /(function [\w$]+\(e,t\)\{)(let [\w$]+=[\w$]+\(\);if\([\w$]+!==void 0\)return [\w$]+;if\([\w$]+\(e,t\)\)return [\w$]+;return [\w$]+\(e,t\)\})/,
-        (_m, head, body) => head! + SNIPPET + body!,
+        /(function [\w$]+\(([\w$]+),([\w$]+)\)\{)(let [\w$]+=[\w$]+\(\);if\([\w$]+!==void 0\)return [\w$]+;if\([\w$]+\(\2,\3\)\)return [\w$]+;return [\w$]+\(\2,\3\)\})/,
+        (_m, head, modelParam, _windowParam, body) => head! + snippetFor(modelParam!) + body!,
         { required: true }
       );
     }
@@ -677,24 +698,53 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // and exactly one `<fn>(process.env.CLAUDE_CODE_REMOTE)?` ternary precedes it.
   // Those two facts together are what pin the head to the real builder.
   //
-  // The literal, nested-function and brace-balance checks below are the last
-  // line: they reject a match that ends at a nested `return <copy>}` (which
-  // would truncate the function) or that swallowed a neighbour.
+  // The nested-function and brace-balance checks below are the last line: they
+  // reject a match that ends at a nested `return <copy>}` (which would truncate
+  // the function) or that swallowed a neighbour. The literal checks are split by
+  // what they are FOR — two the rewrite structurally depends on, and a quorum
+  // over names Claude Code happens to scrub, which churn. See below.
   // ---------------------------------------------------------------------------
   {
     const patchName = 'PATCH 10: child network environment';
     const marker = '/*ccpatch:child-network-env*/';
     const contractVar = q(NETWORK_ENV_CONTRACT_VAR);
     const networkVars = JSON.stringify(CHILD_NETWORK_ENV_VARS);
-    const requiredBodyLiterals = [
-      '{...process.env',
-      'CLAUDE_CODE_REMOTE',
+    // What the REWRITE depends on: `{...process.env` is the merged copy every
+    // `process.env` read is redirected away from. (The `CLAUDE_CODE_REMOTE`
+    // ternary is load-bearing too, but the anchor already requires it inside the
+    // captured body, so restating it here could never fail.)
+    const requiredBodyLiterals = ['{...process.env'];
+    // A smell test, NOT the identity proof. Identity is the whole-bundle count of
+    // the passthrough early-out below, the head's CLAUDE_CODE_REMOTE ternary, and
+    // the brace walk proving the match spans exactly the function it started in.
+    // Measured on both real bundles: with these names ignored entirely, the full
+    // anchor still has exactly ONE candidate. They never choose among candidates,
+    // so all they can do is reject one already identified.
+    //
+    // Which is what makes an aggressive threshold the wrong trade. These are names
+    // Claude Code happens to scrub out of a child's environment, each only as
+    // durable as the line that spells it: 2.1.252 wrote
+    // `process.env.CLAUDE_BG_PTY_AUTH!==void 0` inline, and 2.1.257 replaced that
+    // whole run of per-name reads with a set-membership test and stopped spelling
+    // the name anywhere. Requiring EVERY name turned that refactor — which changed
+    // nothing about what clodex rewrites — into `clodex patch` refusing 2.1.257 on
+    // all eight published builds at once, and the same move on any other group
+    // would do it again. Nor is a higher floor worth much: two of the five are the
+    // OTEL pair, so "at least two" can be satisfied from a single category and
+    // buys little over one.
+    //
+    // So the floor is ONE. It still refuses a body that scrubs nothing — which is
+    // the only case where these names say something the anchor does not — while
+    // taking four independent refactors, not one, to produce a false refusal.
+    // 2.1.252 matches five and 2.1.257 matches four.
+    const scrubbedEnvNames = [
       'CLAUDE_CODE_OAUTH_TOKEN',
       'CLAUDE_CODE_SUBSCRIPTION_TYPE',
       'CLAUDE_BG_PTY_AUTH',
       '"OTEL_"',
       'CLAUDE_CODE_OTEL_DIAG_STDERR',
     ];
+    const MIN_SCRUBBED_ENV_NAMES = 1;
     /**
      * Index of the `}` closing the block opened at `open`, or -1 if the scan runs
      * off the end. Braces inside strings, template literals and comments do not
@@ -794,15 +844,34 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
         // Walking the real block from the function's own `{` rules out both:
         // the anchor's end must BE the function's end.
         const at = js.indexOf(match);
-        const bound = at < 0
-          ? -1
-          : blockEndIndex(js, at + head!.length - 1) - at - (match.length - 1);
-        const targetIsValid = requiredBodyLiterals.every(literal => body!.includes(literal))
-          && !/\bfunction\s*[\w$]*\(/.test(body!)
-          && bound === 0;
-        if (!targetIsValid) {
-          log('FAIL', patchName, 'target validation failed');
-          fail('clodex patch: child network environment target validation failed');
+        const closingBrace = at < 0 ? -1 : blockEndIndex(js, at + head!.length - 1);
+        // Distinct from "ended in the wrong place": -1 means the walk ran off the
+        // end of the source without ever closing the block. Folding it into the
+        // arithmetic below reports it as a bundle-sized negative distance, which
+        // names nothing.
+        const braceScanFailed = at < 0 || closingBrace < 0;
+        const bound = braceScanFailed ? 0 : closingBrace - at - (match.length - 1);
+        // Name the check that rejected it. "target validation failed" alone sends
+        // the next person triaging a canary failure off to extract a 32 MB bundle
+        // by hand to learn which of four unrelated conditions was the one.
+        const missingLiteral = requiredBodyLiterals.find(literal => !body!.includes(literal));
+        const scrubbedSeen = scrubbedEnvNames.filter(name => body!.includes(name));
+        const why = missingLiteral !== undefined
+          ? 'body does not contain ' + missingLiteral
+          : scrubbedSeen.length < MIN_SCRUBBED_ENV_NAMES
+            ? 'body scrubs only ' + scrubbedSeen.length + ' of the '
+              + scrubbedEnvNames.length + ' known child-env names (expected at least '
+              + MIN_SCRUBBED_ENV_NAMES + ')'
+            : /\bfunction\s*[\w$]*\(/.test(body!)
+              ? 'body declares a nested function'
+              : braceScanFailed
+                ? "the brace walk never reached the function's closing brace"
+                : bound !== 0
+                  ? 'match ends ' + bound + ' characters from the function it started in'
+                  : undefined;
+        if (why !== undefined) {
+          log('FAIL', patchName, 'target validation failed: ' + why);
+          fail('clodex patch: child network environment target validation failed: ' + why);
         }
         const restoredBody = body!.replace(/process\.env/g, '_clodexChildEnv');
         const restore = marker

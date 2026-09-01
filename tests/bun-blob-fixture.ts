@@ -278,3 +278,156 @@ export function rebuildFakeNativeClaude(
     { entryPointId: parsed.entryPointId, flags: parsed.flags, structBytes: parsed.structBytes },
   );
 }
+
+// ---------------------------------------------------------------------------------------------
+// An ELF64 wrapper for the blob above, so the `clodex patch` write path can be driven end to end
+// on the one executable format that needs the Bun blob-pointer stand-in.
+//
+// A Mach-O or PE candidate never reaches `src/bun-compiled-pointer.ts` — only ELF relocates the
+// blob and rewrites the global that points at it. Every other fake install here starts with a
+// `#!/bin/sh` shim, so `readElfLayout` returns null and the stand-in is a silent no-op; a fixture
+// that cannot produce ELF bytes cannot see the production wiring get deleted.
+// ---------------------------------------------------------------------------------------------
+
+/** Where the writable PT_LOAD starts in the FILE, at a deliberately un-16K-aligned offset. */
+const ELF_SEG_OFFSET = 0x1000;
+/**
+ * How far the segment's virtual address runs ahead of its file offset — 0x202000 on the real
+ * linux-x64 build, 0x220000 on arm64. Never zero, and that matters: a fixture mapped at
+ * `vaddr === offset` cannot tell a virtual address from a file offset, so an implementation that
+ * confuses the two reads and writes the same wrong place, passes its own readback, and leaves Bun
+ * pointed at the old blob on every real Linux build.
+ */
+const ELF_LOAD_BIAS = 0x202000;
+const ELF_SEG_VADDR = ELF_SEG_OFFSET + ELF_LOAD_BIAS;
+/** The lowest address tweakcc's 16 KiB-strided scan visits inside that segment. */
+const ELF_FIRST_SCANNED = Math.ceil(ELF_SEG_VADDR / 0x4000) * 0x4000;
+/** Where the Bun blob-pointer global sits — off the boundary, as on every 2.1.257 ELF build. */
+const ELF_POINTER_VADDR = ELF_FIRST_SCANNED + 0x758;
+const elfOffsetOf = (vaddr: number) => ELF_SEG_OFFSET + (vaddr - ELF_SEG_VADDR);
+/** File offset of the Bun blob-pointer global — what a test reads out of the published bytes. */
+export const ELF_POINTER_OFFSET = elfOffsetOf(ELF_POINTER_VADDR);
+/** File offset of the slot the stand-in borrows, which must come back byte-identical. */
+export const ELF_STAND_IN_OFFSET = elfOffsetOf(ELF_FIRST_SCANNED);
+const ELF_BUN_OFFSET = 0x8000;
+const ELF_BUN_VADDR = ELF_BUN_OFFSET + ELF_LOAD_BIAS;
+const ELF_SECTION_NAMES = ['', '.shstrtab', '.bun'];
+
+function elfSectionHeaders(bunAddr: number, bunOffset: number, bunSize: number, shoff: number): Buffer {
+  const shstrtab = Buffer.from(`${ELF_SECTION_NAMES.join('\0')}\0`, 'utf8');
+  const nameOffsets = new Map<string, number>();
+  let cursor = 0;
+  for (const name of ELF_SECTION_NAMES) {
+    nameOffsets.set(name, cursor);
+    cursor += name.length + 1;
+  }
+  const table = Buffer.alloc(3 * 64 + shstrtab.length);
+  const write = (index: number, name: string, addr: number, offset: number, size: number) => {
+    const at = index * 64;
+    table.writeUInt32LE(nameOffsets.get(name)!, at);
+    table.writeBigUInt64LE(BigInt(addr), at + 16);
+    table.writeBigUInt64LE(BigInt(offset), at + 24);
+    table.writeBigUInt64LE(BigInt(size), at + 32);
+  };
+  write(1, '.shstrtab', 0, shoff + 3 * 64, shstrtab.length);
+  write(2, '.bun', bunAddr, bunOffset, bunSize);
+  shstrtab.copy(table, 3 * 64);
+  return table;
+}
+
+/**
+ * A native install shaped like a Linux Claude Code build: an ELF64 whose writable segment holds
+ * the Bun blob-pointer global at an address tweakcc's scan never visits, followed by the blob
+ * itself in a `.bun` section.
+ */
+export function buildFakeElfClaude(modules: BunModuleFixture[], options: BunBlobOptions = {}): Buffer {
+  const blob = buildBunBlob(modules, options);
+  const bunOffset = ELF_BUN_OFFSET;
+  const segmentSize = bunOffset - ELF_SEG_OFFSET + blob.length;
+  const shoff = bunOffset + blob.length;
+  const buf = Buffer.alloc(shoff + 3 * 64 + 64);
+
+  buf.writeUInt32LE(0x464c457f, 0);
+  buf[4] = 2; // ELFCLASS64
+  buf[5] = 1; // ELFDATA2LSB
+  buf.writeBigUInt64LE(0x40n, 0x20); // e_phoff
+  buf.writeBigUInt64LE(BigInt(shoff), 0x28); // e_shoff
+  buf.writeUInt16LE(56, 0x36);
+  buf.writeUInt16LE(1, 0x38); // one program header
+  buf.writeUInt16LE(64, 0x3a);
+  buf.writeUInt16LE(3, 0x3c); // three section headers
+  buf.writeUInt16LE(1, 0x3e); // .shstrtab index
+
+  buf.writeUInt32LE(1, 0x40); // PT_LOAD
+  buf.writeUInt32LE(6, 0x44); // R|W
+  buf.writeBigUInt64LE(BigInt(ELF_SEG_OFFSET), 0x48);
+  buf.writeBigUInt64LE(BigInt(ELF_SEG_VADDR), 0x50);
+  buf.writeBigUInt64LE(BigInt(segmentSize), 0x60);
+
+  // Filler that can never be read as an address, then the global, then the blob.
+  buf.fill(0xaa, ELF_SEG_OFFSET, bunOffset);
+  buf.writeBigUInt64LE(BigInt(ELF_BUN_VADDR), ELF_POINTER_OFFSET);
+  blob.copy(buf, bunOffset);
+  elfSectionHeaders(ELF_BUN_VADDR, bunOffset, blob.length, shoff).copy(buf, shoff);
+  return buf;
+}
+
+/**
+ * What tweakcc's `repackELFSection` does to that binary: scan the writable segment at a 16384-byte
+ * stride for the address `.bun` currently has, rewrite the eight bytes it finds to `.bun`'s new
+ * address, and record the section there. It never looks anywhere else — which is the whole reason
+ * `shimBunCompiledPointer` exists.
+ *
+ * Throws the way tweakcc throws when the scan comes up empty, so a fixture that stops reproducing
+ * the 2.1.257 failure fails loudly instead of passing for the wrong reason.
+ */
+export function repackFakeElfClaude(
+  binary: Buffer,
+  contentsByIndex: (index: number, previous: string) => string,
+  newBunAddr: number,
+): Buffer {
+  const segmentOffset = Number(binary.readBigUInt64LE(0x48));
+  const segmentVaddr = Number(binary.readBigUInt64LE(0x50));
+  const segmentSize = Number(binary.readBigUInt64LE(0x60));
+  const shoff = Number(binary.readBigUInt64LE(0x28));
+  const bunAddr = Number(binary.readBigUInt64LE(shoff + 2 * 64 + 16));
+
+  const needle = Buffer.alloc(8);
+  needle.writeBigUInt64LE(BigInt(bunAddr));
+  let foundAt = -1;
+  const first = Math.ceil(segmentVaddr / 16384) * 16384;
+  for (let vaddr = first; vaddr <= segmentVaddr + segmentSize - 8; vaddr += 16384) {
+    const at = segmentOffset + (vaddr - segmentVaddr);
+    if (binary.subarray(at, at + 8).equals(needle)) { foundAt = at; break; }
+  }
+  if (foundAt < 0) {
+    throw new Error(`Could not find original BUN_COMPILED location in binary (searched for 0x${bunAddr.toString(16)})`);
+  }
+
+  const parsed = parseBunBlob(binary);
+  const blob = buildBunBlob(
+    parsed.names.map((name, index) => ({
+      name,
+      contents: contentsByIndex(index, parsed.contents[index]!),
+      sourcemap: parsed.sourcemap[index]!,
+      bytecode: parsed.bytecode[index]!,
+      moduleInfo: parsed.moduleInfo[index]!,
+      bytecodeOriginPath: parsed.bytecodeOriginPath[index]!,
+      loader: parsed.loaders[index]!,
+    })),
+    { entryPointId: parsed.entryPointId, flags: parsed.flags, structBytes: parsed.structBytes },
+  );
+
+  // The blob keeps its file position; only its recorded address moves, which is all the restore
+  // reads. Growing the file where the real repack does would add nothing this test can observe.
+  const bunOffset = Number(binary.readBigUInt64LE(shoff + 2 * 64 + 24));
+  const grown = bunOffset + blob.length;
+  const out = Buffer.alloc(grown + 3 * 64 + 64);
+  binary.subarray(0, bunOffset).copy(out, 0);
+  blob.copy(out, bunOffset);
+  out.writeBigUInt64LE(BigInt(grown), 0x28);
+  out.writeBigUInt64LE(BigInt(bunOffset - segmentOffset + blob.length), 0x60);
+  out.writeBigUInt64LE(BigInt(newBunAddr), foundAt);
+  elfSectionHeaders(newBunAddr, bunOffset, blob.length, grown).copy(out, grown);
+  return out;
+}

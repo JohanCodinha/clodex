@@ -6,12 +6,18 @@ import {
   CLAUDE_PROXY_EFFORT_FIXTURE,
   CLAUDE_SPLIT_ENTRY_ID,
   CLAUDE_SPLIT_MODULES,
+  CONTEXT_RESOLVER,
+  contextResolver,
 } from './fixtures/claude-bundle.js';
 import {
+  buildFakeElfClaude,
   buildFakeNativeClaude,
+  ELF_POINTER_OFFSET,
+  ELF_STAND_IN_OFFSET,
   MACHO_MAGIC,
   parseBunBlob,
   rebuildFakeNativeClaude,
+  repackFakeElfClaude,
 } from './bun-blob-fixture.js';
 import { execFileSync } from 'node:child_process';
 import * as p from '@clack/prompts';
@@ -582,8 +588,8 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
       .join('\n');
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
-      version: 10,
-      digest: 'b7897568a924dfa98b828d6cf4f136638777e5d11216e38a8e7408b9b5639b16',
+      version: 11,
+      digest: 'de2d7eed932eccae7f6a59b4334c95f15ea580e540f41e166efb2120a2b9556e',
     });
   });
 });
@@ -1316,6 +1322,179 @@ describe('applyPatch', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  /**
+   * The ELF half of the same write path. A Bun standalone ELF keeps its blob's address in an
+   * 8-byte global; tweakcc's repack moves the blob and rewrites that global, but finds it by
+   * scanning only 16384-aligned addresses. Claude Code 2.1.257 moved it off a boundary on all four
+   * ELF builds and the repack threw, so `clodex patch` failed there while macOS and Windows — which
+   * assign the section in place and rewrite no pointer — stayed green.
+   *
+   * `src/bun-compiled-pointer.ts` has its own tests. This one exists because those call it
+   * directly: every other fake install in this file starts with a `#!/bin/sh` shim, so the module
+   * is a silent no-op and BOTH production call sites could be deleted with the suite green.
+   */
+  it('repoints the ELF blob pointer that tweakcc cannot find on its own', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clodex-elf-pointer-'));
+    const binaryPath = join(dir, 'claude');
+    const tweakccHome = join(dir, 'tweakcc-home');
+    const previousAppHome = process.env.CLODEX_HOME;
+    const previousTweakccHome = process.env.TWEAKCC_CONFIG_DIR;
+    const pristine = buildFakeElfClaude(CLAUDE_SPLIT_MODULES, { entryPointId: CLAUDE_SPLIT_ENTRY_ID });
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockImplementation((() => '') as unknown as typeof execFileSync);
+    mkdirSync(tweakccHome, { recursive: true });
+    writeFileSync(binaryPath, pristine, { mode: 0o755 });
+    process.env.CLODEX_HOME = dir;
+    process.env.TWEAKCC_CONFIG_DIR = tweakccHome;
+
+    // Where the fixture's repack relocates the blob to. Any address the pristine binary does not
+    // already carry will do; the point is that the published global must end up holding THIS.
+    const RELOCATED_BUN_ADDR = 0x900000;
+
+    tweakccMocks.tryDetectInstallation.mockReset();
+    tweakccMocks.readContent.mockReset();
+    tweakccMocks.writeContent.mockReset();
+    tweakccMocks.tryDetectInstallation.mockImplementation(
+      async ({ path }: { path: string }) => ({ path, version: 'test-version', kind: 'native' }),
+    );
+    tweakccMocks.readContent.mockImplementation(async ({ path }: { path: string }) => {
+      const parsed = parseBunBlob(readFileSync(path));
+      const index = parsed.names.findIndex(tweakccRecognizesModuleName);
+      if (index < 0) throw new Error(`Failed to extract JavaScript from native installation: ${path}`);
+      return parsed.contents[index]!;
+    });
+    // Throws exactly as `repackELFSection` throws when its strided scan finds nothing, so a fixture
+    // that stopped reproducing 2.1.257 fails loudly instead of passing for the wrong reason.
+    tweakccMocks.writeContent.mockImplementation(
+      async ({ path }: { path: string }, content: string) => {
+        const parsed = parseBunBlob(readFileSync(path));
+        writeFileSync(
+          path,
+          repackFakeElfClaude(
+            readFileSync(path),
+            (index, previous) => (tweakccRecognizesModuleName(parsed.names[index]!) ? content : previous),
+            RELOCATED_BUN_ADDR,
+          ),
+          { mode: 0o755 },
+        );
+      },
+    );
+
+    try {
+      const outcome = await applyPatch(
+        binaryPath,
+        'test-version',
+        {
+          config: { 'clodex:test:extended': { alias: 'extended', context: 272_000, display: 'Extended (test)' } },
+          unknownWindows: [],
+        },
+        'desired-config-hash',
+        { trace: false, manifest: null },
+      );
+
+      expect(outcome.ok ? 'ok' : outcome.message).toBe('ok');
+
+      const published = readFileSync(binaryPath);
+      // The real global holds the relocated address. Read at its FILE OFFSET, which the fixture
+      // keeps distinct from its virtual address — the two are 0x202000 apart on a real linux-x64.
+      expect(published.readBigUInt64LE(ELF_POINTER_OFFSET)).toBe(BigInt(RELOCATED_BUN_ADDR));
+      // ...and the slot the stand-in borrowed holds what it held before, byte for byte.
+      expect(published.readBigUInt64LE(ELF_STAND_IN_OFFSET))
+        .toBe(pristine.readBigUInt64LE(ELF_STAND_IN_OFFSET));
+      // The patch itself still landed, so this is not passing on a binary nothing was done to.
+      expect(parseBunBlob(published).contents[0]).toContain('"extended"');
+      expect(parseBunBlob(published).contents[6]).toContain('/*ccpatch:ctx*/');
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+      if (previousAppHome === undefined) delete process.env.CLODEX_HOME;
+      else process.env.CLODEX_HOME = previousAppHome;
+      if (previousTweakccHome === undefined) delete process.env.TWEAKCC_CONFIG_DIR;
+      else process.env.TWEAKCC_CONFIG_DIR = previousTweakccHome;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The same thing on the OTHER write path. `applyPatch` falls back to tweakcc's single-module
+   * write whenever `readClaudeBundle` returns null — an npm `cli.js` install, or a blob whose
+   * modules do not round-trip. An npm install is not an ELF, so the stand-in is a no-op there and
+   * that call site could be deleted with everything else still green; this is the case where the
+   * fallback and a native ELF meet, which is what makes it a second call site rather than a
+   * decoration.
+   */
+  it('repoints the ELF blob pointer on the single-module write path too', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clodex-elf-fallback-'));
+    const binaryPath = join(dir, 'claude');
+    const tweakccHome = join(dir, 'tweakcc-home');
+    const previousAppHome = process.env.CLODEX_HOME;
+    const previousTweakccHome = process.env.TWEAKCC_CONFIG_DIR;
+    // Loader 5 is a vendored asset, not JavaScript Bun executes, so `readClaudeBundle` finds no
+    // bundle at all and returns null — which is what selects the fallback write.
+    const modules = [{ name: '/$bunfs/root/src/entrypoints/cli.js', contents: CLAUDE_FIXTURE, loader: 5 }];
+    const pristine = buildFakeElfClaude(modules);
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockImplementation((() => '') as unknown as typeof execFileSync);
+    mkdirSync(tweakccHome, { recursive: true });
+    writeFileSync(binaryPath, pristine, { mode: 0o755 });
+    process.env.CLODEX_HOME = dir;
+    process.env.TWEAKCC_CONFIG_DIR = tweakccHome;
+
+    const RELOCATED_BUN_ADDR = 0x900000;
+
+    tweakccMocks.tryDetectInstallation.mockReset();
+    tweakccMocks.readContent.mockReset();
+    tweakccMocks.writeContent.mockReset();
+    tweakccMocks.tryDetectInstallation.mockImplementation(
+      async ({ path }: { path: string }) => ({ path, version: 'test-version', kind: 'native' }),
+    );
+    tweakccMocks.readContent.mockImplementation(
+      async ({ path }: { path: string }) => parseBunBlob(readFileSync(path)).contents[0]!,
+    );
+    tweakccMocks.writeContent.mockImplementation(
+      async ({ path }: { path: string }, content: string) => {
+        writeFileSync(
+          path,
+          repackFakeElfClaude(readFileSync(path), () => content, RELOCATED_BUN_ADDR),
+          { mode: 0o755 },
+        );
+      },
+    );
+
+    try {
+      const outcome = await applyPatch(
+        binaryPath,
+        'test-version',
+        {
+          config: { 'clodex:test:extended': { alias: 'extended', context: 272_000, display: 'Extended (test)' } },
+          unknownWindows: [],
+        },
+        'desired-config-hash',
+        { trace: false, manifest: null },
+      );
+
+      expect(outcome.ok ? 'ok' : outcome.message).toBe('ok');
+
+      const published = readFileSync(binaryPath);
+      expect(published.readBigUInt64LE(ELF_POINTER_OFFSET)).toBe(BigInt(RELOCATED_BUN_ADDR));
+      expect(published.readBigUInt64LE(ELF_STAND_IN_OFFSET))
+        .toBe(pristine.readBigUInt64LE(ELF_STAND_IN_OFFSET));
+      // Went through the fallback, and the patch landed in the one module tweakcc names.
+      expect(parseBunBlob(published).contents[0]).toContain('"extended"');
+      expect(parseBunBlob(published).contents[0]).toContain('/*ccpatch:ctx*/');
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+      if (previousAppHome === undefined) delete process.env.CLODEX_HOME;
+      else process.env.CLODEX_HOME = previousAppHome;
+      if (previousTweakccHome === undefined) delete process.env.TWEAKCC_CONFIG_DIR;
+      else process.env.TWEAKCC_CONFIG_DIR = previousTweakccHome;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 
@@ -1939,26 +2118,107 @@ describe('patch script identity naming', () => {
     expect(result.content).toContain('if(o[0]){delete v.CLAUDE_CODE_OAUTH_TOKEN;return e}');
   });
 
-  // Each literal is an independent statement about what the target function does.
-  // The anchor alone cannot tell the child-env builder from another function that
-  // merges process.env, so dropping any one of these must refuse rather than
-  // patch a lookalike.
-  it.each([
+  // The names the builder scrubs are a smell test, not the identity proof, and
+  // each one is only as durable as the line that happens to spell it. Claude Code
+  // 2.1.257 replaced a run of per-name `process.env.CLAUDE_BG_*!==void 0` reads
+  // with a set-membership test and stopped spelling those names at all — a
+  // refactor that changed nothing about what clodex rewrites. Requiring every
+  // name made `clodex patch` refuse that release on all eight published builds.
+  const SCRUBBED_ENV_NAMES: [string, string, string][] = [
     ['the OAuth credential it scrubs', 'CLAUDE_CODE_OAUTH_TOKEN', 'SOMETHING_ELSE_TOKEN'],
     ['the subscription type it scrubs', 'CLAUDE_CODE_SUBSCRIPTION_TYPE', 'SOMETHING_ELSE_TYPE'],
     ['the background PTY token it scrubs', 'CLAUDE_BG_PTY_AUTH', 'SOMETHING_ELSE_AUTH'],
     ['the OTEL prefix it strips', '"OTEL_"', '"UNRELATED_"'],
     ['the OTEL diagnostic flag it strips', 'CLAUDE_CODE_OTEL_DIAG_STDERR', 'SOMETHING_ELSE_DIAG'],
-  ])('refuses a child builder that no longer references %s', (_name, literal, replacement) => {
-    // Replace EVERY occurrence: the check is `body.includes(literal)`, so one
-    // surviving mention anywhere in the body keeps the guard satisfied and the
-    // test passes without testing anything.
-    const source = CLAUDE_FIXTURE_239.split(literal).join(replacement);
+  ];
+
+  /** Every occurrence, so one surviving mention cannot keep the guard satisfied. */
+  function withoutScrubbedNames(source: string, names: [string, string, string][]): string {
+    return names.reduce((acc, [, literal, replacement]) => acc.split(literal).join(replacement), source);
+  }
+
+  it.each(SCRUBBED_ENV_NAMES)(
+    'still patches a child builder that stopped spelling %s',
+    (_name, literal, replacement) => {
+      const source = withoutScrubbedNames(CLAUDE_FIXTURE_239, [['', literal, replacement]]);
+
+      expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_239);
+      expect(source, 'no occurrence of the literal may survive').not.toContain(literal);
+
+      const result = applyClodexPatches(source, config);
+
+      expect(result.results.at(-1)).toEqual({
+        status: 'OK',
+        name: 'PATCH 10: child network environment',
+      });
+      expect(result.content).toContain('function childEnv(){/*ccpatch:child-network-env*/');
+    },
+  );
+
+  // Exactly ON the floor, which is the case neither the five positives above nor
+  // the negative below can see: they leave four names and none. Without this, an
+  // off-by-one — `<=` instead of `<` — refuses a builder clodex can patch, on
+  // every platform, with every other assertion here still green.
+  it('still patches a child builder down to a single known name', () => {
+    const source = withoutScrubbedNames(CLAUDE_FIXTURE_239, SCRUBBED_ENV_NAMES.slice(0, 4));
 
     expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_239);
-    expect(source, 'no occurrence of the literal may survive').not.toContain(literal);
+    const survivors = SCRUBBED_ENV_NAMES.filter(([, literal]) => source.includes(literal));
+    expect(survivors, 'exactly one name may survive, or this is not the boundary').toHaveLength(1);
+
+    const result = applyClodexPatches(source, config);
+
+    expect(result.results.at(-1)).toEqual({
+      status: 'OK',
+      name: 'PATCH 10: child network environment',
+    });
+    expect(result.content).toContain('function childEnv(){/*ccpatch:child-network-env*/');
+  });
+
+  // The floor still has to mean something: a body that scrubs none of them is not
+  // the child-env builder and must be refused, not rewritten.
+  it('refuses a child builder that scrubs none of the known names', () => {
+    const source = withoutScrubbedNames(CLAUDE_FIXTURE_239, SCRUBBED_ENV_NAMES);
+
+    expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_239);
+    for (const [, literal] of SCRUBBED_ENV_NAMES) expect(source).not.toContain(literal);
+
     expect(() => runPatchScript(config, source)).toThrow(
-      'clodex patch: child network environment target validation failed',
+      'clodex patch: child network environment target validation failed: '
+      + 'body scrubs only 0 of the 5 known child-env names (expected at least 1)',
+    );
+  });
+
+  // Every refusal names the check that produced it. A bare "target validation
+  // failed" covers four unrelated conditions, and telling them apart from a
+  // canary report meant extracting a 32 MB bundle by hand.
+  it('says which check refused the target', () => {
+    const nested = CLAUDE_FIXTURE.replace(
+      's=flag(process.env.CLAUDE_CODE_REMOTE)?remote():{};let o=',
+      's=flag(process.env.CLAUDE_CODE_REMOTE)?remote():{};function nested(){}let o=',
+    );
+    expect(() => runPatchScript(config, nested)).toThrow(
+      'clodex patch: child network environment target validation failed: '
+      + 'body declares a nested function',
+    );
+
+    const noMerge = CLAUDE_FIXTURE.replace('let v={...process.env,...e,...s}', 'let v={...te,...e,...s}');
+    expect(() => runPatchScript(config, noMerge)).toThrow(
+      'clodex patch: child network environment target validation failed: '
+      + 'body does not contain {...process.env',
+    );
+
+    // The brace walk reads `/` as division, never as the start of a regex literal — telling those
+    // apart needs the grammar. An unmatched `{` inside one therefore runs the walk off the end of
+    // the source. Reported as a distance, that is a bundle-sized negative number naming nothing.
+    const runawayBrace = CLAUDE_FIXTURE_239.replace(
+      'for(let k of u)delete v[k];return v}',
+      'var re=/{/;for(let k of u)delete v[k];return v}',
+    );
+    expect(runawayBrace, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_239);
+    expect(() => runPatchScript(config, runawayBrace)).toThrow(
+      'clodex patch: child network environment target validation failed: '
+      + "the brace walk never reached the function's closing brace",
     );
   });
 
@@ -1987,6 +2247,24 @@ describe('patch script identity naming', () => {
 
     expect(() => runPatchScript(config, source)).toThrow(
       'clodex patch: child network environment target validation failed',
+    );
+  });
+
+  // `CLAUDE_CODE_REMOTE` is not in the literal list, because the ANCHOR already requires it inside
+  // the captured body — that is why removing it from the list was safe. Nothing else pins the
+  // anchor's copy of it, so widen it to any environment variable and the site would silently stop
+  // proving it bound to the builder that consults the remote flag.
+  it('rejects a child builder whose head consults a different environment variable', () => {
+    const source = CLAUDE_FIXTURE.replace(
+      'flag(process.env.CLAUDE_CODE_REMOTE)?remote():{}',
+      'flag(process.env.CLAUDE_CODE_ELSEWHERE)?remote():{}',
+    );
+
+    expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE);
+    expect(source).not.toContain('CLAUDE_CODE_REMOTE');
+
+    expect(() => runPatchScript(config, source)).toThrow(
+      'clodex patch: required patch failed: PATCH 10: child network environment',
     );
   });
 
@@ -2494,6 +2772,113 @@ describe('patch script identity naming', () => {
     const parsed = JSON.parse(table!) as Record<string, number>;
     expect(parsed['clodex:openai:mystery']).toBe(131_072);
     expect(parsed['sol']).toBe(272_000);
+  });
+
+  // ---------------------------------------------------------------------------
+  // PATCH 7's anchor and the parameter names Claude Code's minifier picks.
+  //
+  // 2.1.252 minified the context-window resolver as `(e,t)` and 2.1.257 minified
+  // the same function as `(e,n)`. The anchor required the literal `(e,t)`, so the
+  // site reported "anchor not found" on all eight published 2.1.257 builds and
+  // `clodex patch` aborted — no context windows, no auto-compaction, on every
+  // platform at once. Nothing below is 2.1.257-specific: the resolver is spelled
+  // through a helper so a name the minifier has not chosen yet is covered too.
+  // ---------------------------------------------------------------------------
+  describe('PATCH 7 against a resolver whose parameters the minifier renamed', () => {
+    /** The patched resolver, pulled back out of the bundle so it can be RUN. */
+    function resolverFrom(patched: string): (model: unknown, opts?: unknown) => unknown {
+      const declaration = patched
+        .split('\n')
+        .find(line => line.startsWith('function RS(') && line.includes('/*ccpatch:ctx*/'));
+      expect(declaration).toBeDefined();
+      // The resolver's own callees are stubbed to the shape the real ones have:
+      // no env override, no 1M gate, and a native window for anything unbaked.
+      const make = new Function(
+        'FAc',
+        'EHi',
+        'Dve',
+        '$Ac',
+        `${declaration}; return RS;`,
+      ) as (
+        FAc: () => undefined,
+        EHi: () => boolean,
+        Dve: number,
+        $Ac: () => number,
+      ) => (model: unknown, opts?: unknown) => unknown;
+      return make(() => undefined, () => false, 200_000, () => 200_000);
+    }
+
+    it.each([
+      { spelling: '(e,t)', model: 'e', window: 't' },
+      { spelling: '(e,n)', model: 'e', window: 'n' },
+      { spelling: '(a,i)', model: 'a', window: 'i' },
+    ])('applies to a resolver minified as $spelling', ({ model, window }) => {
+      const source = CLAUDE_FIXTURE.replace(CONTEXT_RESOLVER, contextResolver(model, window));
+      // Guards the substitution itself: a fixture edit that stopped this from
+      // landing would leave every case below testing the same `(e,t)` spelling.
+      expect(source).toContain(contextResolver(model, window));
+
+      const patched = applyClodexPatches(source, config);
+
+      expect(patched.results).toContainEqual({ status: 'OK', name: 'PATCH 7: per-model context window' });
+      // The lookup has to read the parameter THIS build declares. Reading a name
+      // that is not in scope would either throw or silently pick up an unrelated
+      // binding from the module around it, and every model would fall through to
+      // the 200k clamp with nothing reported as failed.
+      expect(patched.content).toContain(`[String(${model}||"").trim().toLowerCase()]`);
+
+      const resolve = resolverFrom(patched.content);
+      expect(resolve('sol')).toBe(272_000);
+      expect(resolve('  SOL  ')).toBe(272_000);
+      expect(resolve('clodex:openai:mystery')).toBe(128_000);
+      expect(resolve('sonnet')).toBe(200_000);
+    });
+
+    // What still pins the site once the names are wildcarded is that BOTH parameters are threaded
+    // unchanged into both calls. Drop that and the anchor is "any two-parameter function with this
+    // statement shape", which a minifier can produce more than once — so the decoy below has the
+    // resolver's exact shape and differs only in what it passes.
+    it('does not bind a lookalike that threads different arguments', () => {
+      const decoy = 'function Dcy(p,q){let z=Q1();if(z!==void 0)return z;'
+        + 'if(R1(p,9))return S1;return T1(p,q)}';
+      const source = `${CLAUDE_FIXTURE}\n${decoy}`;
+
+      const patched = applyClodexPatches(source, config);
+
+      expect(patched.results).toContainEqual({ status: 'OK', name: 'PATCH 7: per-model context window' });
+      // The marker went into the resolver, and the lookalike came through untouched. An anchor that
+      // stopped proving the threading would match both and refuse the whole patch as ambiguous.
+      expect(patched.content).toContain(`function RS(e,t){${'/*ccpatch:ctx*/'}`);
+      expect(patched.content).toContain(decoy);
+      expect(patched.content.match(/\/\*ccpatch:ctx\*\//g)).toHaveLength(1);
+    });
+
+    it('keeps the build\'s own parameter name when a later run refreshes the table', () => {
+      const source = CLAUDE_FIXTURE.replace(CONTEXT_RESOLVER, contextResolver('a', 'i'));
+      const once = applyClodexPatches(source, config).content;
+
+      const updated = applyClodexPatches(once, {
+        ...config,
+        'clodex:openai:mystery': { context: 131_072, display: 'Mystery (OpenAI)' },
+      });
+
+      expect(updated.results).toContainEqual({
+        status: 'OK',
+        name: 'PATCH 7: per-model context window (refresh)',
+      });
+      // Scoped to the context snippet: the effort patches legitimately read `e`,
+      // because THEIR anchors are single-parameter functions of that name.
+      expect(updated.content).toMatch(
+        /\/\*ccpatch:ctx\*\/var _ccw=\(\{[^{}]*\}\)\[String\(a\|\|""\)\.trim\(\)\.toLowerCase\(\)\]/,
+      );
+      expect(updated.content).not.toMatch(
+        /\/\*ccpatch:ctx\*\/var _ccw=\(\{[^{}]*\}\)\[String\(e\|\|""\)/,
+      );
+
+      const resolve = resolverFrom(updated.content);
+      expect(resolve('clodex:openai:mystery')).toBe(131_072);
+      expect(resolve('sol')).toBe(272_000);
+    });
   });
 
   it('keeps identity and context patches when every effort anchor drifts', () => {
