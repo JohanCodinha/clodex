@@ -19,9 +19,14 @@ import { isValidProviderId } from './validate.js';
 import {
   isRetainedOpenCodeGoProvider,
   openCodeGoPinnedApiUrl,
+  resolveProviderTemplate,
   retainedOpenCodeGoTemplate,
 } from './resolve-template.js';
 import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
+import {
+  OPENROUTER_PROVIDER_ID,
+  projectOpenRouterModelTransport,
+} from '../openrouter.js';
 import { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
 
 export { OAUTH_ACCOUNT_ENV } from '../oauth-account-selection.js';
@@ -60,14 +65,21 @@ export { openCodeGoPinnedApiUrl } from './resolve-template.js';
 /**
  * Project persisted model caches onto the authority that owns their provider identity.
  * Ordinary and custom providers retain their cache array unchanged; retained OpenCode
- * identities are fail-closed against the committed template catalog.
+ * identities are fail-closed against the committed template catalog, and OpenRouter's
+ * model-specific transport exception is applied here and only here, so the persisted
+ * cache stays provider-native and a cache written by any release materializes the same way.
  */
 export function projectProviderCachedModels(provider: RegistryProvider): CachedModel[] {
   const cached = provider.modelsCache?.models ?? [];
   if (isChatGptOAuthProvider(provider)) return applyOAuthSeedContextMetadata(cached);
-  if (!isRetainedOpenCodeGoProvider(provider)) return cached;
-  const template = retainedOpenCodeGoTemplate();
-  return template ? applyTemplateModelMetadata(template, cached) : [];
+  if (isRetainedOpenCodeGoProvider(provider)) {
+    const template = retainedOpenCodeGoTemplate();
+    return template ? applyTemplateModelMetadata(template, cached) : [];
+  }
+  if (resolveProviderTemplate(provider)?.id === OPENROUTER_PROVIDER_ID) {
+    return cached.map(model => projectOpenRouterModelTransport(model, provider.api.url));
+  }
+  return cached;
 }
 
 function resolveMaterializedApiUrl(

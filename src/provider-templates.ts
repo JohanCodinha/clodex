@@ -181,10 +181,11 @@ export const PROVIDER_TEMPLATES: ProviderTemplate[] = [
     id: OPENROUTER_PROVIDER_ID,
     name: OPENROUTER_PROVIDER_NAME,
     authType: 'api',
-    // Every OpenRouter model is reached as Anthropic Messages, including the
-    // OpenAI, Google and Chinese ones: the gateway translates in both
-    // directions, so Claude Code's own request — cache breakpoints, tool
-    // blocks, thinking blocks — is forwarded rather than rewritten.
+    // OpenRouter models use Anthropic Messages by default, including models
+    // from OpenAI, Google and Chinese vendors: the gateway translates in both
+    // directions, so Claude Code's own request is normally forwarded rather
+    // than rewritten. Model-specific transport exceptions are applied when the
+    // catalog is materialized and are never persisted.
     npm: '@ai-sdk/anthropic',
     defaultBaseUrl: OPENROUTER_API_BASE_URL,
     modelsPath: OPENROUTER_MODELS_PATH,

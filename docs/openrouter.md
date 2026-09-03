@@ -19,12 +19,12 @@ is authenticated and does nothing else, so a 401 there is unambiguously about
 the key. Anything else (a 500, an unreachable host) is inconclusive and the key
 is accepted.
 
-## One wire protocol: Anthropic Messages
+## Anthropic Messages by default
 
-OpenRouter exposes an Anthropic-format endpoint that serves **every** model it
-hosts, not only Anthropic's — it translates in both directions. clodex routes
-all OpenRouter models through it, so Claude Code's request is forwarded rather
-than rewritten:
+OpenRouter exposes an Anthropic-format endpoint that serves models from every
+vendor, not only Anthropic's — it translates in both directions. clodex routes
+OpenRouter models through it by default, so Claude Code's request is forwarded
+rather than rewritten:
 
 - **Prompt caching works with no translation.** Claude Code's own
   `cache_control` breakpoints reach the upstream intact. This is worth a lot:
@@ -38,9 +38,25 @@ than rewritten:
   and `cache_creation_input_tokens` reach Claude Code's context tracking
   directly.
 
+**Gemini 3.8 Flash is the exception.** Whenever a request carries a thinking
+budget, OpenRouter's Anthropic stream for this model opens a signature-only
+thinking block while the text block is still open, and Claude Code then reports
+a successful turn with a blank answer. It happens with no tools at all, and
+Claude Code's adaptive thinking becomes exactly such a budget on this route (see
+Thinking levels below), so a default session hits it on its first text reply.
+clodex routes the model through OpenRouter's Chat Completions endpoint instead,
+where it returns visible text and working tool calls. OpenRouter currently also
+publishes its `:batch` route under the same canonical Gemini model, so clodex
+applies the same transport exception to that variant. The native pass-through
+and Anthropic-shaped cache reporting above therefore do not apply to those
+models, and Gemini's per-tool-call thought signatures are not yet carried across
+turns there: OpenRouter returns them as `reasoning_details`, which clodex does
+not round-trip yet.
+
 ### Two kinds of caching
 
-Which one applies depends on the model family, and both are reported to Claude Code.
+For models on the Anthropic route, which one applies depends on the model family,
+and both are reported to Claude Code.
 
 **Anthropic models cache explicitly**, from the breakpoints Claude Code already sends. That is
 deterministic: the second turn of a session hits cache.
@@ -80,21 +96,23 @@ Each model also carries:
 
 Claude Code sends most tool definitions deferred, as a placeholder that stands
 in for the tools it will load on demand. OpenRouter honours that for the
-Anthropic models it hosts, but rejects it for the rest ("Deferred custom tools
-are only supported on Anthropic models"). clodex learns that from the rejection,
-per model, and resends without the placeholder — so a Gemini or GPT session
-loses dynamic tool loading and keeps every tool the request actually carries,
-rather than failing outright.
+Anthropic models it hosts, but rejects it for non-Anthropic models that remain
+on the Anthropic route ("Deferred custom tools are only supported on Anthropic
+models"). clodex learns that from the rejection, per model, and resends without
+the placeholder — so those sessions lose dynamic tool loading and keep every
+tool the request actually carries, rather than failing outright.
 
 ## Thinking levels
 
 Models that report reasoning support are offered low / medium / high.
 
-OpenRouter accepts Claude Code's adaptive thinking requests but does not act on
-them — an adaptive request produces the same token counts as a request with no
-thinking at all, while a budgeted request scales them. Since nothing is ever
-rejected, clodex converts adaptive thinking to a proportional budget before
-forwarding, so each level does something different.
+On the Anthropic route, OpenRouter accepts Claude Code's adaptive thinking
+requests but does not act on them — an adaptive request produces the same token
+counts as a request with no thinking at all, while a budgeted request scales
+them. Since nothing is ever rejected, clodex converts adaptive thinking to a
+proportional budget before forwarding, so each level does something different.
+For Gemini 3.8 Flash's Chat Completions route, the same levels map to OpenRouter's
+reasoning-effort field.
 
 ## Token counting
 
