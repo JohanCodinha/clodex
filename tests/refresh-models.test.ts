@@ -15,6 +15,15 @@ vi.mock('../src/registry/fetch-template-models.js', () => ({
 vi.mock('../src/registry/custom-endpoint.js', () => ({
   fetchAnthropicModels: vi.fn(),
 }));
+vi.mock('../src/registry/url-security.js', async () => {
+  const actual = await vi.importActual<typeof import('../src/registry/url-security.js')>(
+    '../src/registry/url-security.js',
+  );
+  return {
+    ...actual,
+    validateCustomEndpointUrl: vi.fn(actual.validateCustomEndpointUrl),
+  };
+});
 vi.mock('../src/registry/io.js', () => ({
   loadRegistryStrict: vi.fn(() => ({ schemaVersion: 1, providers: [] })),
   saveRegistry: vi.fn(),
@@ -34,17 +43,23 @@ vi.mock('../src/registry/lock.js', () => ({
 
 import { fetchTemplateModels } from '../src/registry/fetch-template-models.js';
 import { fetchAnthropicModels } from '../src/registry/custom-endpoint.js';
+import { validateCustomEndpointUrl } from '../src/registry/url-security.js';
 import { loadRegistryStrict, saveRegistry } from '../src/registry/io.js';
 import {
   OPENCODE_GO_ANTHROPIC_BASE_URL,
   OPENCODE_GO_COMPLETIONS_BASE_URL,
 } from '../src/data/opencode-go-models.js';
+import {
+  OPENROUTER_API_BASE_URL,
+  OPENROUTER_LEGACY_API_BASE_URL,
+} from '../src/openrouter.js';
 
 describe('refreshProviderModels', () => {
   beforeEach(() => {
     providerMutationState.active = false;
     vi.mocked(fetchTemplateModels).mockReset();
     vi.mocked(fetchAnthropicModels).mockReset();
+    vi.mocked(validateCustomEndpointUrl).mockClear();
     vi.mocked(loadRegistryStrict).mockReset();
     vi.mocked(saveRegistry).mockClear();
   });
@@ -880,6 +895,97 @@ describe('refreshProviderModels', () => {
 
     expect(result).toMatchObject({ ok: true, modelCount: 1 });
     expect(vi.mocked(fetchTemplateModels).mock.calls[0]?.[2]).toBe(OPENCODE_GO_COMPLETIONS_BASE_URL);
+  });
+
+  it('refreshes OpenRouter through its template so model compatibility metadata survives', async () => {
+    const registry: ProviderRegistry = {
+      schemaVersion: 1,
+      providers: [{
+        id: 'openrouter',
+        templateId: 'openrouter',
+        name: 'OpenRouter',
+        enabled: true,
+        authRef: 'keyring:provider:openrouter',
+        authType: 'api',
+        api: { npm: '@ai-sdk/anthropic', url: OPENROUTER_LEGACY_API_BASE_URL },
+        addedAt: '2026-09-03T00:00:00.000Z',
+      }],
+    };
+    const compatibility = {
+      supportsCountTokens: false,
+      honorsAdaptiveThinking: false,
+    };
+    vi.mocked(fetchTemplateModels).mockResolvedValue({
+      baseUrl: OPENROUTER_API_BASE_URL,
+      models: [{
+        id: 'google/gemini-3.8-flash',
+        name: 'Google: Gemini 3.8 Flash',
+        upstreamModelId: 'google/gemini-3.8-flash',
+        modelFormat: 'anthropic',
+        npm: '@ai-sdk/anthropic',
+        compatibility,
+      }],
+    });
+    vi.mocked(loadRegistryStrict).mockReturnValue(registry);
+
+    const result = await refreshProviderModels('openrouter', 'sk-or-test', registry);
+
+    expect(fetchAnthropicModels).not.toHaveBeenCalled();
+    expect(validateCustomEndpointUrl).not.toHaveBeenCalled();
+    expect(fetchTemplateModels).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'openrouter' }),
+      'sk-or-test',
+      OPENROUTER_API_BASE_URL,
+    );
+    expect(result).toMatchObject({ ok: true, modelCount: 1 });
+    expect(registry.providers[0]?.api.url).toBe(OPENROUTER_API_BASE_URL);
+    // The persisted cache stays provider-native; the Gemini transport exception
+    // is applied when the cache is materialized, not here.
+    expect(registry.providers[0]?.modelsCache?.models[0]).toMatchObject({
+      npm: '@ai-sdk/anthropic',
+      modelFormat: 'anthropic',
+      compatibility,
+    });
+  });
+
+  it.each([
+    ['canonical', OPENROUTER_API_BASE_URL],
+    ['custom', 'https://192.0.2.3/openrouter'],
+  ])('leaves %s OpenRouter catalog URLs unchanged', async (kind, url) => {
+    const registry: ProviderRegistry = {
+      schemaVersion: 1,
+      providers: [{
+        id: 'openrouter',
+        templateId: 'openrouter',
+        name: 'OpenRouter',
+        enabled: true,
+        authRef: 'keyring:provider:openrouter',
+        authType: 'api',
+        api: { npm: '@ai-sdk/anthropic', url },
+        addedAt: '2026-09-03T00:00:00.000Z',
+      }],
+    };
+    vi.mocked(fetchTemplateModels).mockResolvedValue({
+      baseUrl: url,
+      models: [{
+        id: 'model-a',
+        name: 'Model A',
+        upstreamModelId: 'model-a',
+        modelFormat: 'anthropic',
+      }],
+    });
+    vi.mocked(loadRegistryStrict).mockReturnValue(registry);
+
+    const result = await refreshProviderModels('openrouter', 'sk-or-test', registry);
+
+    expect(result).toMatchObject({ ok: true, modelCount: 1 });
+    expect(vi.mocked(fetchTemplateModels).mock.calls[0]?.[2]).toBe(url);
+    if (kind === 'custom') {
+      expect(validateCustomEndpointUrl).toHaveBeenCalledWith(url, { allowInsecureLocal: false });
+    } else {
+      expect(validateCustomEndpointUrl).not.toHaveBeenCalled();
+    }
+    expect(registry.providers[0]?.api.url).toBe(url);
   });
 
   it('leaves an ordinary Anthropic provider refreshing against its own configured endpoint', async () => {
