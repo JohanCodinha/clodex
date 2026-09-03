@@ -17,6 +17,10 @@ import {
   OPENCODE_GO_ANTHROPIC_BASE_URL,
   OPENCODE_GO_COMPLETIONS_BASE_URL,
 } from '../src/data/opencode-go-models.js';
+import {
+  OPENROUTER_API_BASE_URL,
+  OPENROUTER_LEGACY_API_BASE_URL,
+} from '../src/openrouter.js';
 
 describe('provider id validation', () => {
   it('accepts stable slugs', () => {
@@ -436,6 +440,121 @@ describe('materializeRegistry', () => {
     });
     expect(locals[0]?.apiKey).toBe('sk-test');
     expect(locals[0]?.authType).toBe('oauth');
+  });
+
+  it('reprojects an older Gemini 3.8 OpenRouter cache onto its working runtime route', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'openrouter',
+      templateId: 'openrouter',
+      name: 'OpenRouter',
+      enabled: true,
+      authRef: 'keyring:provider:openrouter',
+      authType: 'api',
+      api: { npm: '@ai-sdk/anthropic', url: OPENROUTER_LEGACY_API_BASE_URL },
+      addedAt: '2026-09-03T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-09-03T00:00:00.000Z',
+        models: [{
+          id: 'google/gemini-3.8-flash',
+          name: 'Google: Gemini 3.8 Flash',
+          upstreamModelId: 'google/gemini-3.8-flash',
+          modelFormat: 'anthropic',
+          npm: '@ai-sdk/anthropic',
+          apiUrl: OPENROUTER_LEGACY_API_BASE_URL,
+        }, {
+          id: 'google/gemini-3.7-flash',
+          name: 'Google: Gemini 3.7 Flash',
+          upstreamModelId: 'google/gemini-3.7-flash',
+          modelFormat: 'anthropic',
+          npm: '@ai-sdk/anthropic',
+          apiUrl: OPENROUTER_LEGACY_API_BASE_URL,
+        }],
+      },
+    });
+    registry.providers.push({
+      id: 'custom-anthropic',
+      templateId: 'custom-anthropic',
+      name: 'Custom Anthropic',
+      enabled: true,
+      authRef: 'keyring:provider:custom-anthropic',
+      authType: 'api',
+      api: { npm: '@ai-sdk/anthropic', url: 'https://custom.example/v1' },
+      addedAt: '2026-09-03T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-09-03T00:00:00.000Z',
+        models: [{
+          id: 'google/gemini-3.8-flash',
+          name: 'Custom Gemini 3.8 Flash',
+          upstreamModelId: 'google/gemini-3.8-flash',
+          modelFormat: 'anthropic',
+          npm: '@ai-sdk/anthropic',
+        }],
+      },
+    });
+
+    const locals = materializeRegistry(registry, () => 'sk-or-test');
+    const models = locals.find(provider => provider.id === 'openrouter')?.models;
+    const custom = locals.find(provider => provider.id === 'custom-anthropic')?.models[0];
+    const gemini38 = models?.find(model => model.id === 'google/gemini-3.8-flash');
+    const gemini37 = models?.find(model => model.id === 'google/gemini-3.7-flash');
+
+    expect(gemini38).toMatchObject({
+      npm: '@ai-sdk/openai-compatible',
+      modelFormat: 'openai',
+      apiBaseUrl: OPENROUTER_API_BASE_URL,
+      completionsUrl: `${OPENROUTER_API_BASE_URL}/chat/completions`,
+    });
+    expect(gemini37).toMatchObject({
+      npm: '@ai-sdk/anthropic',
+      modelFormat: 'anthropic',
+      baseUrl: OPENROUTER_LEGACY_API_BASE_URL,
+    });
+    expect(custom).toMatchObject({
+      npm: '@ai-sdk/anthropic',
+      modelFormat: 'anthropic',
+      baseUrl: 'https://custom.example',
+    });
+    expect(registry.providers[0]?.api.url).toBe(OPENROUTER_LEGACY_API_BASE_URL);
+  });
+
+  it('projects a fresh Gemini 3.8 OpenRouter cache onto Chat Completions without rewriting it', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'openrouter',
+      templateId: 'openrouter',
+      name: 'OpenRouter',
+      enabled: true,
+      authRef: 'keyring:provider:openrouter',
+      authType: 'api',
+      api: { npm: '@ai-sdk/anthropic', url: OPENROUTER_API_BASE_URL },
+      addedAt: '2026-09-03T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-09-03T00:00:00.000Z',
+        models: [{
+          id: 'google/gemini-3.8-flash',
+          name: 'Google: Gemini 3.8 Flash',
+          upstreamModelId: 'google/gemini-3.8-flash',
+          modelFormat: 'anthropic',
+          npm: '@ai-sdk/anthropic',
+          apiUrl: OPENROUTER_API_BASE_URL,
+        }],
+      },
+    });
+
+    const locals = materializeRegistry(registry, () => 'sk-or-test');
+    const gemini38 = locals.find(provider => provider.id === 'openrouter')?.models[0];
+
+    expect(gemini38).toMatchObject({
+      npm: '@ai-sdk/openai-compatible',
+      modelFormat: 'openai',
+      completionsUrl: `${OPENROUTER_API_BASE_URL}/chat/completions`,
+    });
+    // Discovery persists the provider-native shape; only materialization projects it.
+    expect(registry.providers[0]?.modelsCache?.models[0]).toMatchObject({
+      npm: '@ai-sdk/anthropic',
+      modelFormat: 'anthropic',
+    });
   });
 
   it('returns empty when credential missing', () => {
