@@ -49,6 +49,11 @@ import { getInstalledClaudeVersion } from '../launch.js';
 import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
 import { isLegacyAnonymousCustomEndpoint } from './materialize.js';
 import { OPENCODE_GO_PROVIDER_NAME } from '../data/opencode-go-models.js';
+import {
+  OPENROUTER_API_BASE_URL,
+  OPENROUTER_LEGACY_API_BASE_URL,
+  OPENROUTER_PROVIDER_ID,
+} from '../openrouter.js';
 
 export interface RefreshProviderResult {
   id: string;
@@ -310,13 +315,23 @@ async function refreshApiListProvider(
     };
   }
   const configuredUrl = provider.api.url?.trim();
-  const baseUrl = retained
+  const resolvedBaseUrl = retained
     ? configuredUrl || pinned || undefined
     : effectiveProviderBaseUrl(provider, catalogTemplate);
 
-  if (!baseUrl) {
+  if (!resolvedBaseUrl) {
     return { models: [], error: 'Provider has no API base URL configured.' };
   }
+
+  // A refresh on the previous build stored the Anthropic runtime root:
+  // `fetchAnthropicModels` strips `/v1` and its result was persisted. It still
+  // works for inference because that SDK appends `/v1/messages`, but template
+  // discovery appends `/models` directly. Upgrade only that exact official
+  // address; an explicitly configured custom endpoint remains untouched.
+  const baseUrl = catalogTemplate?.id === OPENROUTER_PROVIDER_ID
+    && resolvedBaseUrl.replace(/\/$/, '') === OPENROUTER_LEGACY_API_BASE_URL
+    ? OPENROUTER_API_BASE_URL
+    : resolvedBaseUrl;
 
   // The retained built-in's destination is decided HERE, before any
   // npm-specific branch below can put the credential on the wire.
@@ -341,7 +356,7 @@ async function refreshApiListProvider(
 
   let safeBaseUrl = baseUrl;
   const templateDefault = catalogTemplate?.defaultBaseUrl?.trim();
-  if (configuredUrl && configuredUrl !== templateDefault) {
+  if (configuredUrl && baseUrl !== templateDefault) {
     const urlCheck = await validateCustomEndpointUrl(baseUrl, {
       allowInsecureLocal: catalogTemplate?.apiKeyOptional === true,
     });
@@ -356,14 +371,12 @@ async function refreshApiListProvider(
     : syntheticTemplate(provider, safeBaseUrl);
 
   // The pin above decides WHERE the key goes; it says nothing about which
-  // routine reads the answer. A retained record storing
-  // `api.npm: '@ai-sdk/anthropic'` at the pinned OpenCode Anthropic address
-  // clears the pin and then falls in here, where `fetchAnthropicModels`
-  // expects an Anthropic `{ data: [...] }` envelope that OpenCode does not
-  // send and applies none of the committed allowlist/metadata overlay. The
-  // retained built-in discovers through its template whatever npm it names;
-  // ordinary Anthropic providers keep this branch unchanged.
-  if (!retained && npm === '@ai-sdk/anthropic') {
+  // routine reads the answer. Built-ins whose catalog is not Anthropic-shaped
+  // must discover through their template even when Anthropic is their runtime
+  // SDK: OpenCode returns a bare array, while OpenRouter needs its tool filter
+  // and compatibility metadata applied to an OpenAI-shaped list. Ordinary
+  // Anthropic providers keep this branch unchanged.
+  if (!retained && catalogTemplate?.id !== OPENROUTER_PROVIDER_ID && npm === '@ai-sdk/anthropic') {
     const fetched = await fetchAnthropicModels(safeBaseUrl, apiKey);
     if (fetched.error || fetched.models.length === 0) {
       return { models: [], error: fetched.error ?? 'No models returned.', baseUrl: fetched.baseUrl };

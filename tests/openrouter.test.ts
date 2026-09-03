@@ -1,7 +1,10 @@
 // tests/openrouter.test.ts
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
+  OPENROUTER_API_BASE_URL,
+  OPENROUTER_LEGACY_API_BASE_URL,
   openRouterFamily,
+  projectOpenRouterModelTransport,
   shapeOpenRouterModels,
   verifyOpenRouterCredential,
 } from '../src/openrouter.js';
@@ -20,6 +23,18 @@ const LIVE_BODY = {
         input_cache_read: '0.0000001', input_cache_write: '0.00000125',
         overrides: [{ min_prompt_tokens: 200000, prompt: '0.000002' }],
       },
+    },
+    {
+      id: 'google/gemini-3.8-flash',
+      supported_parameters: ['reasoning', 'reasoning_effort', 'tools'],
+      architecture: { input_modalities: ['text', 'image'], output_modalities: ['text'] },
+      top_provider: { max_completion_tokens: 65536 },
+    },
+    {
+      id: 'google/gemini-3.8-flash:batch',
+      supported_parameters: ['reasoning', 'reasoning_effort', 'tools'],
+      architecture: { input_modalities: ['text', 'image'], output_modalities: ['text'] },
+      top_provider: { max_completion_tokens: 65536 },
     },
     {
       id: 'z-ai/glm-4.6',
@@ -64,10 +79,44 @@ const parsed = (ids: string[]): CachedModel[] => ids.map(id => ({
 const shape = () => shapeOpenRouterModels(parsed(LIVE_BODY.data.map(r => r.id)), LIVE_BODY);
 const byId = (id: string) => shape().find(m => m.id === id);
 
+describe('projectOpenRouterModelTransport', () => {
+  const cached = (id: string, apiUrl?: string): CachedModel => ({
+    id, name: id, upstreamModelId: id, family: 'gemini', modelFormat: 'anthropic', npm: '@ai-sdk/anthropic',
+    ...(apiUrl ? { apiUrl } : {}),
+  });
+
+  it.each([
+    'google/gemini-3.8-flash',
+    'google/gemini-3.8-flash:batch',
+  ])('moves %s onto Chat Completions and keeps a canonical apiUrl', id => {
+    expect(projectOpenRouterModelTransport(cached(id, OPENROUTER_API_BASE_URL))).toMatchObject({
+      npm: '@ai-sdk/openai-compatible',
+      modelFormat: 'openai',
+      apiUrl: OPENROUTER_API_BASE_URL,
+    });
+  });
+
+  // A refresh on the previous build stored the root without `/v1` on the model
+  // and on the provider; Chat Completions needs the versioned root.
+  it('rewrites the legacy root, whether the model or the provider carries it', () => {
+    expect(projectOpenRouterModelTransport(cached('google/gemini-3.8-flash', OPENROUTER_LEGACY_API_BASE_URL)).apiUrl)
+      .toBe(OPENROUTER_API_BASE_URL);
+    expect(projectOpenRouterModelTransport(cached('google/gemini-3.8-flash'), `${OPENROUTER_LEGACY_API_BASE_URL}/`).apiUrl)
+      .toBe(OPENROUTER_API_BASE_URL);
+  });
+
+  it('returns every other model untouched', () => {
+    const gemini37 = cached('google/gemini-3.7-flash', OPENROUTER_LEGACY_API_BASE_URL);
+    expect(projectOpenRouterModelTransport(gemini37)).toBe(gemini37);
+  });
+});
+
 describe('shapeOpenRouterModels', () => {
   it('hides models that cannot take tools, which Claude Code needs every turn', () => {
     expect(shape().map(m => m.id)).toEqual([
       'anthropic/claude-haiku-4.5',
+      'google/gemini-3.8-flash',
+      'google/gemini-3.8-flash:batch',
       'z-ai/glm-4.6',
       'kwaipilot/kat-coder-air-v2.5',
       'qwen/qwen3.7-flash',
@@ -78,6 +127,16 @@ describe('shapeOpenRouterModels', () => {
   it('reads the output ceiling from top_provider, where OpenRouter publishes it', () => {
     expect(byId('anthropic/claude-haiku-4.5')?.maxOutputTokens).toBe(64_000);
     expect(byId('z-ai/glm-4.6')?.maxOutputTokens).toBe(16_384);
+  });
+
+  it('leaves every model on the provider-native transport, Gemini 3.8 included', () => {
+    // The Chat Completions exception is applied when the cache is materialized
+    // (projectOpenRouterModelTransport below) and never persisted, so a
+    // downgrade reverts to the Anthropic route without a refresh.
+    for (const id of ['google/gemini-3.8-flash', 'google/gemini-3.8-flash:batch', 'anthropic/claude-haiku-4.5']) {
+      expect(byId(id)).toMatchObject({ modelFormat: 'anthropic' });
+      expect(byId(id)?.npm).toBeUndefined();
+    }
   });
 
   // The shared parser's leading-segment split yields the vendor for a

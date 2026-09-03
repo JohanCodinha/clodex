@@ -14,6 +14,7 @@ export const OPENROUTER_PROVIDER_NAME = 'OpenRouter';
  * relay puts it back, so one template URL serves discovery and inference.
  */
 export const OPENROUTER_API_BASE_URL = 'https://openrouter.ai/api/v1';
+export const OPENROUTER_LEGACY_API_BASE_URL = 'https://openrouter.ai/api';
 export const OPENROUTER_MODELS_PATH = '/models';
 
 /** Authenticated endpoint used to validate a pasted key. */
@@ -24,10 +25,51 @@ const OPENROUTER_KEY_URL = `${OPENROUTER_API_BASE_URL}/key`;
  *
  * OpenRouter publishes reasoning as a capability, not as a list of levels the
  * way Copilot does, so the ladder is Claude Code's own low/medium/high sent
- * through unchanged. Requests reach OpenRouter as Anthropic thinking, which it
- * accepts but only acts on when budgeted — the relay does that conversion.
+ * through unchanged. On the default Anthropic route, OpenRouter only acts on
+ * thinking when it is budgeted — the relay does that conversion.
  */
 const REASONING_EFFORT_LEVELS = ['low', 'medium', 'high'] as const;
+
+/**
+ * Models whose OpenRouter Anthropic stream is not consumable by Claude Code.
+ *
+ * Whenever a request carries a thinking budget, OpenRouter's Anthropic stream
+ * for Gemini 3.8 Flash opens a signature-only thinking block while the text
+ * block is still open, and Claude Code reports a successful turn with an empty
+ * answer. It reproduces with no tools at all and disappears without thinking.
+ * Claude Code's adaptive thinking becomes exactly such a budget on this route
+ * (`honorsAdaptiveThinking: false`), so a default session hits it on its first
+ * text reply. OpenRouter's Chat Completions route returns both text and tool
+ * calls correctly, so only this model family uses that route.
+ */
+const CHAT_COMPLETIONS_MODEL_IDS = new Set(['google/gemini-3.8-flash']);
+
+/**
+ * Apply the transport exception to a persisted OpenRouter model.
+ *
+ * Called from `projectProviderCachedModels` and nowhere else, so the stored
+ * registry keeps the provider's native Anthropic shape for every model and a
+ * downgrade reverts to the Anthropic route without a refresh.
+ */
+export function projectOpenRouterModelTransport(
+  model: CachedModel,
+  providerApiUrl?: string,
+): CachedModel {
+  // OpenRouter appends route variants after `:`; `:batch` currently shares
+  // Gemini 3.8 Flash's canonical slug, so it needs the same transport guard.
+  const variantSeparator = model.id.indexOf(':');
+  const baseModelId = variantSeparator === -1 ? model.id : model.id.slice(0, variantSeparator);
+  if (!CHAT_COMPLETIONS_MODEL_IDS.has(baseModelId)) return model;
+  const effectiveApiUrl = model.apiUrl ?? providerApiUrl;
+  const legacyApiUrl = effectiveApiUrl?.trim().replace(/\/$/, '')
+    === OPENROUTER_LEGACY_API_BASE_URL;
+  return {
+    ...model,
+    npm: '@ai-sdk/openai-compatible',
+    modelFormat: 'openai',
+    ...(legacyApiUrl ? { apiUrl: OPENROUTER_API_BASE_URL } : {}),
+  };
+}
 
 const OPENROUTER_PRICING_NOTE =
   'Above it, OpenRouter prices the full request at the higher long-context rate.';
