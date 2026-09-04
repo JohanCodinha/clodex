@@ -1,6 +1,6 @@
 // Context-window stops for models whose provider prices large prompts differently.
-// GPT-5.6 bills prompts above 272,000 input tokens at a higher rate for the whole
-// request, so the default stop sits under that line and the larger one is opt-in.
+// GPT-5.6 and GPT-6 Astra bill prompts above 272,000 input tokens at a higher rate for
+// the whole request, so the default stop sits under that line and the larger one is opt-in.
 // The field shape mirrors the Codex model catalog.
 
 /**

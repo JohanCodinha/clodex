@@ -9,9 +9,13 @@ import type { ModelFormat } from './types.js';
 // connection-local previous_response_id continuation remains available.
 export const CODEX_RESPONSES_LITE_WS_URL = 'wss://chatgpt.com/backend-api/codex/responses';
 // `version` header the Codex backend expects on Responses-Lite requests. The
-// official Codex CLI sends its own version here; OpenAI may require this to be
-// bumped over time — confirm via --trace if Luna requests start failing.
-export const CODEX_RESPONSES_LITE_VERSION = '0.144.1';
+// official Codex CLI sends its own version here, and the backend gates new
+// models on it: GPT-6 Astra's catalog entry declares minimal_client_version
+// 0.153.0, and on 2026-09-05 a request presenting 0.152.0 was refused with
+// "The 'gpt-6-astra' model requires a newer version of Codex" while 0.153.x
+// and later were served. Keep this at or above the newest model's minimum —
+// confirm via --trace if requests for a newly released model start failing.
+export const CODEX_RESPONSES_LITE_VERSION = '0.153.3';
 // OpenAI-Beta opt-in for the WebSocket Responses transport.
 export const CODEX_RESPONSES_WEBSOCKETS_BETA = 'responses_websockets=2026-02-06';
 
