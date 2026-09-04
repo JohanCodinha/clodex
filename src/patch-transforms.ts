@@ -66,8 +66,18 @@ import {
  * An install patched by an older clodex is not wrong, but it was produced by a
  * transform set whose anchors are narrower, so it re-reads as stale rather than
  * current.
+ *
+ * 12 — PATCH 10's head spelled the remote-flag read as a call on
+ * `process.env.CLAUDE_CODE_REMOTE`; Claude Code 2.1.260 reads it off a
+ * module-level env snapshot (`a.CLAUDE_CODE_REMOTE===!0`) and the anchor stopped
+ * matching. The head now requires only that the builder's opening `let` mention
+ * `.CLAUDE_CODE_REMOTE`. Measured on all eight published 2.1.260 builds (the
+ * old anchor matched none, the new one binds exactly once on each) and on
+ * 2.1.251 and 2.1.259, where the widened anchor's matched span and every
+ * capture group are byte-identical to the old one — so an install those produced
+ * is not wrong, but it came from a narrower transform set and re-reads as stale.
  */
-export const PATCH_TRANSFORMS_VERSION = 11;
+export const PATCH_TRANSFORMS_VERSION = 12;
 
 export interface PatchScriptModelEntry {
   alias?: string;
@@ -677,10 +687,20 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   //     both of those as "anchor not found" — and because PATCH 10 is required,
   //     `clodex patch` then refused to patch the release at all, on every
   //     platform. So the head run is now "anything up to the CLAUDE_CODE_REMOTE
-  //     ternary, containing no `;` and no unmatched brace": `[^;{}]` characters
+  //     read, containing no `;` and no unmatched brace": `[^;{}]` characters
   //     or a single balanced `{...}` group. That still cannot leave the `let`
   //     statement it starts in, let alone the function — consuming the enclosing
   //     function's closing `}` would need an unmatched brace.
+  //     2.1.260 then changed how the flag itself is READ. Through 2.1.259 the
+  //     opening `let` called a helper on it — `De(process.env.CLAUDE_CODE_REMOTE)?`
+  //     — and 2.1.260 compares a module-level env snapshot instead
+  //     (`i=a.CLAUDE_CODE_REMOTE===!0,l=i?…`), so an anchor spelling the call
+  //     form read the release as "anchor not found" on every published build.
+  //     The head now asks only that the opening `let` MENTION the flag
+  //     (`.CLAUDE_CODE_REMOTE`, whatever object it is read from and however the
+  //     result is consumed); the run's `[^;{}]` bound still confines it to that
+  //     one statement, which is what keeps a preceding decoy function from
+  //     stealing the match.
   //
   //   * tail — through 2.1.238 the builder ended by scrubbing GitHub Actions
   //     inputs (``delete p[`INPUT_${f}`]``); 2.1.239 dropped that entirely. The
@@ -695,8 +715,10 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // copy"). It is counted across the WHOLE bundle before the anchor runs, so a
   // second candidate fails loud instead of being silently preferred; over 29
   // real bundles (2.1.208 through every 2.1.239 build) it occurs exactly once,
-  // and exactly one `<fn>(process.env.CLAUDE_CODE_REMOTE)?` ternary precedes it.
-  // Those two facts together are what pin the head to the real builder.
+  // and the builder's opening `let` is where `.CLAUDE_CODE_REMOTE` is read
+  // (through 2.1.259 as a `<fn>(process.env.CLAUDE_CODE_REMOTE)?` ternary, from
+  // 2.1.260 as `a.CLAUDE_CODE_REMOTE===!0`). Those two facts together are what
+  // pin the head to the real builder.
   //
   // The nested-function and brace-balance checks below are the last line: they
   // reject a match that ends at a nested `return <copy>}` (which would truncate
@@ -836,7 +858,7 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
     }
     applyOnce(
       patchName,
-      /(function [\w$]+\(\)\{)(let (?:[^;{}]|\{[^;{}]*\})*?[\w$]+\(process\.env\.CLAUDE_CODE_REMOTE\)\?(?:(?!\}\s*function )[\s\S])*?\)return process\.env;let ([\w$]+)=\{(?:(?!\}\s*function )[\s\S])*?return \3)(\})/,
+      /(function [\w$]+\(\)\{)(let (?:[^;{}]|\{[^;{}]*\})*?\.CLAUDE_CODE_REMOTE\b(?:(?!\}\s*function )[\s\S])*?\)return process\.env;let ([\w$]+)=\{(?:(?!\}\s*function )[\s\S])*?return \3)(\})/,
       (match, head, body, _copyVar, tail) => {
         // The tail is found lazily, so it can stop in the wrong place in EITHER
         // direction, and both are silent without this check:

@@ -588,8 +588,8 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
       .join('\n');
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
-      version: 11,
-      digest: '347109442fbf14a785671325aad7e1ac120be496019d832c013f3dab502f7036',
+      version: 12,
+      digest: '3f9aa128f546cd4576bda602f8729cfe14d59267f3fc41a7c408e5bb9089c0e6',
     });
   });
 });
@@ -1837,6 +1837,16 @@ describe('patch script identity naming', () => {
     )
     .replace('delete v[k],delete v[`INPUT_${k}`];return v}', 'delete v[k];return v}');
 
+  // Claude Code 2.1.260 changed how the remote flag is READ. Through 2.1.259 the
+  // opening `let` called a helper on `process.env.CLAUDE_CODE_REMOTE`; 2.1.260
+  // compares a module-level env snapshot instead (`i=a.CLAUDE_CODE_REMOTE===!0,
+  // l=i?…`), so an anchor spelling the call form read every one of the eight
+  // published builds as "anchor not found" — and PATCH 10 is required.
+  const CLAUDE_FIXTURE_260 = CLAUDE_FIXTURE_239.replace(
+    's=flag(process.env.CLAUDE_CODE_REMOTE)?remote():{}',
+    'r=h.CLAUDE_CODE_REMOTE===!0,s=r?remote():{}',
+  );
+
   // The tolerated run admits `[^;{}]` characters or one balanced `{...}` group,
   // so it cannot reach out of the `let` statement it starts in — consuming the
   // enclosing function's closing brace would need an UNMATCHED one. Widen it to
@@ -1953,6 +1963,77 @@ describe('patch script identity naming', () => {
     });
     expect(env['NODE_EXTRA_CA_CERTS']).toBeUndefined();
     expect(env[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
+  });
+
+  it('patches a child builder that reads the remote flag off an env snapshot', () => {
+    expect(CLAUDE_FIXTURE_260, 'fixture drifted from the shape this test mutates')
+      .not.toBe(CLAUDE_FIXTURE_239);
+    expect(CLAUDE_FIXTURE_260, 'the 2.1.260 head must not read the flag through process.env')
+      .not.toContain('process.env.CLAUDE_CODE_REMOTE');
+
+    const result = applyClodexPatches(CLAUDE_FIXTURE_260, config);
+
+    expect(result.results.at(-1)).toEqual({
+      status: 'OK',
+      name: 'PATCH 10: child network environment',
+    });
+    expect(result.content.match(/\/\*ccpatch:child-network-env\*\//g)).toHaveLength(1);
+    expect(result.content).toContain('function childEnv(){/*ccpatch:child-network-env*/');
+    // The snapshot read is not a process.env read, so it is left alone; the
+    // merged copy is still redirected to the restored environment.
+    expect(result.content).toContain('r=h.CLAUDE_CODE_REMOTE===!0,s=r?remote():{}');
+    expect(result.content).toContain('let v={..._clodexChildEnv,...e,...s}');
+  });
+
+  it('restores the original network environment through the env-snapshot builder', () => {
+    const env = executeChildEnv(runPatchScript(config, CLAUDE_FIXTURE_260), {
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://127.0.0.1:3457',
+      NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
+      [NETWORK_ENV_CONTRACT_VAR]: JSON.stringify({
+        version: 1,
+        original: {
+          HTTPS_PROXY: 'http://corp-proxy.example:8080',
+          NODE_EXTRA_CA_CERTS: null,
+        },
+        injected: {
+          HTTPS_PROXY: 'http://127.0.0.1:3457',
+          NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
+        },
+      }),
+    });
+
+    expect(env).toMatchObject({
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://corp-proxy.example:8080',
+    });
+    expect(env['NODE_EXTRA_CA_CERTS']).toBeUndefined();
+    expect(env[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
+  });
+
+  // The remote-flag mention is what pins the head to the builder's OWN opening
+  // `let`. Without it the anchor could start at the nearest preceding function
+  // whose head happens to fit, so a builder that never mentions the flag must be
+  // refused rather than guessed at — loud, in the safe direction.
+  it('refuses a builder whose opening let never mentions the remote flag', () => {
+    const source = CLAUDE_FIXTURE_260.replace(
+      'r=h.CLAUDE_CODE_REMOTE===!0,s=r?remote():{}',
+      's=remote()',
+    );
+    expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_260);
+
+    let thrown: unknown;
+    try {
+      applyClodexPatches(source, config);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(PatchApplyError);
+    expect((thrown as PatchApplyError).results.at(-1)).toEqual({
+      status: 'FAIL',
+      name: 'PATCH 10: child network environment',
+      extra: 'anchor not found',
+    });
   });
 
   // The passthrough early-out identifies the builder, so a bundle carrying two
