@@ -698,9 +698,14 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   //     form read the release as "anchor not found" on every published build.
   //     The head now asks only that the opening `let` MENTION the flag
   //     (`.CLAUDE_CODE_REMOTE`, whatever object it is read from and however the
-  //     result is consumed); the run's `[^;{}]` bound still confines it to that
-  //     one statement, which is what keeps a preceding decoy function from
-  //     stealing the match.
+  //     result is consumed). Read the `[^;{}]` bound precisely: it confines the
+  //     head only UP TO that landmark. A preceding function whose own opening
+  //     `let` mentions the flag CAN start a match, and the lazy body then runs
+  //     into the real builder; it is the nested-function and brace-walk checks
+  //     below that refuse that span — loud, in the safe direction. With a
+  //     `}function` boundary between the two, the body guard stops the run and
+  //     the real builder binds instead. Both layouts are pinned in
+  //     tests/patcher.test.ts; neither occurs in any released build.
   //
   //   * tail — through 2.1.238 the builder ended by scrubbing GitHub Actions
   //     inputs (``delete p[`INPUT_${f}`]``); 2.1.239 dropped that entirely. The

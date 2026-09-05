@@ -36,10 +36,21 @@ import vm from 'node:vm';
 import { applyClodexPatches } from '../../src/patch-transforms.js';
 import { NETWORK_ENV_CONTRACT_VAR } from '../../src/network-env.js';
 import { BUNDLE_MODULE_SEPARATOR } from '../../src/bun-bundle.js';
+import { EXPECTED_PATCH_SITES } from '../../scripts/probe-patch-sites.mjs';
 
 const BUNDLE_DIR = process.env['REVIEW_BUNDLE_DIR'] ?? '';
 const MARKER = '/*ccpatch:child-network-env*/';
-const CONFIG = { 'clodex:openai:gpt-5.6-sol': { alias: 'sol', display: 'GPT-5.6 Sol' } };
+// Context and effort are set so every conditional site is exercised; a config with
+// only alias/display activates nine of the eleven, and "every patch site" would then
+// be a broader title than the assertion.
+const CONFIG = {
+  'clodex:openai:gpt-5.6-sol': {
+    alias: 'sol',
+    display: 'GPT-5.6 Sol',
+    context: 272000,
+    effort: { levels: ['low', 'medium', 'high', 'xhigh', 'max'], defaultLevel: 'high' },
+  },
+};
 
 function bundles(): string[] {
   if (!BUNDLE_DIR || !existsSync(BUNDLE_DIR)) return [];
@@ -130,6 +141,11 @@ function runBuilder(
 ): Record<string, string> {
   const builder = patchedBuilderSource(patched);
   const names = freeNames(builder);
+  // Two roles recovered to the same identifier would collapse into one binding
+  // below; compare the recovered VALUES, not the keys of the bindings object
+  // (Object.keys has already deduplicated by then).
+  expect(new Set(Object.values(names)).size, 'two roles resolved to one identifier')
+    .toBe(Object.keys(names).length);
   const unreachable = (label: string) => () => { throw new Error(`${label} should not run in this scenario`); };
   const bindings: Record<string, unknown> = {
     process: { env },
@@ -162,7 +178,6 @@ function runBuilder(
     [names['isSecret']!]: () => false,
   };
   const params = Object.keys(bindings);
-  expect(new Set(params).size, 'two roles resolved to one identifier').toBe(params.length);
   const factory = new Function(...params, `return (${builder})`);
   const fn = factory(...params.map(p => bindings[p])) as () => Record<string, string>;
   return fn();
@@ -205,8 +220,9 @@ describe.skipIf(FILES.length === 0)('Claude Code 2.1.260 — the patched builder
       const pristine = readFileSync(join(BUNDLE_DIR, file), 'utf8');
       const patched = applyClodexPatches(pristine, CONFIG).content;
 
-      it('applies every patch site, PATCH 10 included', () => {
+      it('applies every one of the eleven patch sites, PATCH 10 included', () => {
         const out = applyClodexPatches(pristine, CONFIG);
+        expect(out.results.map(r => r.name)).toEqual([...EXPECTED_PATCH_SITES]);
         expect(out.results.filter(r => r.status !== 'OK')).toEqual([]);
         expect(out.content.match(/\/\*ccpatch:child-network-env\*\//g)).toHaveLength(1);
       });

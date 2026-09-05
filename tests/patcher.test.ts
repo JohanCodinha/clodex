@@ -589,7 +589,7 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
       version: 12,
-      digest: '3f9aa128f546cd4576bda602f8729cfe14d59267f3fc41a7c408e5bb9089c0e6',
+      digest: '77e3444f85192bbffe2095b8284e708fa976a94307135f47584ed04370ee11c6',
     });
   });
 });
@@ -2034,6 +2034,43 @@ describe('patch script identity naming', () => {
       name: 'PATCH 10: child network environment',
       extra: 'anchor not found',
     });
+  });
+
+  // A preceding function whose own opening `let` also mentions the flag can start
+  // the match. What happens next depends on the boundary between the two: joined
+  // by `};` the lazy body runs into the real builder and the nested-function check
+  // refuses the span (loud, safe); across `}function ` the body guard stops the run
+  // at the boundary and the real builder binds, decoy untouched. Neither layout
+  // occurs in a released build; both are pinned so the safe direction stays safe.
+  const REMOTE_DECOY = 'function zzRemoteDecoy(){let x=settings.CLAUDE_CODE_REMOTE;return x}';
+
+  it('fails closed when a flag-mentioning decoy is joined to the builder by `};`', () => {
+    const source = CLAUDE_FIXTURE_260.replace('function childEnv(){', REMOTE_DECOY + ';function childEnv(){');
+    expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_260);
+
+    let thrown: unknown;
+    try {
+      applyClodexPatches(source, config);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(PatchApplyError);
+    expect((thrown as PatchApplyError).results.at(-1)).toEqual({
+      status: 'FAIL',
+      name: 'PATCH 10: child network environment',
+      extra: 'target validation failed: body declares a nested function',
+    });
+  });
+
+  it('binds the real builder when a flag-mentioning decoy precedes it across `}function`', () => {
+    const source = CLAUDE_FIXTURE_260.replace('function childEnv(){', REMOTE_DECOY + 'function childEnv(){');
+    expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_260);
+
+    const out = runPatchScript(config, source);
+
+    expect(out.match(/\/\*ccpatch:child-network-env\*\//g)).toHaveLength(1);
+    expect(out).toContain('function childEnv(){/*ccpatch:child-network-env*/');
+    expect(out, 'the decoy is left exactly as it was').toContain(REMOTE_DECOY);
   });
 
   // The passthrough early-out identifies the builder, so a bundle carrying two
