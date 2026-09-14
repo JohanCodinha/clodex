@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.13.1](https://github.com/bman654/clodex/compare/v2.13.0...v2.13.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* **providers:** keep Node 26 requests working after a connection drops ([#239](https://github.com/bman654/clodex/issues/239)) ([59810d0](https://github.com/bman654/clodex/commit/59810d03a87d27cf274aca8cee55e95e53cf474a))
+
 ## [2.13.0](https://github.com/bman654/clodex/compare/v2.12.2...v2.13.0) (2026-09-14)
 
 
