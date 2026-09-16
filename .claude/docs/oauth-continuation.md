@@ -629,6 +629,41 @@ Trade-off: a request whose `tools` omit a tool that appears in its own history g
 that tool, which is the pre-fix behaviour. Subagent histories never contain the parent's calls, so
 the residual is narrow.
 
+### Account-meter diagnostics
+
+The Responses socket carries the account meter. Native Codex parses a `codex.rate_limits` event off
+this same connection (`codex-rs/codex-api/src/endpoint/responses_websocket.rs`,
+`parse_rate_limit_event`, rust-v0.154.0). With WS diagnostics enabled, clodex records each one as a
+`ws_rate_limits` event:
+
+- `phase` is `during_response` when the frame arrived while a request was in flight and `idle` when
+  it did not. `idle` means clodex cannot safely attribute the frame to a request, not that no
+  response caused it: `response.completed` clears the in-flight request on a persistent head, so a
+  meter frame sent right after completion by that very response is still labeled `idle`.
+- Correlation follows the phase. A `during_response` frame carries the in-flight request's
+  `requestId` and `claudeSessionId`; an `idle` frame carries neither. Socket callbacks run in the
+  async context of the request that created the socket, so reading the ambient diagnostic context
+  there would stamp an older request's ids on a reused head's frames. The connection sink passes an
+  explicit empty correlation for that reason.
+- `rateLimits`, `additionalRateLimits`, `codeReviewRateLimits`, `credits` and `promo` are the
+  frame's `rate_limits`, `additional_rate_limits`, `code_review_rate_limits`, `credits` and `promo`
+  values passed through uncoerced, so a fractional percent survives and a field the server omitted
+  stays absent instead of reading as zero. Each has a `…Bytes` sibling with its serialized size in UTF-8
+  bytes, and the value itself is dropped when that exceeds 8,000 bytes. `additionalRateLimits` holds the
+  separately metered allowances, keyed by allowance name, so it answers whether one of those moved.
+- `fieldCount` is the number of top-level keys; `fieldsPresent` lists their names (at most 24, each
+  through `boundedDiagnosticIdentifier`); `planType` passes through the same helper.
+- Unlike the rest of this log, which records upstream strings only as bounded identifiers or hashes,
+  these values are the server's own objects, recorded verbatim. They include account state such as
+  credit balance and promotions.
+
+Before this, `handleSocketMessage` returned before parsing whenever no request was in flight, so
+those frames were never read. The idle path needs a connection-scoped sink because
+`RequestContext.emitDiagnostic` only exists mid-request; it is wired at every `createConnection`
+caller, including the transport-retry replacement.
+
+Observation only: nothing here changes a request, a head decision or what is sent upstream.
+
 ### Mismatch diagnostics
 
 On a history mismatch the head-decision log includes `expected_hash`/`actual_hash` (SHA-256 of each

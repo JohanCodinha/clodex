@@ -512,6 +512,7 @@ export async function runServerCommand(options: ServerCommandOptions = {}): Prom
   if (webSocketDiagnosticsLogPath) {
     console.log(`  WebSocket diagnostics: ${webSocketDiagnosticsLogPath}`);
     console.log(pc.yellow('  Diagnostic mode records request headers and metadata; credential headers are redacted.'));
+    console.log(pc.yellow('  It also records OpenAI usage-limit reports verbatim, including account credits and promotions.'));
   }
   if (mode === 'network') {
     for (const { name, address } of getLocalIps()) {

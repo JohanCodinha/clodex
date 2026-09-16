@@ -210,6 +210,14 @@ interface ConnectionEntry {
   canonicalToolDefaultsId?: string;
   options: Required<Pick<ResponsesWebSocketFetchOptions, 'hardTtlMs' | 'idleTtlMs' | 'nurseryIdleTtlMs' | 'maxConnections' | 'now'>>;
   debug: (message: string) => void;
+  /**
+   * Connection-scoped diagnostic sink. `RequestContext.emitDiagnostic` only exists
+   * while a request is in flight, and `codex.rate_limits` frames can arrive between
+   * or after responses, so they belong to the CONNECTION. Without this they
+   * are observed by nobody: the message handler returns before parsing when there is
+   * no active context.
+   */
+  connectionDiagnostic?: (event: { event: string } & Record<string, unknown>) => void;
 }
 
 // A Claude session partition can have multiple valid conversation heads at
@@ -1914,7 +1922,11 @@ function transportReplaySafe(ctx: RequestContext): boolean {
 
 function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
   const ctx = entry.current;
-  if (!ctx || ctx.closed) return;
+  if (!ctx || ctx.closed) {
+    // A usage-limit frame between or after responses is only read when diagnostics are on.
+    if (entry.connectionDiagnostic) observeIdleFrame(entry, data);
+    return;
+  }
   const text = Array.isArray(data) ? Buffer.concat(data).toString('utf8') : data.toString('utf8');
   ctx.frameCount += 1;
   if (ctx.transportRetryPending) {
@@ -1935,6 +1947,10 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
   }
 
   const type = eventType(event);
+  // Emitted through the request's own sink so the frame carries THIS request's ids.
+  // The connection sink would not: socket callbacks run in the async context of
+  // whichever request created the socket, which on a reused head is an older one.
+  if (isQuotaEvent(type)) observeQuotaEvent(entry, event, 'during_response', ctx.emitDiagnostic);
   trackReasoningProtocol(entry, ctx, event, type);
   captureOutput(ctx, event);
   if (type === 'response.completed') {
@@ -2249,6 +2265,102 @@ function numericRetryAfterHeader(value: string | string[] | undefined): number |
     : undefined;
 }
 
+/** The upstream event that carries account-meter state rather than response data. */
+function isQuotaEvent(type: string | undefined): boolean {
+  return type === 'codex.rate_limits';
+}
+
+/** Largest serialized ledger (UTF-8 bytes) recorded verbatim; bigger ones keep only their size. */
+const QUOTA_LEDGER_MAX_BYTES = 8000;
+/** Bound on how many top-level field names one event may list. */
+const QUOTA_FIELDS_MAX_COUNT = 24;
+
+function boundedLedger(value: unknown): { value?: unknown; bytes?: number } {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    return {};
+  }
+  if (serialized === undefined) return {};
+  const bytes = Buffer.byteLength(serialized);
+  return bytes <= QUOTA_LEDGER_MAX_BYTES ? { value, bytes } : { bytes };
+}
+
+/**
+ * Record what an upstream frame says about the ACCOUNT's allowance, verbatim.
+ *
+ * Native Codex parses `codex.rate_limits` off this same socket
+ * (`codex-rs/codex-api/src/endpoint/responses_websocket.rs` → `parse_rate_limit_event`
+ * at `rust-v0.154.0`), so the protocol carries the signal even though clodex has
+ * never looked at it. Nothing here changes inference: it observes and returns.
+ *
+ * Two rules the measurement depends on:
+ *  - values are passed through uncoerced — no `?? 0`, no Number() coercion — so a
+ *    fractional percent survives and a missing field stays distinguishable from a
+ *    measured zero (`fieldsPresent` says which keys actually existed);
+ *  - `phase` records whether the frame arrived inside a response or between them.
+ *    `idle` only says no request was in flight when the frame arrived; the last
+ *    response may well have caused it (`response.completed` clears `current`
+ *    before a trailing meter frame lands), but clodex cannot safely attribute it.
+ *
+ * `emit` decides the correlation: the in-flight request's sink during a response,
+ * the uncorrelated connection sink while idle.
+ */
+function observeQuotaEvent(
+  entry: ConnectionEntry,
+  event: unknown,
+  phase: 'during_response' | 'idle',
+  emit: ConnectionEntry['connectionDiagnostic'],
+): void {
+  if (!emit) return;
+  const record = event as Record<string, unknown>;
+  // The sibling ledgers ride the same frame: `additional_rate_limits` holds the
+  // separately metered allowances, `code_review_rate_limits` the code-review one,
+  // and `credits` and `promo` the account's credit and promotion state. Capturing
+  // only `rate_limits` would leave "did a separate allowance move" unanswerable.
+  const rate = boundedLedger(record.rate_limits);
+  const additional = boundedLedger(record.additional_rate_limits);
+  const codeReview = boundedLedger(record.code_review_rate_limits);
+  const credits = boundedLedger(record.credits);
+  const promo = boundedLedger(record.promo);
+  emit({
+    event: 'ws_rate_limits',
+    connectionId: entry.debugId,
+    generation: entry.generation,
+    phase,
+    upstreamEventType: 'codex.rate_limits',
+    fieldCount: Object.keys(record).length,
+    fieldsPresent: Object.keys(record)
+      .slice(0, QUOTA_FIELDS_MAX_COUNT)
+      .map(boundedDiagnosticIdentifier)
+      .filter((name): name is string => name !== undefined),
+    rateLimits: rate.value,
+    rateLimitsBytes: rate.bytes,
+    additionalRateLimits: additional.value,
+    additionalRateLimitsBytes: additional.bytes,
+    codeReviewRateLimits: codeReview.value,
+    codeReviewRateLimitsBytes: codeReview.bytes,
+    credits: credits.value,
+    creditsBytes: credits.bytes,
+    promo: promo.value,
+    promoBytes: promo.bytes,
+    planType: boundedDiagnosticIdentifier(record.plan_type),
+  });
+}
+
+/** Parse a frame that arrived with no request in flight, purely to observe quota. */
+function observeIdleFrame(entry: ConnectionEntry, data: RawData): void {
+  let event: unknown;
+  try {
+    event = JSON.parse(Array.isArray(data) ? Buffer.concat(data).toString('utf8') : data.toString('utf8'));
+  } catch {
+    return;
+  }
+  if (!isQuotaEvent(eventType(event))) return;
+  observeQuotaEvent(entry, event, 'idle', entry.connectionDiagnostic);
+}
+
 function createConnection(
   WebSocket: WebSocketConstructor,
   wsUrl: string,
@@ -2259,6 +2371,7 @@ function createConnection(
   debug: ConnectionEntry['debug'],
   /** Optional HTTP(S)_PROXY CONNECT-tunnel agent (see src/outbound-proxy.ts). */
   agent?: import('node:http').Agent,
+  connectionDiagnostic?: ConnectionEntry['connectionDiagnostic'],
 ): ConnectionEntry {
   const now = options.now();
   const socket = new WebSocket(wsUrl, agent ? { headers, agent } : { headers });
@@ -2275,6 +2388,7 @@ function createConnection(
     inFlight: false,
     options,
     debug,
+    connectionDiagnostic,
   };
   if (persistent && key) registerEntry(entry);
   debug(
@@ -2883,6 +2997,15 @@ export function createResponsesWebSocketFetch(
       evictions,
     }, diagnosticCorrelation);
 
+    // Connection-scoped sink, deliberately uncorrelated. Its caller is a socket
+    // callback, and those run in the async context of the request that CREATED the
+    // socket, so the default (`diagnosticContext.getStore()`) would stamp an idle frame
+    // with that first request's ids. The explicit empty
+    // correlation keeps them unattributed; in-response frames use `ctx.emitDiagnostic`.
+    const connectionDiagnostic: ConnectionEntry['connectionDiagnostic'] = options.onDiagnostic
+      ? event => emitDiagnostic(options, event, {})
+      : undefined;
+
     let activeContext: RequestContext | undefined;
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -2918,6 +3041,7 @@ export function createResponsesWebSocketFetch(
             resolvedOptions,
             debug,
             proxyAgent,
+            connectionDiagnostic,
           ),
         };
         activeContext = ctx;
@@ -2931,6 +3055,7 @@ export function createResponsesWebSocketFetch(
           resolvedOptions,
           debug,
           proxyAgent,
+          connectionDiagnostic,
         );
         dispatchContext(entry, ctx);
 

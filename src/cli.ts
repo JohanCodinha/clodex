@@ -514,8 +514,9 @@ ${pc.bold('Common options (both modes):')}
                                ~/.clodex/server-runtime.json, so the
                                clodex-claude wrapper never bridges to it
                                (CLODEX_NO_DISCOVERY=1 works too)
-  --ws-diagnostics             Log sanitized request envelopes and WebSocket
-                               head decisions
+  --ws-diagnostics             Log sanitized request envelopes, WebSocket
+                               head decisions, and the server's usage-limit
+                               reports verbatim (includes account credits)
   --help, --version            Help / version
 
 ${pc.bold('Endpoint mode only')} ${pc.dim('(error if combined with --proxy)')}:

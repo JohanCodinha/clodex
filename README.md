@@ -146,7 +146,7 @@ Common options (both modes):
 | `--save-mode` | With `--endpoint`/`--proxy`: save that mode as the `server` default |
 | `--port <1-65535>` | Listen port (default 17645) |
 | `--no-discovery` | Don't advertise this server in `~/.clodex/server-runtime.json` (`CLODEX_NO_DISCOVERY=1` also works). Use it for a standalone endpoint the `clodex-claude` wrapper should ignore. |
-| `--ws-diagnostics` | Log sanitized request envelopes and WebSocket head decisions |
+| `--ws-diagnostics` | Log sanitized request envelopes and WebSocket head decisions, plus the usage-limit reports the OpenAI socket sends, verbatim (they include account state such as credits) |
 | `--help`, `--version` | Help / version |
 
 Endpoint mode only (an error if combined with `--proxy`):

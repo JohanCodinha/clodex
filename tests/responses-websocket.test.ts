@@ -6767,6 +6767,345 @@ describe('new-connection pacing', () => {
   });
 });
 
+describe('usage-limit diagnostics', () => {
+  // A missing event has to mean the server sent nothing, not that nobody looked.
+
+  function quotaFrame(overrides: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+      type: 'codex.rate_limits',
+      rate_limits: {
+        // Fractional on purpose, to show the value is not coerced.
+        primary: { used_percent: 12.5, window_minutes: 10_080, reset_at: 1_789_805_434 },
+        // A present zero must stay distinguishable from an absent field.
+        secondary: { used_percent: 0 },
+      },
+      plan_type: 'pro',
+      ...overrides,
+    });
+  }
+
+  it('captures a rate-limit frame that arrives DURING a response', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(quotaFrame()));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+
+    const observed = diagnostics.filter(d => d.event === 'ws_rate_limits');
+    expect(observed).toHaveLength(1);
+    expect(observed[0]!.phase).toBe('during_response');
+    expect(observed[0]!.planType).toBe('pro');
+    const limits = observed[0]!.rateLimits as {
+      primary: { used_percent: number; window_minutes: number };
+      secondary: { used_percent: number };
+    };
+    // Fractional precision survives, and is not coerced to an integer.
+    expect(limits.primary.used_percent).toBe(12.5);
+    expect(limits.primary.window_minutes).toBe(10_080);
+    // A measured zero is recorded AS zero, not dropped.
+    expect(limits.secondary.used_percent).toBe(0);
+  });
+
+  it('captures a rate-limit frame that arrives with NO request in flight', async () => {
+    // The case the transport used to discard outright: handleSocketMessage returned
+    // before parsing whenever `entry.current` was absent, so an account-meter frame
+    // between or after responses was seen by nobody.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+    diagnostics.length = 0;
+
+    socket.emit('message', Buffer.from(quotaFrame()));
+
+    const observed = diagnostics.filter(d => d.event === 'ws_rate_limits');
+    expect(observed).toHaveLength(1);
+    expect(observed[0]!.phase).toBe('idle');
+  });
+
+  it('omits a field the server did not send rather than reporting it as zero', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'codex.rate_limits',
+      rate_limits: { primary: { used_percent: 3 } },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+
+    const observed = diagnostics.find(d => d.event === 'ws_rate_limits')!;
+    const limits = observed.rateLimits as { primary: Record<string, unknown> };
+    expect(limits.primary.used_percent).toBe(3);
+    expect('window_minutes' in limits.primary).toBe(false);
+    expect(observed.planType).toBeUndefined();
+  });
+
+  it('captures the sibling allowance ledgers that ride the same frame', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    const frame = {
+      type: 'codex.rate_limits',
+      rate_limits: { primary: { used_percent: 2 } },
+      // Keyed by allowance name, as live frames send it.
+      additional_rate_limits: {
+        'gpt-reserve': {
+          allowed: true,
+          limit_reached: false,
+          primary: { used_percent: 2, window_minutes: 10_080, reset_at: 1_789_382_732 },
+          secondary: null,
+        },
+      },
+      code_review_rate_limits: { allowed: true, primary: { used_percent: 4 } },
+      credits: null,
+      promo: { active: false },
+    };
+    socket.emit('message', Buffer.from(JSON.stringify(frame)));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+
+    const observed = diagnostics.find(d => d.event === 'ws_rate_limits')!;
+    const additional = observed.additionalRateLimits as Record<string, { primary: { used_percent: number } }>;
+    expect(additional['gpt-reserve']!.primary.used_percent).toBe(2);
+    // A null ledger is recorded as null, not dropped as if absent.
+    expect(observed.credits).toBeNull();
+    expect('credits' in observed).toBe(true);
+    expect((observed.codeReviewRateLimits as { primary: { used_percent: number } }).primary.used_percent).toBe(4);
+    expect(observed.promo).toEqual({ active: false });
+
+    // Every ledger's size is the size of THAT ledger, and the event names the
+    // socket the head decision for this request created. A swapped byte count
+    // or a stale connection id would otherwise pass the field-by-field checks.
+    const size = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+    const decision = diagnostics.find(d => d.event === 'ws_head_decision')!;
+    expect(observed).toMatchObject({
+      connectionId: decision.createdConnectionId,
+      generation: decision.createdGeneration,
+      phase: 'during_response',
+      upstreamEventType: 'codex.rate_limits',
+      fieldCount: 6,
+      fieldsPresent: ['type', 'rate_limits', 'additional_rate_limits', 'code_review_rate_limits', 'credits', 'promo'],
+      rateLimits: frame.rate_limits,
+      rateLimitsBytes: size(frame.rate_limits),
+      additionalRateLimits: frame.additional_rate_limits,
+      additionalRateLimitsBytes: size(frame.additional_rate_limits),
+      codeReviewRateLimits: frame.code_review_rate_limits,
+      codeReviewRateLimitsBytes: size(frame.code_review_rate_limits),
+      credits: null,
+      creditsBytes: size(null),
+      promo: frame.promo,
+      promoBytes: size(frame.promo),
+    });
+    expect(observed.planType).toBeUndefined();
+  });
+
+  it('stays silent on an idle frame that carries no meter state', async () => {
+    // Silence has to mean silence, or a null result is unreadable.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+    diagnostics.length = 0;
+
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.output_text.delta', delta: 'x' })));
+    socket.emit('message', Buffer.from('not json at all'));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'codex.response.metadata', rate_limits: {} })));
+    expect(diagnostics.filter(d => d.event === 'ws_rate_limits')).toHaveLength(0);
+
+    // The same idle path does report a real meter frame, so the silence above came
+    // from the filter and not from an observer that was never listening.
+    socket.emit('message', Buffer.from(quotaFrame()));
+    expect(diagnostics.filter(d => d.event === 'ws_rate_limits')).toHaveLength(1);
+  });
+
+  it('attributes a meter frame to the request in flight, not to the request that opened the socket', async () => {
+    // Socket callbacks run in the async context of the request that CREATED the
+    // socket. On a reused head that is an older request, so a frame correlated from
+    // the ambient store carries the wrong requestId and session. The emits below run
+    // inside the first request's context to reproduce that.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const contextA = { requestId: 'req-A', claudeSessionId: 'session-A' };
+    const inA = (fn: () => void) => withResponsesWebSocketDiagnosticContext(contextA, fn);
+    const firstUser = { role: 'user', content: [{ type: 'input_text', text: 'first' }] };
+
+    const socketsBefore = socketCount();
+    const first = await withResponsesWebSocketDiagnosticContext(
+      contextA,
+      () => wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([firstUser])),
+      }),
+    );
+    const socket = lastSocket();
+    inA(() => {
+      socket.emit('open');
+      emitTextResponse(socket, 'resp_A', 'first answer');
+    });
+    await readAll(first);
+
+    const secondInput = [
+      firstUser,
+      { role: 'assistant', content: [{ type: 'output_text', text: 'first answer' }] },
+      { role: 'user', content: [{ type: 'input_text', text: 'second' }] },
+    ];
+    const second = await withResponsesWebSocketDiagnosticContext(
+      { requestId: 'req-B', claudeSessionId: 'session-B' },
+      () => wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(secondInput)),
+      }),
+    );
+    expect(socketCount()).toBe(socketsBefore + 1);
+    inA(() => {
+      socket.emit('message', Buffer.from(quotaFrame()));
+      emitTextResponse(socket, 'resp_B', 'second answer');
+    });
+    await readAll(second);
+    inA(() => socket.emit('message', Buffer.from(quotaFrame())));
+
+    const [during, idle] = diagnostics.filter(d => d.event === 'ws_rate_limits');
+    expect(during).toMatchObject({ phase: 'during_response', requestId: 'req-B', claudeSessionId: 'session-B' });
+    expect(idle!.phase).toBe('idle');
+    expect(idle!.requestId).toBeUndefined();
+    expect(idle!.claudeSessionId).toBeUndefined();
+  });
+
+  it('observes idle meter frames on a replacement socket after a transport retry', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([])),
+    });
+    const socketsBefore = socketCount();
+    lastSocket().emit('error', Object.assign(new Error('reset'), { code: 'ECONNRESET' }));
+    expect(socketCount()).toBe(socketsBefore + 1);
+    const replacement = lastSocket();
+    replacement.emit('open');
+    emitTextResponse(replacement, 'resp_replacement', 'recovered');
+    await readAll(res);
+    diagnostics.length = 0;
+
+    replacement.emit('message', Buffer.from(quotaFrame()));
+
+    const observed = diagnostics.filter(d => d.event === 'ws_rate_limits');
+    expect(observed).toHaveLength(1);
+    expect(observed[0]!.phase).toBe('idle');
+  });
+
+  it('keeps the size of a ledger too large to record verbatim', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(quotaFrame({
+      additional_rate_limits: [{ limit_name: 'x'.repeat(9000) }],
+      credits: { balance: '0' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+
+    const observed = diagnostics.find(d => d.event === 'ws_rate_limits')!;
+    expect(observed.additionalRateLimits).toBeUndefined();
+    expect(observed.additionalRateLimitsBytes).toBeGreaterThan(8000);
+    expect(observed.credits).toEqual({ balance: '0' });
+    expect(observed.creditsBytes).toBe(JSON.stringify({ balance: '0' }).length);
+  });
+
+  it('measures ledger size in UTF-8 bytes', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    const promo = { label: 'Früh bucher €' };
+    socket.emit('message', Buffer.from(quotaFrame({ promo })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+
+    const observed = diagnostics.find(d => d.event === 'ws_rate_limits')!;
+    expect(observed.promoBytes).toBe(Buffer.byteLength(JSON.stringify(promo)));
+    expect(observed.promoBytes).toBeGreaterThan(JSON.stringify(promo).length);
+    // Under the limit in characters but over it in bytes: dropped, size kept.
+    diagnostics.length = 0;
+    const res2 = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket2 = lastSocket();
+    socket2.emit('open');
+    const wide = { label: '€'.repeat(3000) };
+    socket2.emit('message', Buffer.from(quotaFrame({ promo: wide })));
+    socket2.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res2);
+    const dropped = diagnostics.find(d => d.event === 'ws_rate_limits')!;
+    expect(dropped.promo).toBeUndefined();
+    expect(dropped.promoBytes).toBe(Buffer.byteLength(JSON.stringify(wide)));
+  });
+
+  it('leaves a response untouched when diagnostics are off', async () => {
+    // Without a diagnostic sink the meter frame must be skipped, not dereferenced.
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {});
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(quotaFrame()));
+    emitTextResponse(socket, 'resp_no_diagnostics', 'still answered');
+    expect(await readAll(res)).toContain('still answered');
+  });
+
+  it('bounds and sanitizes the field names and identifiers it records', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    const extra: Record<string, number> = { 'bad\nkey': 1 };
+    for (let i = 0; i < 40; i += 1) extra[`field_${i}`] = i;
+    socket.emit('message', Buffer.from(quotaFrame({ plan_type: 'pro\nforged', ...extra })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+
+    const observed = diagnostics.find(d => d.event === 'ws_rate_limits')!;
+    const fields = observed.fieldsPresent as string[];
+    expect(fields.length).toBeLessThanOrEqual(24);
+    expect(fields).toContain('rate_limits');
+    expect(fields).not.toContain('bad\nkey');
+    expect(observed.fieldCount).toBe(44);
+    expect(observed.planType).toBeUndefined();
+  });
+});
+
 describe('descriptor exhaustion', () => {
   beforeEach(() => {
     resetResponsesWebSocketConnectionsForTests();
