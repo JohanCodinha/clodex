@@ -47,6 +47,8 @@ import {
   builtInPatchProofsChanged,
   captureBuiltInPatchProofs,
 } from '../src/built-in-patch-proofs.js';
+import { MAX_MODEL_CATALOG } from '../src/constants.js';
+import { isModelAliasNameSyntax, isReservedModelAlias } from '../src/model-aliases.js';
 import {
   NETWORK_ENV_CONTRACT_VAR,
   networkEnvBaseline,
@@ -589,7 +591,7 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
       version: 13,
-      digest: 'a8891c730a83bda0410482a9b8eea9273be6f7ead3ba23285464d631aeecc537',
+      digest: '957653aa8315627b088345d487648e2f62ca314b31257f6fea695de5129e69e1',
     });
   });
 });
@@ -756,6 +758,267 @@ describe('applyClodexPatches input validation', () => {
     expect((caught as PatchApplyError).results).toEqual([
       { status: 'FAIL', name: 'PATCH 1: Agent tool model enum', extra: 'anchor not found' },
     ]);
+  });
+});
+
+/**
+ * PATCH 6 reads the "is this alias already present?" region from `case"best":{` forward, bounded by
+ * 2000 characters of drift headroom PLUS the bytes of the cases it injects itself. That bound GROWS
+ * with the alias config, and growing it is only safe because `case"best":{` is unique.
+ *
+ * The lazy quantifier is NOT what makes it safe: laziness fixes where the region ends only once its
+ * START is fixed. Given two anchors — an early one whose `default:return` is far away and the real
+ * resolver later — a small bound selects the real resolver and a large bound selects the decoy, so
+ * both ends of the region move and an alias present in the resolver drops out of the region and is
+ * injected a second time. What forecloses that is `applyOnce`'s `count > 1` refusal with
+ * `required: true`: a second viable region start implies a second anchor match, so the patch aborts
+ * before anything the mis-aimed region decided can be written. (The region IS consulted first —
+ * PATCH 6 matches it and builds its `cases` string before `applyOnce` runs — but that work is
+ * thrown away unused when the anchor count refusal fires.)
+ *
+ * Deleting that refusal (or PATCH 6's `required: true`) turns both aborts below into silent
+ * successes.
+ */
+describe('PATCH 6 refuses an ambiguous resolver anchor', () => {
+  const CONFIG = { 'clodex:openai-oauth:gpt-5.6-sol': { alias: 'sol' } };
+
+  /**
+   * An anchor-shaped decoy whose own `default:return` sits 2500 characters away — out of reach of
+   * the bound a small alias config produces (2000 + 23), within reach of the bound the largest
+   * config the favorites UI can produce does (2000 + 20 * 145 = 4900).
+   */
+  const DECOY = `function D(e){switch(e){case"best":{return 0}${'z'.repeat(2500)}default:return null}}`;
+
+  /** 20 aliases at the 64-character `MODEL_ALIAS_PATTERN` maximum. */
+  const MAX_LEGAL_CONFIG = Object.fromEntries(
+    Array.from({ length: 20 }, (_, i) => [
+      `clodex:openai:m${i}`,
+      { alias: `a${String(i).padStart(2, '0')}`.padEnd(64, 'x') },
+    ]),
+  ) as PatchScriptModelConfig;
+
+  it('aborts the whole patch rather than choosing between two case"best":{ anchors', () => {
+    let caught: unknown;
+    try {
+      applyClodexPatches(`${DECOY}\n${CLAUDE_FIXTURE}`, CONFIG);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(PatchApplyError);
+    expect((caught as Error).message)
+      .toBe('clodex patch: ambiguous anchor: PATCH 6: alias resolver switch');
+    expect((caught as PatchApplyError).results).toContainEqual({
+      status: 'FAIL',
+      name: 'PATCH 6: alias resolver switch',
+      extra: 'anchor matched 2 times (expected 1)',
+    });
+  });
+
+  it('aborts at the alias budget that would otherwise re-aim the region at the decoy', () => {
+    expect(() => applyClodexPatches(`${DECOY}\n${CLAUDE_FIXTURE}`, MAX_LEGAL_CONFIG))
+      .toThrow(/ambiguous anchor: PATCH 6/);
+  });
+
+  it('does not fire on the single anchor a real bundle carries, at either budget', () => {
+    for (const config of [CONFIG, MAX_LEGAL_CONFIG]) {
+      const out = applyClodexPatches(CLAUDE_FIXTURE, config);
+      expect(out.results.find(r => r.name.startsWith('PATCH 6'))!.status).toBe('OK');
+    }
+    expect(applyClodexPatches(CLAUDE_FIXTURE, CONFIG).content)
+      .toContain('case"sol":return "sol";');
+  });
+});
+
+/**
+ * PATCH 6's region bound is DYNAMIC — 2000 bytes of drift headroom PLUS exactly the bytes of the
+ * cases PATCH 6 injects itself (`case"<a>":return "<a>";`, i.e. `2 * a.length + 17` each). Every
+ * term is load-bearing, and NONE of them is pinned by a fixture whose `default:return` sits
+ * adjacent to the anchor: there the lazy match stops at byte 0 and the size of the bound is never
+ * consulted, so any coefficient at all passes.
+ *
+ * Each configuration below puts the region EXACTLY on the boundary — the bytes PATCH 6 really
+ * injected (read back off a real patch, never computed from the formula under test) plus exactly
+ * the documented 2000 of headroom — and then one byte past it. A bound one byte short loses the
+ * region on the RE-RUN `applyPatch`'s built-in verification performs, every alias reads as
+ * missing, the cases go in a second time, and the local patch set is rolled back.
+ *
+ * ONE configuration pins only one total: `1000 + Σ(2·len + 67)` also totals 4900 at 20 × 64 and
+ * passed a single-config version of this block, while cutting one short alias's headroom to 1050.
+ * The formula has three unknowns — headroom, per-alias constant, per-character slope — so there are
+ * three configurations with independent (count, total length) rows: 20 × 64, 1 × 64 and 1 × 1.
+ * Pinned on both sides at all three, no other linear formula survives.
+ *
+ * GROWING any term reds the "one byte past" tests, deliberately: if the headroom is intentionally
+ * raised, update `DRIFT_HEADROOM` here in the same commit.
+ */
+describe('PATCH 6 resolver budget on its exact boundary', () => {
+  /** The headroom literal in `RESOLVER_BUDGET` (src/patch-transforms.ts). */
+  const DRIFT_HEADROOM = 2000;
+
+  /** The anchor as src/patch-transforms.ts spells it; used only to LOCATE the site. */
+  const RESOLVER_ANCHOR = /case"best":\{[^{}]*\}/;
+  const ANCHOR = CLAUDE_FIXTURE.match(RESOLVER_ANCHOR)![0];
+
+  /**
+   * The longest alias `MODEL_ALIAS_PATTERN` accepts, measured through the real validator rather
+   * than restated, so a change to the pattern moves this fixture with it.
+   */
+  const ALIAS_MAX_LENGTH = (() => {
+    let n = 1;
+    while (n < 4096 && isModelAliasNameSyntax('a'.repeat(n + 1))) n++;
+    return n;
+  })();
+
+  const aliasesOf = (count: number, length: number) =>
+    count === 1 && length < 3
+      ? ['q'.repeat(length)]
+      : Array.from({ length: count }, (_, i) => `a${String(i).padStart(2, '0')}`.padEnd(length, 'x'));
+  const configOf = (aliases: string[]) => Object.fromEntries(
+    aliases.map((alias, i) => [`clodex:openai-oauth:m${i}`, { alias }]),
+  ) as PatchScriptModelConfig;
+
+  const CONFIGS = [
+    // The largest alias set the favorites UI can produce: MAX_MODEL_CATALOG at the maximum length.
+    { label: `${MAX_MODEL_CATALOG} x ${ALIAS_MAX_LENGTH}-char aliases`, aliases: aliasesOf(MAX_MODEL_CATALOG, ALIAS_MAX_LENGTH) },
+    { label: `1 x ${ALIAS_MAX_LENGTH}-char alias`, aliases: aliasesOf(1, ALIAS_MAX_LENGTH) },
+    { label: '1 x 1-char alias', aliases: aliasesOf(1, 1) },
+  ];
+
+  const p6 = (out: { results: Array<{ name: string; status: string }> }) =>
+    out.results.find(r => r.name.startsWith('PATCH 6'))!.status;
+
+  const needle = (a: string) => `case${JSON.stringify(a)}:return ${JSON.stringify(a)};`;
+
+  /** The bytes between the anchor and the switch's own `default:return`, in `js`. */
+  function regionBody(js: string): string {
+    const at = js.indexOf(ANCHOR) + ANCHOR.length;
+    return js.slice(at, js.indexOf('default:return', at));
+  }
+
+  /**
+   * `bytes` of plausible upstream churn to sit between the injected cases and `default:return`.
+   * Native-looking cases, none of which can collide with an alias name, and no second anchor.
+   */
+  function driftOf(bytes: number): string {
+    let out = '';
+    for (let i = 0; ; i++) {
+      const tag = String(i).padStart(3, '0');
+      const one = `case"drift${tag}":return "native${tag}";`;
+      if (out.length + one.length > bytes) break;
+      out += one;
+    }
+    const left = bytes - out.length;
+    if (left >= 4) out += `/*${'d'.repeat(left - 4)}*/`;
+    else out += ';'.repeat(left);
+    return out;
+  }
+
+  /** CLAUDE_FIXTURE with `bytes` of drift inserted before the resolver's own `default:return`. */
+  const fixtureWithDrift = (bytes: number) =>
+    CLAUDE_FIXTURE.replace(ANCHOR + 'default:return', ANCHOR + driftOf(bytes) + 'default:return');
+
+  it('builds the fixtures out of the real caps, and the drift really is drift', () => {
+    expect(ALIAS_MAX_LENGTH).toBe(64);
+    expect(isModelAliasNameSyntax('a'.repeat(ALIAS_MAX_LENGTH))).toBe(true);
+    expect(isModelAliasNameSyntax('a'.repeat(ALIAS_MAX_LENGTH + 1))).toBe(false);
+    for (const { aliases } of CONFIGS) {
+      expect(aliases.every(a => isModelAliasNameSyntax(a) && !isReservedModelAlias(a))).toBe(true);
+      expect(new Set(aliases).size).toBe(aliases.length);
+    }
+    // The three (count, total length) rows are linearly independent: (20, 1280), (1, 64), (1, 1).
+    expect(CONFIGS.map(c => [c.aliases.length, c.aliases.join('').length]))
+      .toEqual([[20, 1280], [1, 64], [1, 1]]);
+
+    // The drift is exactly the size asked for, is not a second anchor, and does not end the region
+    // early — otherwise the fixture would not test the bound at all.
+    for (const bytes of [DRIFT_HEADROOM, DRIFT_HEADROOM + 1]) {
+      const drift = driftOf(bytes);
+      expect(drift.length).toBe(bytes);
+      expect(drift).not.toContain('default:return');
+      expect(fixtureWithDrift(bytes).match(new RegExp(RESOLVER_ANCHOR.source, 'g'))).toHaveLength(1);
+      expect(regionBody(fixtureWithDrift(bytes))).toBe(drift);
+    }
+  });
+
+  describe.each(CONFIGS)('$label', ({ aliases }) => {
+    const config = configOf(aliases);
+    /**
+     * What PATCH 6 actually injects for this config, READ BACK off a real run rather than
+     * recomputed from the formula under test.
+     */
+    const injected = regionBody(applyClodexPatches(CLAUDE_FIXTURE, config).content);
+
+    it('injects exactly one case per alias, and nothing else, into the region', () => {
+      expect(injected).toBe(aliases.map(needle).join(''));
+    });
+
+    it('re-patches as a no-op with the region sitting exactly on the budget', () => {
+      const once = applyClodexPatches(fixtureWithDrift(DRIFT_HEADROOM), config);
+      expect(p6(once)).toBe('OK');
+      // The injected cases plus the whole headroom — the boundary, by construction.
+      expect(regionBody(once.content).length).toBe(injected.length + DRIFT_HEADROOM);
+
+      const twice = applyClodexPatches(once.content, config);
+      expect(p6(twice)).toBe('SKIP');
+      expect(twice.content).toBe(once.content);
+      for (const a of aliases) expect(twice.content.split(needle(a))).toHaveLength(2);
+      expect(() => captureBuiltInPatchProofs(twice.content, config, twice.results)).not.toThrow();
+    });
+
+    it('stops being a no-op one byte past the headroom — the bound is not larger than documented', () => {
+      const once = applyClodexPatches(fixtureWithDrift(DRIFT_HEADROOM + 1), config);
+      expect(p6(once)).toBe('OK');
+      expect(regionBody(once.content).length).toBe(injected.length + DRIFT_HEADROOM + 1);
+
+      const twice = applyClodexPatches(once.content, config);
+      expect(p6(twice)).toBe('OK');                     // not SKIP: every alias reads as missing
+      expect(twice.content).not.toBe(once.content);
+      for (const a of aliases) expect(twice.content.split(needle(a))).toHaveLength(3);
+    });
+  });
+});
+
+/**
+ * Why a region that swallows a mixed-case native case cannot cost an alias its case. It rests on a
+ * CONJUNCTION, and each half is pinned here in CI, not only in the bundle harness:
+ *
+ *  * PATCH 6 lowercases every alias before it builds anything from it, so however the alias was
+ *    spelled in the config, the needle it tests for is lowercase; and
+ *  * the presence test matches CASE-SENSITIVELY, so a lowercase needle does not match the
+ *    camelCase `case"projectSettings":return` / `case"policySettings":return` that older Claude
+ *    Code builds carry within reach of the largest region.
+ *
+ * "Aliases are lowercased, so match case-insensitively" is a well-meant change that would break the
+ * second half, and it reds the first test below.
+ */
+describe('PATCH 6 presence test is case-sensitive over lowercased aliases', () => {
+  const ANCHOR = 'case"best":{return "opus"}';
+  /** A native case inside the region, spelled the way the real swallowed labels are spelled. */
+  const withNative = (label: string) =>
+    CLAUDE_FIXTURE.replace(ANCHOR, `${ANCHOR}case${JSON.stringify(label)}:return 1;`);
+
+  it('injects a lowercase alias whose name matches a camelCase native case only ignoring case', () => {
+    const config = { 'clodex:openai-oauth:m': { alias: 'projectsettings' } };
+    const out = applyClodexPatches(withNative('projectSettings'), config);
+    expect(out.results.find(r => r.name.startsWith('PATCH 6'))!.status).toBe('OK');
+    expect(out.content).toContain('case"projectsettings":return "projectsettings";');
+    expect(() => captureBuiltInPatchProofs(out.content, config, out.results)).not.toThrow();
+  });
+
+  it('lowercases a mixed-case alias before injecting it', () => {
+    const config = { 'clodex:openai-oauth:m': { alias: 'ProjectSettings' } };
+    const out = applyClodexPatches(withNative('projectSettings'), config);
+    expect(out.content).toContain('case"projectsettings":return "projectsettings";');
+    expect(out.content).not.toContain('case"ProjectSettings":return');
+  });
+
+  it('control: the same native case, spelled exactly as the alias, IS read as present', () => {
+    // Proves the native case sits inside the region PATCH 6 reads, so the first test is not green
+    // merely because the region never reached it.
+    const out = applyClodexPatches(withNative('projectsettings'), {
+      'clodex:openai-oauth:m': { alias: 'projectsettings' },
+    });
+    expect(out.content).not.toContain('case"projectsettings":return "projectsettings";');
   });
 });
 
