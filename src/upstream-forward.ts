@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { Readable, Transform } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 import type { ServerResponse } from 'node:http';
@@ -132,7 +133,62 @@ export interface RelayAnthropicOptions {
    * through.
    */
   responseModelOverride?: string;
+  /**
+   * Replace a `msg_` message id (SSE `message_start` and JSON body) with one
+   * Claude Code will not anchor a thread on. Set by callers relaying a
+   * Messages response from an upstream that holds no threads; see
+   * `upstreamHoldsThreads`.
+   */
+  anchorSafeMessageIds?: boolean;
 }
+
+/**
+ * Whether the upstream behind `url` can hold Claude Code's server-side threads.
+ *
+ * Claude Code anchors a thread on the previous assistant message when that
+ * message's id starts with `msg_` (or its response carried a `request-id`
+ * header), and then sends only the messages after the anchor with
+ * `thread:{type:"continue",previous_message_id}`. Only Anthropic's own API
+ * keeps that conversation. Any other Anthropic-format upstream receives the
+ * delta as if it were the whole conversation: some reject it, and some answer
+ * it, with everything before the anchor silently gone.
+ */
+export function upstreamHoldsThreads(url: string): boolean {
+  try {
+    return new URL(url).hostname.toLowerCase() === 'api.anthropic.com';
+  } catch {
+    return false;
+  }
+}
+
+/** Replace an id Claude Code would anchor a thread on; leave any other id as is. */
+function anchorSafeMessageId(id: unknown): unknown {
+  return typeof id === 'string' && id.startsWith('msg_')
+    ? 'clodex_' + randomUUID().replace(/-/g, '')
+    : id;
+}
+
+export function isThreadContinuation(body: Record<string, unknown>): boolean {
+  const thread = body.thread;
+  return typeof thread === 'object' && thread !== null
+    && (thread as Record<string, unknown>).type === 'continue';
+}
+
+/**
+ * The refusal for a thread continuation that reached a route whose upstream
+ * cannot hold the thread. Claude Code's thread-error classifier maps this
+ * `error_code` to "unsupported_request" and resends the turn with the full
+ * conversation, keeping that model stateless for the rest of the session
+ * (read from the 2.1.268 to 2.1.276 bundles).
+ */
+export const THREAD_UNSUPPORTED_BODY = JSON.stringify({
+  type: 'error',
+  error: {
+    type: 'invalid_request_error',
+    message: 'thread continuation is not supported on this route; resend the full conversation',
+    details: { error_code: 'thread_unsupported_request' },
+  },
+});
 
 /**
  * An event-stream line ends with CRLF, LF, or a bare CR. Splitting on \n alone
@@ -150,19 +206,43 @@ const SSE_LINE_SPLIT = /(\r\n|\r|\n)/;
  * byte-for-byte, with its original line ending.
  */
 export function anthropicSseModelRewrite(override: string): Transform {
+  return anthropicSseMessageStartRewrite({ model: override });
+}
+
+/**
+ * The same transform, also able to replace a `message_start` id Claude Code
+ * would anchor a thread on (see `upstreamHoldsThreads`). A line it has
+ * nothing to change on passes through byte-for-byte.
+ */
+export function anthropicSseMessageStartRewrite(
+  rewrite: { model?: string; anchorSafeId?: boolean },
+): Transform {
   const decoder = new StringDecoder('utf8');
   let tail = '';
   const rewriteLine = (line: string): string => {
     if (!line.startsWith('data:') || !line.includes('"message_start"')) return line;
     try {
       // A multi-line `data:` payload (legal SSE, never emitted by Anthropic)
-      // fails to parse here and relays untouched — fail-open, so the worst
-      // case is an un-rewritten model id rather than a corrupted stream.
-      const parsed = JSON.parse(line.slice(5)) as { type?: string; message?: { model?: unknown } };
-      if (parsed.type === 'message_start' && parsed.message && typeof parsed.message.model === 'string') {
-        parsed.message.model = override;
-        return 'data: ' + JSON.stringify(parsed);
+      // fails to parse here and relays untouched rather than corrupting the
+      // stream. That also leaves its model and its message id un-rewritten, so
+      // a `msg_` id in such an event still reaches Claude Code as an anchor;
+      // the proxy's refusal of thread continuations on routes that cannot hold
+      // one is what keeps that case from losing context.
+      const parsed = JSON.parse(line.slice(5)) as { type?: string; message?: { model?: unknown; id?: unknown } };
+      if (parsed.type !== 'message_start' || !parsed.message) return line;
+      let changed = false;
+      if (rewrite.model !== undefined && typeof parsed.message.model === 'string') {
+        parsed.message.model = rewrite.model;
+        changed = true;
       }
+      if (rewrite.anchorSafeId) {
+        const id = anchorSafeMessageId(parsed.message.id);
+        if (id !== parsed.message.id) {
+          parsed.message.id = id;
+          changed = true;
+        }
+      }
+      if (changed) return 'data: ' + JSON.stringify(parsed);
     } catch {
       // Not a single-line JSON payload; relay it untouched.
     }
@@ -247,9 +327,12 @@ export async function relayAnthropicMessages(
     });
     const upstream = Readable.fromWeb(upstreamRes.body as Parameters<typeof Readable.fromWeb>[0])
       .on('error', () => res.destroy());
-    if (options.responseModelOverride) {
+    if (options.responseModelOverride || options.anchorSafeMessageIds) {
       upstream
-        .pipe(anthropicSseModelRewrite(options.responseModelOverride))
+        .pipe(anthropicSseMessageStartRewrite({
+          model: options.responseModelOverride,
+          anchorSafeId: options.anchorSafeMessageIds,
+        }))
         .on('error', () => res.destroy())
         .pipe(res);
     } else {
@@ -279,13 +362,23 @@ export async function relayAnthropicMessages(
   // to carry one had its `model` rewritten too — the two directions of the same
   // relay disagreed about what they were allowed to touch.
   if (
-    options.responseModelOverride
-    && parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    parsed && typeof parsed === 'object' && !Array.isArray(parsed)
     && (parsed as Record<string, unknown>).type === 'message'
-    && typeof (parsed as Record<string, unknown>).model === 'string'
   ) {
-    (parsed as Record<string, unknown>).model = options.responseModelOverride;
-    text = JSON.stringify(parsed);
+    const message = parsed as Record<string, unknown>;
+    let changed = false;
+    if (options.responseModelOverride && typeof message.model === 'string') {
+      message.model = options.responseModelOverride;
+      changed = true;
+    }
+    if (options.anchorSafeMessageIds) {
+      const id = anchorSafeMessageId(message.id);
+      if (id !== message.id) {
+        message.id = id;
+        changed = true;
+      }
+    }
+    if (changed) text = JSON.stringify(message);
   }
   res.writeHead(200, {
     'Content-Type': 'application/json',

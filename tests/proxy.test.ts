@@ -1975,3 +1975,144 @@ describe('OAuth route credential resolution', () => {
     }
   });
 });
+
+describe('thread continuations on routes that cannot hold a thread', () => {
+  // Claude Code sends only the messages after its anchor, with
+  // thread:{type:"continue"}, trusting the server to hold the rest. Only
+  // Anthropic's API reached by raw passthrough does.
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const passthrough = (upstreamUrl: string): ProxyRoute => ({
+    aliasId: 'anthropic-opencode-go__qwen3.8-max',
+    realModelId: 'qwen3.8-max',
+    displayName: 'Qwen',
+    upstreamUrl,
+    apiKey: 'key',
+    modelFormat: 'anthropic',
+    providerId: 'opencode-go',
+  });
+
+  const continuation = (model: string) => ({
+    model,
+    max_tokens: 100,
+    stream: false,
+    messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'step-one' }] }],
+    thread: { type: 'continue', previous_message_id: 'msg_4c571f9f' },
+  });
+
+  const upstreamMessage = (id: string) => vi.fn(async () => new Response(
+    JSON.stringify({ id, type: 'message', role: 'assistant', model: 'qwen3.8-max', content: [], usage: { input_tokens: 1, output_tokens: 1 } }),
+    { status: 200, headers: { 'Content-Type': 'application/json' } },
+  ));
+
+  async function post(route: ProxyRoute, body: unknown) {
+    const handle = await startProxyCatalog([route], route.aliasId, false);
+    try {
+      return await postToProxy(handle.port, handle.token, body);
+    } finally {
+      handle.close();
+    }
+  }
+
+  it('refuses a continuation to a non-Anthropic passthrough upstream without forwarding it', async () => {
+    const fetchMock = upstreamMessage('msg_unused');
+    vi.stubGlobal('fetch', fetchMock);
+    const route = passthrough('https://opencode.ai/zen/go');
+    const res = await post(route, continuation(route.aliasId));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(400);
+    expect(JSON.parse(res.body).error.details.error_code).toBe('thread_unsupported_request');
+  });
+
+  it('refuses a continuation on a translated route without calling the provider', async () => {
+    const fetchMock = upstreamMessage('msg_unused');
+    vi.stubGlobal('fetch', fetchMock);
+    const route: ProxyRoute = {
+      aliasId: 'anthropic-kilo__tencent/hy3:free',
+      realModelId: 'tencent/hy3:free',
+      displayName: 'Tencent Hy3',
+      upstreamUrl: '',
+      apiKey: '',
+      modelFormat: 'openai',
+      npm: 'missing-sdk-provider-for-test',
+      baseURL: 'https://api.kilo.ai/api/gateway',
+      providerId: 'kilo',
+    };
+    const res = await post(route, continuation(route.aliasId));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(400);
+    expect(JSON.parse(res.body).error.details.error_code).toBe('thread_unsupported_request');
+  });
+
+  it('refuses a continuation on a translated route even when its upstream is Anthropic', async () => {
+    // The SDK rebuilds the request and does not send `thread`, so even
+    // Anthropic would receive only the fragment.
+    const fetchMock = upstreamMessage('msg_unused');
+    vi.stubGlobal('fetch', fetchMock);
+    const route: ProxyRoute = {
+      aliasId: 'anthropic-acme__claude-via-sdk',
+      realModelId: 'claude-via-sdk',
+      displayName: 'Claude via SDK',
+      upstreamUrl: 'https://api.anthropic.com',
+      apiKey: 'key',
+      modelFormat: 'openai',
+      npm: 'missing-sdk-provider-for-test',
+      providerId: 'acme',
+    };
+    const res = await post(route, continuation(route.aliasId));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(400);
+    expect(JSON.parse(res.body).error.details.error_code).toBe('thread_unsupported_request');
+  });
+
+  it.each([
+    ['a user-text fragment', { messages: [{ role: 'user', content: 'Now apply the same rule to the next item.' }] }],
+    ['a streaming request', { stream: true }],
+    ['an anchor id without the msg_ prefix', { thread: { type: 'continue', previous_message_id: 'req-header-anchor' } }],
+  ])('refuses a continuation carrying %s, whatever its content', async (_label, overrides) => {
+    const fetchMock = upstreamMessage('msg_unused');
+    vi.stubGlobal('fetch', fetchMock);
+    const route = passthrough('https://opencode.ai/zen/go');
+    const res = await post(route, { ...continuation(route.aliasId), ...overrides });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(400);
+    expect(JSON.parse(res.body).error.details.error_code).toBe('thread_unsupported_request');
+  });
+
+  it('forwards a continuation to Anthropic with its thread intact and keeps its message id', async () => {
+    const fetchMock = upstreamMessage('msg_01AnthropicOwn');
+    vi.stubGlobal('fetch', fetchMock);
+    const route = passthrough('https://api.anthropic.com');
+    const res = await post(route, continuation(route.aliasId));
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(String(init.body)).thread).toEqual({ type: 'continue', previous_message_id: 'msg_4c571f9f' });
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.body).id).toBe('msg_01AnthropicOwn');
+  });
+
+  it('forwards a full-history thread create to a non-Anthropic upstream and replaces its msg_ id', async () => {
+    const fetchMock = upstreamMessage('msg_8ed0ab5b-cb18-401d-aa24-f6b6d3b048e7');
+    vi.stubGlobal('fetch', fetchMock);
+    const route = passthrough('https://opencode.ai/zen/go');
+    const create = {
+      model: route.aliasId,
+      max_tokens: 100,
+      stream: false,
+      messages: [
+        { role: 'user', content: 'Run echo step-one.' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'echo step-one' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'step-one' }] },
+      ],
+      thread: { type: 'create' },
+    };
+    const res = await post(route, create);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(String(init.body)).messages).toHaveLength(3);
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.body).id).toMatch(/^clodex_[0-9a-f]{32}$/);
+  });
+});

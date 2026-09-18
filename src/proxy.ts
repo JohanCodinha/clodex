@@ -23,8 +23,11 @@ import {
   writeWebSocketDiagnosticLog,
 } from './trace-log.js';
 import {
+  isThreadContinuation,
   relayAnthropicMessages,
   resolveOAuthRetryReplacement,
+  THREAD_UNSUPPORTED_BODY,
+  upstreamHoldsThreads,
   UpstreamUnreachableError,
 } from './upstream-forward.js';
 import {
@@ -521,6 +524,20 @@ export async function startProxyCatalog(
         return;
       }
 
+      // A thread continuation carries only the messages after Claude Code's
+      // anchor. Only Anthropic's own API, reached by raw passthrough, holds the
+      // rest; any other upstream, and any translated route (the SDK does not
+      // send `thread`), would answer the fragment as if it were the whole
+      // conversation. Refuse it here, before any format branch, with the code
+      // Claude Code answers by resending the full history.
+      const holdsThreads = route.modelFormat === 'anthropic' && upstreamHoldsThreads(upstreamUrl);
+      if (!holdsThreads && isThreadContinuation(anthropicBody)) {
+        plog(() => `thread continuation refused: route=${route.realModelId} upstream does not hold threads`);
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(THREAD_UNSUPPORTED_BODY);
+        return;
+      }
+
       if (!apiKey && routeAuthType !== 'none' && !usesSdkAdapter) {
         anthropicError(res, 401, 'Missing API key');
         return;
@@ -584,6 +601,9 @@ export async function startProxyCatalog(
                 && originalModel !== route.realModelId
                 ? originalModel
                 : undefined,
+            // An upstream that holds no threads must not hand Claude Code an id
+            // it would anchor the next request on.
+            anchorSafeMessageIds: !holdsThreads,
             onUpstreamError: inferenceLogPath
               ? (statusCode, errorContent) => writeInferenceResponseErrorLog(inferenceLogPath, {
                   modelId: originalModel,
