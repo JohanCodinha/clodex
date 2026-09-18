@@ -87,7 +87,7 @@ import {
  * patched by an older clodex is not wrong, but it was produced by a transform set
  * whose anchors are narrower, so it re-reads as stale rather than current.
  */
-export const PATCH_TRANSFORMS_VERSION = 12;
+export const PATCH_TRANSFORMS_VERSION = 13;
 
 export interface PatchScriptModelEntry {
   alias?: string;
@@ -376,14 +376,50 @@ export function applyClodexPatches(source: string, config: PatchScriptModelConfi
   // edit) tops up cleanly rather than duplicating cases.
   // ---------------------------------------------------------------------------
   {
-    const missing = ALIASES.filter((a) => !new RegExp('case' + reEsc(q(a)) + ':return').test(js));
+    // The injection site, and the region the presence test reads. `case"best":{`
+    // is unique in the bundle; the region runs from it to the switch's own
+    // `default:return`, which is where an injected case and any native sibling
+    // case live. The cases BEFORE `case"best"` are the reserved tier names,
+    // which an alias cannot take, so the region need not reach back past it.
+    //
+    // The size bound has to count the cases PATCH 6 itself injects, because
+    // they land INSIDE the region. With a fixed bound, enough alias text (20
+    // favorites at the 64-char alias maximum is 2900 bytes) pushed the
+    // switch's `default:return` out of reach on a re-patch: the region stopped
+    // matching, every alias read as missing, the cases went in a second time,
+    // and the built-in verification, which requires a re-run over patched
+    // output to be a no-op, rolled back the local patch set. The 2000 is
+    // headroom for upstream drift; the added term is exactly the bytes of our
+    // own `case"<a>":return "<a>";` entries. The quantifier is lazy, so a
+    // larger bound can only turn a miss into a match; it never moves where the
+    // region ends.
+    const RESOLVER_ANCHOR = /(case"best":\{[^{}]*\})/;
+    const RESOLVER_BUDGET = 2000 + ALIASES.reduce((n, a) => n + 2 * a.length + 17, 0);
+    const RESOLVER_SWITCH = new RegExp(
+      'case"best":\\{[^{}]*\\}[\\s\\S]{0,' + RESOLVER_BUDGET + '}?default:return',
+    );
+    // The presence test's job is RE-PATCH IDEMPOTENCY: a case this patch
+    // already injected must be recognised, so a second run over patched
+    // output is the no-op the built-in verification demands. (It would also
+    // stop an injected duplicate shadowing a native non-reserved case placed
+    // after `case"best"`; no build ships one today, since every native case
+    // sits before it.) But `case"<word>":return` is not a rare string, and
+    // the switch it sits in is what decides whether it means anything here:
+    // zod's schema walker ships `case"union":return ...`, so an alias named
+    // `union` read as natively resolved. Its case was dropped silently, its
+    // built-in postcondition could then not be captured, and the whole LOCAL
+    // PATCH SET was abandoned — one unlucky alias NAME cost every local patch.
+    const resolver = js.match(RESOLVER_SWITCH)?.[0] ?? '';
+    const missing = ALIASES.filter(
+      (a) => !new RegExp('case' + reEsc(q(a)) + ':return').test(resolver),
+    );
     const cases = missing.map((a) => 'case' + q(a) + ':return ' + q(a) + ';').join('');
     if (ALIASES.length === 0) {
       log('SKIP', 'PATCH 6: alias resolver switch', 'no aliases configured');
     } else {
       applyOnce(
         'PATCH 6: alias resolver switch',
-        /(case"best":\{[^{}]*\})/,
+        RESOLVER_ANCHOR,
         (m) => m + cases,
         { required: true, noopIsSkip: true }
       );

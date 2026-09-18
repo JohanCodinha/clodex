@@ -969,6 +969,95 @@ describe('runPatchCommand local patches', () => {
     expect(logs.join('\n')).toMatch(/FAIL\s+LOCAL PATCH SET.*postconditions/);
   });
 
+  it('injects an alias whose name collides with an unrelated switch elsewhere in the bundle', async () => {
+    // The regression: the presence test read the WHOLE bundle, so an alias
+    // named after any word another switch already branches on read as
+    // natively resolved. zod's schema walker ships `case"union":return ...`,
+    // which is where this was found — one unlucky alias NAME silently lost its
+    // case, and the missing case then cost every local patch, because its
+    // built-in postcondition could not be captured.
+    const bundle = `${PRISTINE_BUNDLE}\nfunction walk(d){switch(d.type){case"union":return d.options.map(walk);default:return d}}`;
+    const real = installClaude('2.1.220', bundle);
+    mkdirSync(clodexHome, { recursive: true });
+    writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({
+      favoriteModels: [{ providerId: 'opencode-go', modelId: 'union-alpha' }],
+      modelAliases: [{ name: 'union', providerId: 'opencode-go', modelId: 'union-alpha' }],
+    }));
+    writeFileSync(join(clodexHome, 'local-patches.mjs'), `
+      export default [{
+        id: 'runs-alongside',
+        apply(source, { marker }) { return source + '\\n' + marker; },
+      }];
+    `);
+
+    expect(await runPatchCommand({ localPatches: true })).toBe(0);
+    // The alias reaches the resolver...
+    expect(bundleOf(real)).toContain('case"union":return "union";');
+    // ...the unrelated switch is untouched...
+    expect(bundleOf(real)).toContain('case"union":return d.options.map(walk);');
+    // ...and the local patch set still runs, which is what the dropped case cost.
+    expect(bundleOf(real)).toContain('/*clodex-local:runs-alongside*/');
+    expect(logs.join('\n')).not.toMatch(/FAIL\s+LOCAL PATCH SET/);
+  });
+
+  it('reads the resolver region from case"best" forward, not the cases before it', async () => {
+    // A competing case for the alias sits BEFORE case"best", where only the
+    // reserved tier names live today. The presence test must not read it: if
+    // the region reached back over it, the alias would read as present, its
+    // case would be skipped, and the missing built-in postcondition would
+    // abandon the local patch set.
+    const bundle = PRISTINE_BUNDLE.replace(
+      'case"best":{return "opus"}',
+      'case"orbit":return "decoy";case"best":{return "opus"}',
+    );
+    const real = installClaude('2.1.220', bundle);
+    mkdirSync(clodexHome, { recursive: true });
+    writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({
+      favoriteModels: [{ providerId: 'opencode-go', modelId: 'orbit-1' }],
+      modelAliases: [{ name: 'orbit', providerId: 'opencode-go', modelId: 'orbit-1' }],
+    }));
+    writeFileSync(join(clodexHome, 'local-patches.mjs'), `
+      export default [{
+        id: 'runs-alongside',
+        apply(source, { marker }) { return source + '\\n' + marker; },
+      }];
+    `);
+
+    expect(await runPatchCommand({ localPatches: true })).toBe(0);
+    expect(bundleOf(real)).toContain('case"orbit":return "orbit";');
+    expect(bundleOf(real)).toContain('/*clodex-local:runs-alongside*/');
+    expect(logs.join('\n')).not.toMatch(/FAIL\s+LOCAL PATCH SET/);
+  });
+
+  it('keeps a re-patch idempotent at the documented alias maximum', async () => {
+    // 20 favorites (MAX_MODEL_CATALOG) with 64-char aliases (the alias
+    // pattern's maximum) inject 2900 bytes into the resolver region. The
+    // built-in verification re-runs the patches over their own output and
+    // demands a no-op; a region bound that our own cases can outgrow reads
+    // every alias as missing on that re-run and duplicates them all.
+    const names = Array.from({ length: 20 }, (_, i) => `a${String(i).padStart(2, '0')}${'x'.repeat(61)}`);
+    const real = installClaude('2.1.220');
+    mkdirSync(clodexHome, { recursive: true });
+    writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({
+      favoriteModels: names.map((_, i) => ({ providerId: 'opencode-go', modelId: `m-${i}` })),
+      modelAliases: names.map((name, i) => ({ name, providerId: 'opencode-go', modelId: `m-${i}` })),
+    }));
+    writeFileSync(join(clodexHome, 'local-patches.mjs'), `
+      export default [{
+        id: 'runs-alongside',
+        apply(source, { marker }) { return source + '\\n' + marker; },
+      }];
+    `);
+
+    expect(await runPatchCommand({ localPatches: true })).toBe(0);
+    const patched = bundleOf(real);
+    for (const name of names) {
+      expect(patched.split(`case"${name}":return "${name}";`).length - 1).toBe(1);
+    }
+    expect(patched).toContain('/*clodex-local:runs-alongside*/');
+    expect(logs.join('\n')).not.toMatch(/FAIL\s+LOCAL PATCH SET/);
+  });
+
   it('allows a local edit adjacent to an intact built-in postcondition', async () => {
     const real = installClaude('2.1.220');
     writeFileSync(join(clodexHome, 'local-patches.mjs'), `
