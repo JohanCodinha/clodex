@@ -2392,3 +2392,56 @@ describe('translateRequest openai promptCacheKey', () => {
     expect(keyOf(req(), '@ai-sdk/xai')).toBeUndefined();
   });
 });
+
+describe('translated message ids', () => {
+  // Claude Code anchors server-side thread continuation on an assistant message
+  // whose id starts with `msg_`: the next request then carries only the messages
+  // after it, with `thread:{type:"continue"}`. No translated upstream holds that
+  // thread, so a translated reply must never look like an anchor, or the follow-
+  // up after a tool call arrives upstream as a bare tool result and is rejected.
+  it('streams a message id Claude Code will not anchor a thread on', async () => {
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'text-start', id: 't1' },
+      { type: 'text-delta', id: 't1', text: 'Hello' },
+      { type: 'text-end', id: 't1' },
+      { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1 } },
+    ]);
+    const id = events.find(e => e.event === 'message_start')?.data.message.id;
+    expect(typeof id).toBe('string');
+    expect(id.startsWith('msg_')).toBe(false);
+  });
+
+  it('returns a non-streamed message id Claude Code will not anchor a thread on', async () => {
+    const provider = createOpenAI({
+      apiKey: 'synthetic-test-key',
+      fetch: async () => new Response(JSON.stringify({
+        id: 'resp_synthetic',
+        model: 'm',
+        output: [],
+        usage: {
+          input_tokens: 1,
+          input_tokens_details: { cached_tokens: 0 },
+          output_tokens: 0,
+          output_tokens_details: { reasoning_tokens: 0 },
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    });
+    const params = translateRequest({
+      model: 'm',
+      messages: [{ role: 'user', content: 'synthetic prompt' }],
+    }, '@ai-sdk/openai');
+    const message = await generateAnthropicResponse(provider.responses('m'), params, 'm') as { id: string };
+    expect(typeof message.id).toBe('string');
+    expect(message.id.startsWith('msg_')).toBe(false);
+  });
+
+  it('gives each translated message a random id, not a timestamp', async () => {
+    const first = await collect([{ type: 'start' }, { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1 } }]);
+    const second = await collect([{ type: 'start' }, { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1 } }]);
+    const idOf = (r: typeof first) => r.events.find(e => e.event === 'message_start')?.data.message.id;
+    expect(idOf(first)).toMatch(/^clodex_[0-9a-f]{32}$/);
+    expect(idOf(second)).toMatch(/^clodex_[0-9a-f]{32}$/);
+    expect(idOf(first)).not.toBe(idOf(second));
+  });
+});
