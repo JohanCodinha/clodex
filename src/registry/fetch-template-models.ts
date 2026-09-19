@@ -8,6 +8,7 @@ import type { ProviderTemplate } from '../provider-templates.js';
 import { normalizeGoogleDisplayName, normalizeGoogleModelId } from './google-model-id.js';
 import type { CachedModel } from './types.js';
 import { openCodeGoPinnedApiUrl } from './resolve-template.js';
+import { hasControlChars } from './server-text.js';
 import {
   getProviderDebugLogPath,
   makeTraceLogger,
@@ -28,6 +29,8 @@ interface ProviderModelListRow {
   context_length?: number;
   contextWindow?: number;
   context_window?: number;
+  /** vLLM's spelling, in each OpenAI `ModelCard` it serves. */
+  max_model_len?: number;
   isFree?: boolean;
   pricing?: Record<string, string | number | undefined>;
   use_responses_lite?: boolean;
@@ -122,6 +125,11 @@ function parseModelList(
   for (const row of rows) {
     const rawId = row.id?.trim();
     if (!rawId) continue;
+    // The server chose these strings and the model picker prints them on every
+    // later run, so an entry a terminal could act on is not kept. Both are
+    // checked trimmed, as they are stored: a name that only ends in a newline
+    // is an ordinary model, not a hostile one.
+    if (hasControlChars(rawId) || (typeof row.name === 'string' && hasControlChars(row.name.trim()))) continue;
     const { id, upstreamModelId } = normalizeGoogleModelId(rawId, npm);
     const family = id.split(/[-/:]/)[0] ?? id;
     const cost = parseNativePricing(row.pricing);
@@ -132,6 +140,7 @@ function parseModelList(
       row.context_length ??
       row.contextWindow ??
       row.context_window ??
+      row.max_model_len ??
       resolveContextWindow(id);
     models.push({
       id,
