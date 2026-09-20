@@ -78,6 +78,26 @@ describe('models alias command', () => {
     expect(loadPreferences().modelAliases).toEqual([]);
   });
 
+  it('saves a -fast alias beside its plain sibling and says what the suffix does', async () => {
+    const info = vi.spyOn(p.log, 'info').mockImplementation(() => {});
+    try {
+      expect(await runModelsCommand({ alias: 'sol=clodex:openai-oauth:gpt-5.6-sol' })).toBe(0);
+      expect(info).not.toHaveBeenCalled();
+
+      // Same target, different name: two aliases on one favorite is the shape
+      // the feature relies on, and it must not be treated as a conflict.
+      expect(await runModelsCommand({ alias: 'Sol-Fast=clodex:openai-oauth:gpt-5.6-sol' })).toBe(0);
+      expect(loadPreferences().modelAliases).toEqual([
+        { name: 'sol', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' },
+        { name: 'sol-fast', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' },
+      ]);
+      expect(info).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(info).mock.calls[0]![0]).toContain('Codex fast mode');
+    } finally {
+      info.mockRestore();
+    }
+  });
+
   it('rejects aliases whose targets are not saved favorites', async () => {
     expect(await runModelsCommand({ alias: 'other=clodex:openai-oauth:gpt-other' })).toBe(1);
     expect(loadPreferences().modelAliases).toBeUndefined();

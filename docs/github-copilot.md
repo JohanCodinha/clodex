@@ -159,7 +159,8 @@ accept that field but sells fast mode as a separate model (today only `claude-op
 when the catalog has such a sibling the request is sent to it, and otherwise the field is removed
 by the self-repair above and the request runs at normal speed. Copilot's Responses endpoint rejects
 the OpenAI `service_tier` control, so clodex's `--fast` (the Codex fast tier) does not apply to
-Copilot models either.
+Copilot models either — and neither does a saved alias ending in `-fast`, which requests that same
+tier and is therefore applied only to ChatGPT/Codex OAuth targets.
 
 ## Support tier
 

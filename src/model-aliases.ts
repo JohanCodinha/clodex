@@ -67,6 +67,35 @@ export function isValidModelAlias(name: string): boolean {
   return isModelAliasNameSyntax(canonical) && !isReservedModelAlias(canonical);
 }
 
+/**
+ * Suffix that opts a saved alias into Codex fast mode.
+ *
+ * `clodex claude --fast` (CLODEX_SERVICE_TIER) is launch-wide: it puts the main
+ * agent and every subagent on the priority tier for the whole session. Naming an
+ * alias `sol-fast` makes the same choice per model identity instead, so a single
+ * subagent can be handed the fast route while the rest of the session stays on
+ * the default tier.
+ *
+ * The suffix is only a request. Callers apply it exclusively to ChatGPT-OAuth
+ * (Codex) targets, because that is the only backend clodex sends a service tier
+ * to; on every other provider a name ending in `-fast` stays just a name.
+ */
+const FAST_TIER_ALIAS_SUFFIX = '-fast';
+
+/**
+ * Whether a saved alias name asks for Codex fast mode.
+ *
+ * Total over arbitrary strings so route lookups can ask it about an inbound
+ * model id directly. A bare `-fast` is not an opt-in: MODEL_ALIAS_PATTERN
+ * already requires a leading letter or digit, and the length guard keeps that
+ * true for callers that have not validated the name.
+ */
+export function aliasRequestsFastTier(name: string): boolean {
+  const canonical = stripOneMContextSuffix(canonicalModelAliasName(name));
+  return canonical.length > FAST_TIER_ALIAS_SUFFIX.length
+    && canonical.endsWith(FAST_TIER_ALIAS_SUFFIX);
+}
+
 export function modelAliasMatchesName(value: unknown, name: string): boolean {
   if (!value || typeof value !== 'object' || !('name' in value)) return false;
   const candidate = value.name;

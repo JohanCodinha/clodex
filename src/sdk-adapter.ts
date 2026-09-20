@@ -25,6 +25,8 @@ import { upstreamMaxRetries } from './upstream-retry.js';
 import { emitParentNotice } from './parent-notice.js';
 import { CLAUDE_CODE_BILLING_HEADER_PREFIX } from './oauth/claude-identity.js';
 import { GITHUB_COPILOT_PROVIDER_ID } from './github-copilot.js';
+import { aliasRequestsFastTier } from './model-aliases.js';
+import { normalizeRouteLookupId } from './context-model-id.js';
 
 export { silenceSdkWarnings };
 
@@ -98,6 +100,13 @@ export interface TranslateRequestOptions {
   claudeSessionId?: string;
   /** Hard cap on tools sent to the provider (e.g. Groq: 128). Excess tools are silently dropped. */
   maxTools?: number;
+  /**
+   * Service tier already resolved for this request by `resolveServiceTier`,
+   * which is the only caller that can see the alias the client addressed. When
+   * absent the env-var default still applies, so callers that never had an
+   * alias table behave exactly as before.
+   */
+  serviceTier?: string;
 }
 
 const CLAUDE_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -575,7 +584,7 @@ export function translateRequest(
   // blocks, while retaining an automatic latest-message breakpoint as fallback.
   if (npm === '@ai-sdk/openai') {
     const claudeSessionId = extractClaudeSessionId(body, options?.claudeSessionId);
-    const serviceTier = options?.openAiOAuth ? oauthServiceTier() : undefined;
+    const serviceTier = options?.openAiOAuth ? options.serviceTier ?? oauthServiceTier() : undefined;
     providerOptions = deepMergeProviderOptions(providerOptions, {
       openai: {
         promptCacheKey: claudeSessionId
@@ -634,14 +643,19 @@ export function isOpenAiOAuthRoute(
     && route.providerId !== GITHUB_COPILOT_PROVIDER_ID;
 }
 
-const SERVICE_TIERS = new Set(['auto', 'default', 'flex', 'priority']);
+/** Wire value for Codex fast mode; Codex CLI spells the same tier `fast`. */
+const CODEX_PRIORITY_SERVICE_TIER = 'priority';
+
+const SERVICE_TIERS = new Set(['auto', 'default', 'flex', CODEX_PRIORITY_SERVICE_TIER]);
 let warnedInvalidServiceTier = false;
 let warnedUnsupportedServiceTier = false;
 
 export function oauthServiceTier(): string | undefined {
   const raw = process.env.CLODEX_SERVICE_TIER;
   if (raw === undefined || raw.trim() === '') return undefined;
-  const normalized = raw.trim().toLowerCase() === 'fast' ? 'priority' : raw.trim().toLowerCase();
+  const normalized = raw.trim().toLowerCase() === 'fast'
+    ? CODEX_PRIORITY_SERVICE_TIER
+    : raw.trim().toLowerCase();
   if (!SERVICE_TIERS.has(normalized)) {
     if (!warnedInvalidServiceTier) {
       warnedInvalidServiceTier = true;
@@ -652,6 +666,64 @@ export function oauthServiceTier(): string | undefined {
     return undefined;
   }
   return normalized;
+}
+
+/**
+ * The service tier for one request — the single resolver every surface uses.
+ *
+ * Two inputs, most specific first:
+ *   1. the model id the client actually addressed, when it names a saved alias
+ *      that opted into Codex fast mode with the `-fast` suffix;
+ *   2. CLODEX_SERVICE_TIER (`clodex claude --fast`), the launch-wide default.
+ *
+ * A `-fast` alias therefore lifts one agent to the priority tier without
+ * disturbing the rest of the session, and `--fast` still applies to every model
+ * that does not name its own tier.
+ *
+ * `fastAliasNames` must contain only aliases whose target is a ChatGPT-OAuth
+ * route, and the caller populates it from its own alias table rather than from
+ * the id on the wire: a provider is free to ship a catalog model whose real id
+ * ends in `-fast` (GitHub Copilot already does), and that model must keep the
+ * backend default.
+ *
+ * Both the request diagnostic and the dispatch path call this, so the trace can
+ * never disagree with what was requested on the wire.
+ */
+export function resolveServiceTier(
+  route: { npm?: string; authType?: string; providerId?: string } | undefined,
+  requestedModelId?: unknown,
+  fastAliasNames?: ReadonlySet<string>,
+): string | undefined {
+  if (!isOpenAiOAuthRoute(route)) return undefined;
+  if (
+    typeof requestedModelId === 'string'
+    && fastAliasNames?.has(normalizeRouteLookupId(requestedModelId))
+  ) {
+    return CODEX_PRIORITY_SERVICE_TIER;
+  }
+  return oauthServiceTier();
+}
+
+/**
+ * Alias-name lookup keys for the routes that may carry Codex fast mode.
+ *
+ * Shared so the gateway, the endpoint proxy and the MITM proxy cannot drift
+ * apart on which names count. `isOAuthTarget` is supplied by the caller because
+ * each surface holds a different route shape for the same model.
+ */
+export function collectFastTierAliasNames<A extends { name: string }, T>(
+  aliases: readonly A[],
+  resolveTarget: (alias: A) => T | undefined,
+  isOAuthTarget: (target: T) => boolean,
+): Set<string> {
+  const names = new Set<string>();
+  for (const alias of aliases) {
+    if (!aliasRequestsFastTier(alias.name)) continue;
+    const target = resolveTarget(alias);
+    if (target === undefined || !isOAuthTarget(target)) continue;
+    names.add(normalizeRouteLookupId(alias.name));
+  }
+  return names;
 }
 
 export function reportUnsupportedServiceTier(params: SdkCallParams, warnings: unknown): void {

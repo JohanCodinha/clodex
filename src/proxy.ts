@@ -38,8 +38,9 @@ import {
 import { createLanguageModel, isSdkMigratedNpm, maxToolsForNpm } from './provider-factory.js';
 import { randomUUID } from 'node:crypto';
 import {
+  collectFastTierAliasNames,
   isOpenAiOAuthRoute,
-  oauthServiceTier,
+  resolveServiceTier,
   translateRequest as sdkTranslateRequest,
   streamAnthropicResponse,
   generateAnthropicResponse,
@@ -341,6 +342,16 @@ export async function startProxyCatalog(
     const aliasId = normalizeRouteLookupId(alias.name);
     if (route && !byAlias.has(aliasId)) byAlias.set(aliasId, route);
   }
+  // Aliases that asked for Codex fast mode by name, resolved against the same
+  // declared target the registration loop above routes them to — so the tier
+  // and the route can never be decided from different entries.
+  const fastTierAliasNames = collectFastTierAliasNames(
+    (modelAliases ?? []).filter((alias): alias is ProxyModelAlias & { routeId: string } => (
+      alias.routeId !== undefined && alias.unavailableReason === undefined
+    )),
+    alias => lookupRoute(byAlias, alias.routeId),
+    isOpenAiOAuthRoute,
+  );
   const defaultRoute = lookupRoute(byAlias, defaultAliasId) ?? routes[0]!;
 
   const plog = makeProxyLog(debug, debugLogPath);
@@ -493,10 +504,10 @@ export async function startProxyCatalog(
 
       // Record the tier clodex resolved for this route before dispatch. This is
       // requested intent; the provider SDK may still omit it during serialization.
-      const loggedTier = isOpenAiOAuthRoute(route) ? oauthServiceTier() : undefined;
+      const requestServiceTier = resolveServiceTier(route, originalModel, fastTierAliasNames);
       plog(() =>
         `POST /v1/messages - alias=${originalModel} route=${route.realModelId} format=${route.modelFormat} key=${routeAuthType === 'none' ? 'none' : apiKey ? `len:${apiKey.length}` : 'MISSING'}`
-        + (loggedTier ? ` tier=${loggedTier}` : ''),
+        + (requestServiceTier ? ` tier=${requestServiceTier}` : ''),
       );
 
       const usesSdkAdapter = isSdkMigratedNpm(route.npm);
@@ -630,6 +641,7 @@ export async function startProxyCatalog(
         const runSdkRequest = async (): Promise<void> => {
           const params = sdkTranslateRequest(anthropicBody, route.npm!, {
             openAiOAuth,
+            serviceTier: requestServiceTier,
             claudeSessionId,
             maxTools: maxToolsForNpm(route.npm),
             maxOutputTokens: route.maxOutputTokens,

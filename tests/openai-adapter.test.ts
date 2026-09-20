@@ -354,3 +354,59 @@ describe('OpenAI-format service tier omission warning', () => {
     }
   });
 });
+
+describe('translateOpenAiRequest service tier', () => {
+  const body = {
+    model: 'gpt-5.6-sol',
+    messages: [{ role: 'user' as const, content: 'hi' }],
+  };
+
+  /** Run `run` with CLODEX_SERVICE_TIER set to `value` (or unset for undefined). */
+  function withEnvTier<T>(value: string | undefined, run: () => T): T {
+    const prior = process.env.CLODEX_SERVICE_TIER;
+    try {
+      if (value === undefined) delete process.env.CLODEX_SERVICE_TIER;
+      else process.env.CLODEX_SERVICE_TIER = value;
+      resetServiceTierWarningForTests();
+      return run();
+    } finally {
+      if (prior === undefined) delete process.env.CLODEX_SERVICE_TIER;
+      else process.env.CLODEX_SERVICE_TIER = prior;
+      resetServiceTierWarningForTests();
+    }
+  }
+
+  it('sends a resolved alias tier with no launch-wide tier set', () => {
+    withEnvTier(undefined, () => {
+      const params = translateOpenAiRequest(body, {
+        openAiOAuth: true,
+        serviceTier: 'priority',
+      });
+      expect(params.providerOptions?.openai?.serviceTier).toBe('priority');
+    });
+  });
+
+  it('prefers the resolved alias tier over the launch-wide default', () => {
+    withEnvTier('flex', () => {
+      const params = translateOpenAiRequest(body, {
+        openAiOAuth: true,
+        serviceTier: 'priority',
+      });
+      expect(params.providerOptions?.openai?.serviceTier).toBe('priority');
+    });
+  });
+
+  it('falls back to the launch-wide default when no alias tier was resolved', () => {
+    withEnvTier('fast', () => {
+      const params = translateOpenAiRequest(body, { openAiOAuth: true });
+      expect(params.providerOptions?.openai?.serviceTier).toBe('priority');
+    });
+  });
+
+  it('sends no tier at all off the OAuth route', () => {
+    withEnvTier(undefined, () => {
+      const params = translateOpenAiRequest(body, { serviceTier: 'priority' });
+      expect(params.providerOptions?.openai?.serviceTier).toBeUndefined();
+    });
+  });
+});

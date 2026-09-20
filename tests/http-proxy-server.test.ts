@@ -147,6 +147,10 @@ function adapterRequestWithResponseEvents(
 async function requestLogEntriesForRoute(
   logName: string,
   route: Record<string, unknown>,
+  options: {
+    modelAliases?: Array<{ name: string; routeId: string; displayName: string }>;
+    requestedModel?: string;
+  } = {},
 ): Promise<Array<Record<string, unknown>>> {
   const certificates = ensureHttpProxyCertificates();
   const inferenceLogPath = join(testHome, logName);
@@ -154,10 +158,11 @@ async function requestLogEntriesForRoute(
     routes: [route as never],
     adapterHandle: { port: 1, token: 'adapter-local-token', close: () => {} },
     inferenceLogPath,
+    ...(options.modelAliases ? { modelAliases: options.modelAliases } : {}),
   });
   try {
     const body = JSON.stringify({
-      model: route.aliasId,
+      model: options.requestedModel ?? route.aliasId,
       messages: [{ role: 'user', content: 'tier probe' }],
     });
     const secure = await connectMitm(proxy.port, certificates.caCert);
@@ -1919,6 +1924,52 @@ describe('selective HTTP proxy', () => {
         expect(request, fixture.logName).toBeTruthy();
         expect(request!.serviceTier, fixture.logName).toBeUndefined();
       }
+    } finally {
+      if (previous === undefined) delete process.env['CLODEX_SERVICE_TIER'];
+      else process.env['CLODEX_SERVICE_TIER'] = previous;
+    }
+  });
+
+  it('records the tier a -fast alias asks for, and none for its sibling', async () => {
+    // The MITM never dispatches — it hands the body to the in-process adapter —
+    // so this is the layer's own record of what the adapter is about to do. It
+    // has to reach the same answer from the same alias table.
+    const codexRoute = {
+      aliasId: 'clodex:openai-oauth:gpt-5.6-sol',
+      realModelId: 'gpt-5.6-sol',
+      displayName: 'GPT-5.6 Sol',
+      upstreamUrl: '',
+      apiKey: 'synthetic-oauth-token',
+      modelFormat: 'openai' as const,
+      npm: '@ai-sdk/openai',
+      authType: 'oauth' as const,
+      providerId: 'openai-oauth',
+    };
+    const modelAliases = [
+      { name: 'sol', routeId: codexRoute.aliasId, displayName: codexRoute.displayName },
+      { name: 'sol-fast', routeId: codexRoute.aliasId, displayName: codexRoute.displayName },
+    ];
+    const previous = process.env['CLODEX_SERVICE_TIER'];
+    // Deliberately unset: the alias must be able to ask on its own.
+    delete process.env['CLODEX_SERVICE_TIER'];
+    try {
+      const fast = await requestLogEntriesForRoute(
+        'tier-fast-alias-inference.jsonl',
+        codexRoute,
+        { modelAliases, requestedModel: 'sol-fast' },
+      );
+      const fastRequest = fast.find(entry => entry.route === 'translated');
+      expect(fastRequest).toBeTruthy();
+      expect(fastRequest!.serviceTier).toBe('priority');
+
+      const plain = await requestLogEntriesForRoute(
+        'tier-plain-alias-inference.jsonl',
+        codexRoute,
+        { modelAliases, requestedModel: 'sol' },
+      );
+      const plainRequest = plain.find(entry => entry.route === 'translated');
+      expect(plainRequest).toBeTruthy();
+      expect(plainRequest!.serviceTier).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env['CLODEX_SERVICE_TIER'];
       else process.env['CLODEX_SERVICE_TIER'] = previous;

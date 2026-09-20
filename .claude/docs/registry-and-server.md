@@ -65,3 +65,14 @@ but are reported and kept out of routing. **Aliases and canonical ids are accept
 request's response `model` field echoes the alias verbatim (even under masking) so a patched Claude
 Code's context-window lookup keys match (`aliasNames` in `ServerOptions`).
 
+**An alias can also carry a service tier.** A saved name ending in `-fast` requests Codex fast mode
+(`service_tier: priority`) for the requests addressed to it, so one agent can run fast without the
+launch-wide `--fast`/`CLODEX_SERVICE_TIER`. Every surface resolves it through the single
+`resolveServiceTier` in `sdk-adapter.ts` — request diagnostic and dispatch alike, so the trace
+cannot disagree with the wire. The eligible names are collected once at startup by
+`collectFastTierAliasNames` (`fastTierAliasNames` in `ServerOptions`, and the equivalent local set
+in `startProxyCatalog`/`startHttpProxy`); the decision is keyed off that table, **never off the
+spelling that arrived on the wire**, because providers ship real catalog models whose ids end in
+`-fast` (GitHub Copilot's `claude-opus-4.8-fast`). Only ChatGPT-OAuth targets qualify —
+`isOpenAiOAuthRoute`.
+

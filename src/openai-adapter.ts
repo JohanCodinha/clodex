@@ -40,6 +40,8 @@ export function translateOpenAiRequest(
   options?: {
     /** ChatGPT Codex OAuth requires instructions in providerOptions and manages its own output limit. */
     openAiOAuth?: boolean;
+    /** Tier already resolved by `resolveServiceTier`; falls back to the env default. */
+    serviceTier?: string;
   },
 ): SdkCallParams {
   // Pre-scan to map tool_call_id → function name so tool result messages can reference it.
@@ -129,7 +131,7 @@ export function translateOpenAiRequest(
     // limit (an explicit max_output_tokens yields an empty finish:'other'
     // response), and expects store:false.
     const instructions = system?.trim() || 'You are a coding assistant.';
-    const serviceTier = oauthServiceTier();
+    const serviceTier = options.serviceTier ?? oauthServiceTier();
     return {
       messages,
       tools,

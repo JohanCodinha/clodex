@@ -41,6 +41,7 @@ import {
 } from './prompts.js';
 import { createGatewayModelCatalog } from './models.js';
 import { startServer } from './router.js';
+import { collectFastTierAliasNames, isOpenAiOAuthRoute } from '../sdk-adapter.js';
 import {
   filterServerModelsByFavorites,
   filterServerModelsByProviders,
@@ -488,6 +489,7 @@ export async function runServerCommand(options: ServerCommandOptions = {}): Prom
       + `Saved entries were preserved.\n  ${aliasWarnings.join('\n  ')}`,
     );
   }
+  const gatewayCatalog = createGatewayModelCatalog(models, gateway, modelAliases);
   const inferenceLogPath = getInferenceRequestLogPath();
   const webSocketDiagnosticsLogPath = options.wsDiagnostics
     ? getSessionLogPath('server-websocket-diagnostics', 'jsonl')
@@ -497,9 +499,16 @@ export async function runServerCommand(options: ServerCommandOptions = {}): Prom
     port: options.port ?? DEFAULT_SERVER_PORT,
     apiKey,
     serverPassword,
-    catalog: createGatewayModelCatalog(models, gateway, modelAliases),
+    catalog: gatewayCatalog,
     gateway,
     aliasNames: new Set(modelAliases.map(alias => alias.name)),
+    // Resolved through the same catalog the router resolves requests with, so
+    // the tier cannot be decided from a different model than the one served.
+    fastTierAliasNames: collectFastTierAliasNames(
+      modelAliases,
+      alias => gatewayCatalog.get(alias.name),
+      isOpenAiOAuthRoute,
+    ),
     inferenceLogPath,
     webSocketDiagnosticsLogPath,
   });

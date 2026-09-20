@@ -42,6 +42,7 @@ import { VERSION } from './constants.js';
 import type { ParsedArgs, FavoriteModel, LocalProvider, LocalProviderModel } from './types.js';
 import { addFavorite, removeFavorite, isFavorite } from './favorites.js';
 import {
+  aliasRequestsFastTier,
   canonicalModelAliasName,
   modelAliasMatchesName,
   modelAliasMatchesStoredName,
@@ -444,7 +445,9 @@ ${pc.bold('Options:')}
   --dry-run    Run the wizard but show a preview instead of launching Claude Code
   --trace      Write debug logs to ~/.clodex/logs/ and show errors on exit
   --fast       Request Codex fast mode (service_tier=priority) on ChatGPT-OAuth models
-               (equivalent to CLODEX_SERVICE_TIER=fast; warns if the SDK omits it)
+               for the whole session (equivalent to CLODEX_SERVICE_TIER=fast;
+               warns if the SDK omits it). To do this for one agent only, save
+               a -fast alias with clodex models --alias
   --provider   Boot provider id (skip wizard when paired with --model or in print mode)
   --model      Boot model id (skip wizard when paired with --provider or in print mode)
   --context    <model=stop> use a different share of a model's window for this
@@ -578,6 +581,7 @@ ${pc.bold('Usage:')}
   clodex favorites
   clodex models --list
   clodex models --alias sol=clodex:openai-oauth:gpt-5.6-sol
+  clodex models --alias sol-fast=clodex:openai-oauth:gpt-5.6-sol
   clodex models --unalias sol
   clodex models --context sol=max --save
   clodex models --json
@@ -594,6 +598,9 @@ ${pc.bold('Behavior:')}
   --alias <name=target> saves a short name for a proxy-mode favorite. The
   target is clodex:<provider-id>:<model-id> (the clodex: prefix is optional).
   Alias names are stored lowercase and cannot use client-reserved model names.
+  A name ending in -fast requests Codex fast mode whenever that alias is used,
+  so a single agent can run fast while the rest of the session does not. It
+  applies only to ChatGPT (OAuth) models; elsewhere the name carries no meaning.
   --unalias <name> removes a saved short name.
   --context <model=stop> chooses how much of a model's window to use. Stops are
   standard (the provider's tuned default), max (its ceiling), default (clear a
@@ -617,6 +624,7 @@ ${pc.bold('Context stops and cost:')}
 ${pc.bold('Examples:')}
   clodex favorites
   clodex models --alias sol=clodex:openai-oauth:gpt-5.6-sol
+  clodex models --alias sol-fast=clodex:openai-oauth:gpt-5.6-sol   # same model, fast mode
   clodex models --context sol=max --save
   clodex claude    # switch menu active when favorites are set`;
 }
@@ -874,6 +882,15 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
     modelAliases.push(parsed);
     savePreferences({ modelAliases });
     p.log.success(`Saved model alias ${parsed.name} → ${modelAliasTarget(parsed)}.`);
+    if (aliasRequestsFastTier(parsed.name)) {
+      // Stated as what the suffix requests, not as what this target will do:
+      // the provider catalog is not loaded here, so whether the target is a
+      // ChatGPT-OAuth model is not known at this point.
+      p.log.info(
+        'The -fast suffix requests Codex fast mode for requests sent to this alias. '
+        + 'It applies only to ChatGPT (OAuth) models; on other providers it is ignored.',
+      );
+    }
     return 0;
   }
   if (opts.unalias !== undefined) {

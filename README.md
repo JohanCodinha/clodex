@@ -121,7 +121,7 @@ Launch Claude Code bridged to configured model providers. Unrecognized flags (an
 | `--save-mode` | With `--endpoint`/`--proxy`: save that mode as the `claude` default |
 | `--dry-run` | Run the wizard but print a launch preview instead of launching (never persists anything) |
 | `--trace` | Write debug logs to `~/.clodex/logs/` and show errors on exit |
-| `--fast` | Request Codex fast mode (`service_tier=priority`) for ChatGPT/Codex OAuth routes; equivalent to `CLODEX_SERVICE_TIER=fast` |
+| `--fast` | Request Codex fast mode (`service_tier=priority`) for every ChatGPT/Codex OAuth route in the session; equivalent to `CLODEX_SERVICE_TIER=fast`. To do this for one agent only, save a `-fast` alias instead |
 | `--provider <id>` | Boot provider id (`openai`, `openai-oauth`, or `opencode-go`); with `--model`, skips the wizard |
 | `--model <id>` | Boot model id; with `--provider`, skips the wizard |
 | `--context <model=stop>` | Use a different share of a model's context window for this launch only; never saved. Reaches Claude Code through the exported catalog, so a binary patched by `clodex patch` keeps its baked window until the stop is saved and the patch re-run |
@@ -234,12 +234,48 @@ Manage favorite models (max 20) and short aliases. Favorites feed the endpoint-m
 | --- | --- |
 | *(none)* | Interactive manager: search all providers or browse one at a time |
 | `--list` | Print the exact `clodex:<provider-id>:<model-id>` names (and aliases) without opening the manager |
-| `--alias <name=target>` | Save a short name for a favorite, e.g. `--alias sol=clodex:openai-oauth:gpt-5.6-sol` (the `clodex:` prefix is optional in the target) |
+| `--alias <name=target>` | Save a short name for a favorite, e.g. `--alias sol=clodex:openai-oauth:gpt-5.6-sol` (the `clodex:` prefix is optional in the target). A name ending in `-fast` also requests Codex fast mode — see [per-alias fast mode](#per-alias-codex-fast-mode) |
 | `--unalias <name>` | Remove a saved short name |
 | `--context <model=stop>` | Choose how much of a model's context window to use: `standard`, `max`, `default` to clear, or a token count such as `500k`. Applies to this run unless `--save` is given |
 | `--save` | With `--context`: store the stop as that model's default |
 | `--json` | Print resolved metadata for saved favorites as JSON (ids, aliases, context stop and windows, output limit, pricing boundary, effort levels). Diagnostics go to stderr so stdout stays parseable |
 | `--help`, `--version` | Help / version |
+
+#### Per-alias Codex fast mode
+
+`clodex claude --fast` puts the whole session on Codex fast mode — the main agent
+and every subagent. When you only want one agent to run fast, save a second alias
+for the same model and end its name with `-fast`:
+
+```bash
+clodex models --alias sol=clodex:openai-oauth:gpt-5.6-sol
+clodex models --alias sol-fast=clodex:openai-oauth:gpt-5.6-sol
+clodex patch   # both names reach the model picker and the Agent tool
+```
+
+Requests addressed to `sol-fast` are sent at the priority tier; requests
+addressed to `sol` keep the backend default. Both names route to the same model,
+so nothing else about the two differs. A `-fast` alias overrides `--fast` and
+`CLODEX_SERVICE_TIER`; every other alias still follows them.
+
+Fast mode draws on your ChatGPT plan's priority allowance, and an alias sitting
+in the Agent-tool enum is easy to hand to a long-running agent — which is why the
+opt-in is visible in the name.
+
+The suffix only means something on ChatGPT/Codex OAuth models. On GitHub Copilot,
+OpenRouter, an OpenAI API key, or any other provider, a name ending in `-fast` is
+just a name.
+
+Two further limits, both shared with `--fast`:
+
+- The OpenAI SDK will not send `service_tier` for a model it does not recognise as
+  supporting priority processing. With `@ai-sdk/openai` 4.0.11 that allowlist is
+  `gpt-4*`, `gpt-5*` (excluding `-nano` and `-chat`), `o3*` and `o4-mini*` — so
+  `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` and `gpt-5.3-codex` are sent,
+  while `gpt-6-astra` is not. When the SDK drops it, clodex warns once and the
+  backend default is used.
+- A request diagnostic records the tier clodex resolved before dispatch. That is
+  requested intent, not proof of what the provider billed.
 
 #### Context stops and the pricing boundary
 
@@ -337,7 +373,9 @@ clodex --version    # version
   resolved value only after selecting a ChatGPT/Codex OAuth route; OpenAI
   API-key and non-OpenAI routes are unaffected. `clodex claude --fast` sets the
   value to `fast` for that invocation, overriding an ambient value, and composes
-  the same environment before a dry-run preview. Request diagnostics record
+  the same environment before a dry-run preview. A saved `-fast` alias overrides
+  both for the requests addressed to it — see
+  [per-alias fast mode](#per-alias-codex-fast-mode). Request diagnostics record
   this pre-dispatch intent, not proof of wire serialization. If the provider
   SDK reports that it omitted the tier for a model, clodex warns once and the
   backend default remains in use.
