@@ -92,7 +92,6 @@ const OPENAI_OAUTH_MODEL_SEEDS: OAuthModelSeed[] = [
   { id: 'o1-mini',              name: 'o1 Mini',           reasoning: true },
 ];
 
-/** Models priced with a higher-rate band above a documented input size. */
 /**
  * Families that price the whole request at a higher rate above a documented input
  * size. Read the family version rather than listing ids, so a later family is

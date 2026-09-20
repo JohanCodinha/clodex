@@ -2322,3 +2322,80 @@ describe('client disconnect cancels upstream work', () => {
     expect(clientDisconnected(observed!)).toBe(false);
   });
 });
+
+// Endpoint mode reaches the Anthropic-passthrough branch for every
+// Anthropic-format route the registry holds — a GitHub Copilot Claude model, a
+// custom Anthropic-compatible endpoint. None of those upstreams keeps Claude
+// Code's server-side thread, so the proxy's rule has to hold here too.
+describe('anthropic passthrough thread continuations', () => {
+  const THREAD_CONTINUATION = {
+    model: 'claude-native',
+    messages: [{ role: 'user', content: 'hi' }],
+    thread: { type: 'continue', previous_message_id: 'msg_01Anchor' },
+  };
+
+  it('refuses a continuation with the code Claude Code answers by resending history', async () => {
+    const upstream = await startUpstream({ id: 'msg_01Upstream', type: 'message', content: [] });
+    handles.push(upstream);
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([
+        model('claude-native', 'anthropic', 'zen', { baseUrl: upstream.baseUrl }),
+      ]),
+    });
+
+    const res = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(THREAD_CONTINUATION),
+    });
+
+    expect(res.status).toBe(400);
+    expect((await res.json() as any).error.details.error_code).toBe('thread_unsupported_request');
+    // Refused before the relay: a truncated conversation never reaches the provider.
+    expect(upstream.requests).toHaveLength(0);
+  });
+
+  // Under-scope: an ordinary turn must still be relayed. Without this the guard
+  // could refuse everything and the test above would still pass.
+  it('relays a request that carries no thread field', async () => {
+    const upstream = await startUpstream({ id: 'msg_01Upstream', type: 'message', content: [] });
+    handles.push(upstream);
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([
+        model('claude-native', 'anthropic', 'zen', { baseUrl: upstream.baseUrl }),
+      ]),
+    });
+
+    const res = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-native', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(upstream.requests).toHaveLength(1);
+  });
+
+  // The other half of the same rule: the reply must not carry an id Claude Code
+  // would anchor the NEXT request on, or the refusal above fires every turn.
+  it('rewrites an upstream msg_ id into one Claude Code will not anchor on', async () => {
+    const upstream = await startUpstream({ id: 'msg_01Upstream', type: 'message', content: [] });
+    handles.push(upstream);
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([
+        model('claude-native', 'anthropic', 'zen', { baseUrl: upstream.baseUrl }),
+      ]),
+    });
+
+    const res = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-native', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    const body = await res.json() as { id: string };
+    expect(body.id.startsWith('msg_')).toBe(false);
+    expect(body.id).toMatch(/^clodex_[0-9a-f]{32}$/);
+  });
+
+});

@@ -181,7 +181,8 @@ ${pc.bold('Usage:')}
 
 ${pc.bold('Subcommands:')}
   (none)      Provider hub wizard
-  add         Add a built-in provider, a custom OpenAI-compatible server, or sign in with ChatGPT
+  add         Add a built-in provider, a custom OpenAI-compatible server, or sign in with
+              ChatGPT or GitHub Copilot
   auth        Sign in with ChatGPT/Codex-plan OAuth (device code, or --browser)
   list        Show configured providers
   remove      Remove a provider by id

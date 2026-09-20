@@ -22,8 +22,11 @@ import { providerDynamicHeaders } from '../github-copilot.js';
 import {
   anthropicSchemaRepairsFor,
   applyFastModeVariant,
+  isThreadContinuation,
   relayAnthropicMessages,
   resolveOAuthRetryReplacement,
+  THREAD_UNSUPPORTED_BODY,
+  upstreamHoldsThreads,
 } from '../upstream-forward.js';
 import {
   anthropicPromptTooLongMessage,
@@ -325,6 +328,19 @@ async function handleAnthropicMessages(
       return;
     }
     const messagesUrl = `${model.baseUrl}/v1/messages`;
+    // Same rule the proxy applies, for the same reason: a thread continuation
+    // carries only the messages after Claude Code's anchor, and only Anthropic's
+    // own API holds the rest. Endpoint mode reaches this branch for every
+    // Anthropic-format route the registry has — a Copilot Claude model, a custom
+    // Anthropic-compatible endpoint — and relaying the delta to one of those
+    // answers a truncated conversation as if it were whole.
+    const holdsThreads = upstreamHoldsThreads(messagesUrl);
+    if (!holdsThreads && isThreadContinuation(body as Record<string, unknown>)) {
+      plog(() => `thread continuation refused: model=${model.id} upstream does not hold threads`);
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(THREAD_UNSUPPORTED_BODY);
+      return;
+    }
     let apiKey: string;
     try {
       apiKey = await resolveModelApiKey(model, options.apiKey);
@@ -398,6 +414,9 @@ async function handleAnthropicMessages(
           typeof body.model === 'string' && body.model !== upstreamModelId(model)
             ? body.model
             : undefined,
+        // An upstream that holds no threads must not hand Claude Code an id it
+        // would anchor the next request on.
+        anchorSafeMessageIds: !holdsThreads,
         onUpstreamError: options.inferenceLogPath
           ? (statusCode, errorContent) => writeInferenceResponseErrorLog(options.inferenceLogPath!, {
               requestId,
