@@ -35,9 +35,9 @@ interface OAuthModelSeed {
 }
 
 /**
- * GPT-5.6 prices prompts above this input size at 2x input and 1.5x output for the
- * full request, not just the overage. That is why the Codex-reported window sits
- * here rather than at the model ceiling.
+ * GPT-5.6 and GPT-6 Astra price prompts above this input size at 2x input and 1.5x
+ * output for the full request, not just the overage. That is why the Codex-reported
+ * window sits here rather than at the model ceiling.
  */
 const GPT_5_6_PRICING_BOUNDARY = 272_000;
 const GPT_5_6_PRICING_NOTE =
@@ -58,6 +58,13 @@ export const CHATGPT_CODEX_UNSUPPORTED_MODELS = new Set<string>([
 // model spec and varies by plan, so discovery overrides these whenever it answers.
 // A model with no ceiling here has none above its default window.
 const OPENAI_OAUTH_MODEL_SEEDS: OAuthModelSeed[] = [
+  // GPT-6 family (Astra). Rolled out to ChatGPT plans in stages during 2026-09;
+  // until the Codex catalog listed it for an account the backend rejected it with
+  // "not supported when using Codex with a ChatGPT account", so discovery decides
+  // when it appears. The catalog reports it Responses-Lite over WebSockets, a
+  // 272K default window with an 872K ceiling, and requires a client version of
+  // at least 0.153.0 (see CODEX_RESPONSES_LITE_VERSION).
+  { id: 'gpt-6-astra',          name: 'GPT-6 Astra',       contextWindow: 272_000, maxContextWindow: 872_000, maxOutputTokens: 128_000, reasoning: true, useResponsesLite: true, preferWebSockets: true },
   // GPT-5.6 family (Sol / Terra / Luna)
   { id: 'gpt-5.6-sol',          name: 'GPT-5.6 Sol',       contextWindow: 272_000, maxContextWindow: 872_000, maxOutputTokens: 128_000, reasoning: true },
   { id: 'gpt-5.6-terra',        name: 'GPT-5.6 Terra',     contextWindow: 272_000, maxContextWindow: 872_000, maxOutputTokens: 128_000, reasoning: true },
@@ -77,8 +84,11 @@ const OPENAI_OAUTH_MODEL_SEEDS: OAuthModelSeed[] = [
   { id: 'o1-mini',              name: 'o1 Mini',           reasoning: true },
 ];
 
-/** Models priced with a higher-rate band above a documented input size. */
-const PRICING_BOUNDARY_FAMILIES = /^gpt-5\.[56]/;
+/**
+ * Models priced with a higher-rate band above a documented input size: GPT-5.5,
+ * GPT-5.6 and GPT-6 (Astra). A later `gpt-6.x` is not assumed to share it.
+ */
+const PRICING_BOUNDARY_FAMILIES = /^gpt-(?:5\.[56]|6)(?:-|$)/;
 
 /**
  * Pricing-band metadata for a Codex model id, applied to discovered models too so a

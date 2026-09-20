@@ -109,9 +109,14 @@ export function modelPrefersResponsesApi(modelId: string): boolean {
   if (RESPONSES_ONLY_PREFIXES.some(prefix => lower === prefix || lower.startsWith(`${prefix}-`))) {
     return true;
   }
-  // gpt-5.4 and later minor versions require the Responses API (e.g. gpt-5.4, gpt-5.5, gpt-5.6, gpt-5.6-fast).
-  const gpt5Minor = lower.match(/^gpt-5\.(\d+)(?:-|$)/);
-  if (gpt5Minor && Number(gpt5Minor[1]) >= 4) return true;
+  // gpt-5.4 and every later GPT release require the Responses API
+  // (e.g. gpt-5.4, gpt-5.5, gpt-5.6-sol, gpt-6-astra).
+  const gptVersion = lower.match(/^gpt-(\d+)(?:\.(\d+))?(?:-|$)/);
+  if (gptVersion) {
+    const major = Number(gptVersion[1]);
+    const minor = Number(gptVersion[2] ?? 0);
+    if (major > 5 || (major === 5 && minor >= 4)) return true;
+  }
   // Versioned Codex IDs (e.g. gpt-5.3-codex) don't match the gpt-5-codex prefix.
   if (lower.startsWith('gpt-') && lower.includes('-codex')) return true;
   // xAI multiagent models (e.g. grok-4.20-multi-agent, grok-4.2-multiagent).
@@ -416,6 +421,8 @@ export interface ReasoningCapabilities {
 const ANTHROPIC_EFFORT_LEVELS = ['low', 'medium', 'high'] as const;
 const OPENAI_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh'] as const;
 const GPT_56_EFFORT_LEVELS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+/** GPT-6 Astra documents low through max; `none` is not listed, so it is not sent. */
+const GPT_6_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 const GEMINI_EFFORT_LEVELS = ['low', 'medium', 'high'] as const;
 const MISTRAL_EFFORT_LEVELS = ['high', 'off'] as const;
 const XAI_EFFORT_LEVELS = ['none', 'low', 'medium', 'high'] as const;
@@ -645,8 +652,14 @@ function mapCodexEffortToAnthropic(effort: string): string | undefined {
   }
 }
 
-function isGpt56Model(modelId: string): boolean {
-  return /^gpt-5\.6(?:-|$)/i.test(modelId);
+/**
+ * The effort ladder OpenAI documents for a model family, when it is wider than the
+ * generic low/medium/high(/xhigh→high) mapping. Undefined for every other model.
+ */
+function documentedOpenAiEffortLevels(modelId: string): readonly string[] | undefined {
+  if (/^gpt-5\.6(?:-|$)/i.test(modelId)) return GPT_56_EFFORT_LEVELS;
+  if (/^gpt-6(?:-|$)/i.test(modelId)) return GPT_6_EFFORT_LEVELS;
+  return undefined;
 }
 
 // gpt-5.3-codex-spark rejects `reasoning.summary` outright:
@@ -661,13 +674,8 @@ function isReasoningSummaryUnsupportedModel(modelId: string): boolean {
 }
 
 function mapCodexEffortToOpenAI(effort: string, modelId?: string): string | undefined {
-  if (
-    modelId
-    && isGpt56Model(modelId)
-    && GPT_56_EFFORT_LEVELS.includes(effort as typeof GPT_56_EFFORT_LEVELS[number])
-  ) {
-    return effort;
-  }
+  const documented = modelId ? documentedOpenAiEffortLevels(modelId) : undefined;
+  if (documented?.includes(effort)) return effort;
   if (effort === 'xhigh') return 'high';
   const allowed = ['low', 'medium', 'high'];
   return allowed.includes(effort) ? effort : undefined;
@@ -847,7 +855,7 @@ export function getReasoningCapabilities(
     const prefersResponses = modelPrefersResponsesApi(modelId);
     if (prefersResponses || metadata?.reasoning) {
       return {
-        levels: isGpt56Model(modelId) ? [...GPT_56_EFFORT_LEVELS] : [...OPENAI_EFFORT_LEVELS],
+        levels: [...(documentedOpenAiEffortLevels(modelId) ?? OPENAI_EFFORT_LEVELS)],
         defaultLevel: 'medium',
         supportsSummaries: true,
         mode: 'controllable',

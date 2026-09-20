@@ -95,6 +95,8 @@ describe('modelPrefersResponsesApi', () => {
     expect(modelPrefersResponsesApi('gpt-5.6-sol')).toBe(true);
     expect(modelPrefersResponsesApi('gpt-5.6-terra')).toBe(true);
     expect(modelPrefersResponsesApi('gpt-5.6-luna')).toBe(true);
+    expect(modelPrefersResponsesApi('gpt-6-astra')).toBe(true);
+    expect(modelPrefersResponsesApi('gpt-6')).toBe(true);
     expect(modelPrefersResponsesApi('gpt-5.2-pro')).toBe(true);
     expect(modelPrefersResponsesApi('grok-4.20-multi-agent')).toBe(true);
     expect(modelPrefersResponsesApi('gpt-4o')).toBe(false);
@@ -178,6 +180,19 @@ describe('getReasoningCapabilities', () => {
     const caps = getPatchReasoningCapabilities('@ai-sdk/openai', 'gpt-5.6-sol');
     expect(caps.levels).toEqual(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
     expect(caps.defaultLevel).toBe('medium');
+  });
+
+  // OpenAI documents low through max for GPT-6 Astra and does not list `none`.
+  it('returns the documented GPT-6 Astra effort levels with the medium default', () => {
+    const caps = getReasoningCapabilities('@ai-sdk/openai', 'gpt-6-astra');
+    expect(caps.levels).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+    expect(caps.defaultLevel).toBe('medium');
+    expect(caps.mode).toBe('controllable');
+  });
+
+  it('retains every GPT-6 Astra effort level in patched-client metadata', () => {
+    const caps = getPatchReasoningCapabilities('@ai-sdk/openai', 'gpt-6-astra');
+    expect(caps.levels).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
   });
 
   it('does not advertise GPT-5.5 levels that change on the patched-client wire', () => {
@@ -409,6 +424,19 @@ describe('effortProviderOptions + deepMergeProviderOptions', () => {
     expect(effortProviderOptions('@ai-sdk/openai', 'xhigh', 'gpt-5.5')).toEqual({
       openai: { reasoningEffort: 'high' },
     });
+  });
+
+  it.each(['low', 'medium', 'high', 'xhigh', 'max'])(
+    'preserves GPT-6 Astra %s effort on the OpenAI wire',
+    (effort) => {
+      expect(effortProviderOptions('@ai-sdk/openai', effort, 'gpt-6-astra')).toEqual({
+        openai: { reasoningEffort: effort },
+      });
+    },
+  );
+
+  it('omits the effort parameter for GPT-6 Astra at none, which OpenAI does not document', () => {
+    expect(effortProviderOptions('@ai-sdk/openai', 'none', 'gpt-6-astra')).toBeUndefined();
   });
 
   // gpt-5.3-codex-spark 400s on `reasoning.summary`; the AI SDK adds

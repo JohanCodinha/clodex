@@ -96,6 +96,24 @@ describe('legacy OAuth cache overlay', () => {
     expect(model?.maxContextWindow).toBeUndefined();
   });
 
+  // GPT-6 Astra shares the GPT-5.6 band, so a cache that stored only its window
+  // still gets the seed ceiling and the documented boundary.
+  it('fills GPT-6 Astra budget fields from the seed', () => {
+    const provider = providerWithLegacyCache();
+    provider.modelsCache?.models.push({
+      id: 'gpt-6-astra',
+      name: 'GPT-6 Astra',
+      upstreamModelId: 'gpt-6-astra',
+      contextWindow: 272_000,
+      modelFormat: 'openai',
+    });
+    const astra = projectProviderCachedModels(provider).find(m => m.id === 'gpt-6-astra');
+    expect(astra?.maxContextWindow).toBe(872_000);
+    expect(astra?.pricingBoundary).toBe(272_000);
+    expect(astra?.maxOutputTokens).toBe(128_000);
+    expect(astra?.effectiveContextPercent).toBe(95);
+  });
+
   // Only the ChatGPT OAuth provider uses the Codex effective-window convention.
   // Applying it to an API-key provider would shrink every other model by 5%.
   it('does not touch a non-OAuth provider', () => {
