@@ -193,8 +193,11 @@ env into its own binding (`r=<mod>.settingsColorEnv`) inside the opening `let`,
 builds of 2.1.239, which moved the agent-proxy env behind a registry lookup
 (`sUn.of(lr().host)`), turned the settings-colour binding into a **destructuring** declarator
 (`{settingsColorEnv:n}=e`), added a second computed deny list, and **deleted** the GitHub-Actions
-`INPUT_${…}` scrub from the tail entirely. That is why PATCH 10's anchor identifies the function
-by landmarks inside its body that survive all of that — the `CLAUDE_CODE_REMOTE` ternary, the
+`INPUT_${…}` scrub from the tail entirely, and `Ai()`/`wi()`/`Es()`/`Rs()`/`Ti()` across the
+builds of 2.1.260, which stopped reading the remote flag through `process.env` at all
+(`i=a.CLAUDE_CODE_REMOTE===!0,l=i?…` off a module-level snapshot). That is why PATCH 10's anchor
+identifies the function by landmarks inside its body that survive all of that — a
+`.CLAUDE_CODE_REMOTE` read in the opening `let` (whatever object it is read from), the
 passthrough early-out `)return process.env;let <copy>={` (counted across the whole bundle), the
 back-referenced `return <copy>}` tail, and the required-literal, nested-function and brace-balance
 checks — rather than by counting bindings or by naming a statement upstream is free to delete.

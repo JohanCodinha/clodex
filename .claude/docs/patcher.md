@@ -403,7 +403,7 @@ tweakcc's own repack reads back as an ordinary module name.
   published builds refused to patch at all. Neither end was load-bearing for the replacement: what
   the transform needs is the function's opening brace, its body, and its closing brace. Describe
   each end by what the builder MEANS and let back-references tie the repeats:
-  * the head runs from `function X(){let ` to the `CLAUDE_CODE_REMOTE` ternary over `[^;{}]`
+  * the head runs from `function X(){let ` to the `.CLAUDE_CODE_REMOTE` read over `[^;{}]`
     characters **or one balanced `{...}` group** — that admits the destructuring and the `??{}`
     while still making it impossible to consume the enclosing function's closing brace, which
     would need an *unmatched* one;
@@ -416,7 +416,15 @@ tweakcc's own repack reads back as an ordinary module name.
   29 real bundles (2.1.208 through all eight 2.1.239 builds) it occurs exactly once and exactly one
   `<fn>(process.env.CLAUDE_CODE_REMOTE)?` ternary precedes it; on the 21 pre-2.1.239 bundles the
   widened anchor's matched span is **byte-identical** to the one it replaces, which is what shows
-  this is a widening and not a rebinding. The last line is a postcondition: walk the real block
+  this is a widening and not a rebinding. Claude Code 2.1.260 then stopped spelling that ternary:
+  the opening `let` reads the flag off a module-level env snapshot (`i=a.CLAUDE_CODE_REMOTE===!0,
+  l=i?…`) and never touches `process.env.CLAUDE_CODE_REMOTE`, so the call form read all eight
+  published builds as "anchor not found". The head now requires only that the builder's opening
+  `let` mention `.CLAUDE_CODE_REMOTE` — whatever object it is read from and however the result is
+  consumed. Measured: the further-widened anchor binds exactly once on every 2.1.260 build (the
+  builder is `Ai`/`wi`/`Es`/`Rs`/`Ti` depending on the build) and its span and capture groups
+  are byte-identical to the previous anchor's on 2.1.251 and 2.1.259;
+  `cc260-patch10-execute-real-builder` executes the patched builder from all eight. The last line is a postcondition: walk the real block
   from the function's own `{` and require that it ends exactly where the anchor ended. A lazily
   found tail can stop in the wrong place in **either** direction and both are silent without it.
   Short: a nested `return <copy>}` ends the match inside the function, so only part of it is
