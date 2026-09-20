@@ -27,8 +27,10 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
+import vm from 'node:vm';
 import { applyClodexPatches } from '../../src/patch-transforms.js';
 import { NETWORK_ENV_CONTRACT_VAR } from '../../src/network-env.js';
+import { BUNDLE_MODULE_SEPARATOR } from '../../src/bun-bundle.js';
 
 const BUNDLE_DIR = process.env['REVIEW_BUNDLE_DIR'] ?? '';
 const MARKER = '/*ccpatch:child-network-env*/';
@@ -196,7 +198,7 @@ describe.skipIf(FILES.length === 0)('Claude Code 2.1.260 — the patched builder
         expect(patched.match(/\/\*ccpatch:child-network-env\*\//g)).toHaveLength(1);
       });
 
-      // A whole-bundle syntax check is not available and would not be honest if it
+      // A WHOLE-BUNDLE syntax check is not available and would not be honest if it
       // were: `readContent` concatenates ~1,600 separate modules, so the PRISTINE
       // text does not parse as one file either. The changed span is what this patch
       // can break, so that is what is checked — and `new Function` inside every
@@ -205,6 +207,26 @@ describe.skipIf(FILES.length === 0)('Claude Code 2.1.260 — the patched builder
         const builder = patchedBuilderSource(patched);
         expect(() => new Function(`return (${builder})`)).not.toThrow();
       });
+
+      // Restored from this fork's own version of this harness, which the v2.15.0
+      // merge would otherwise have dropped. It is strictly wider than the builder
+      // check above: PER-MODULE parsing IS available even though whole-bundle
+      // parsing is not, so every module the transforms touched — not just the one
+      // function that gets extracted — is parsed as the ES module it actually is.
+      // The length assertion is the part nothing else pins: a transform that ate a
+      // module boundary would leave both halves compiling in isolation.
+      // `vm.SourceTextModule` needs `NODE_OPTIONS=--experimental-vm-modules`.
+      it.skipIf(typeof vm.SourceTextModule !== 'function')(
+        'produces modules that still parse as ES modules',
+        () => {
+          const pristineParts = pristine.split(BUNDLE_MODULE_SEPARATOR);
+          const parts = patched.split(BUNDLE_MODULE_SEPARATOR);
+          expect(parts.length, 'no module boundary consumed').toBe(pristineParts.length);
+          const changed = parts.filter((part, i) => part !== pristineParts[i]);
+          expect(changed.length, 'the transforms changed at least one module').toBeGreaterThan(0);
+          for (const part of changed) expect(() => new vm.SourceTextModule(part)).not.toThrow();
+        },
+      );
 
       it('binds the builder that folds in the agent-proxy env, and nothing escapes it', () => {
         const builder = patchedBuilderSource(patched);
