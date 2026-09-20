@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  aliasRequestsFastTier,
   canonicalModelAliasName,
   isValidModelAlias,
   modelAliasTarget,
@@ -141,6 +142,32 @@ describe('model aliases', () => {
     ])).toThrow(
       'Saved model aliases are malformed: "modelAliases[1]" must be an object with a string "name".',
     );
+  });
+
+  it.each([
+    // Opt-in: the suffix is the whole request.
+    ['sol-fast', true],
+    ['gpt-5.6-terra-fast', true],
+    // Canonicalized before matching, exactly as the alias is stored.
+    ['  SOL-Fast  ', true],
+    // Claude's synthetic window suffix is a client routing hint, not part of
+    // the name, so it must not hide the opt-in.
+    ['sol-fast[1m]', true],
+    // Under-scope: the suffix is not present.
+    ['sol', false],
+    ['luna', false],
+    // Over-scope: `fast` appears, but not as the trailing token.
+    ['fast', false],
+    ['fast-sol', false],
+    ['breakfast', false],
+    ['sol-faster', false],
+    ['sol_fast', false],
+    // A bare suffix is not a name; MODEL_ALIAS_PATTERN already refuses it, and
+    // the predicate stays total for callers that have not validated the input.
+    ['-fast', false],
+    ['', false],
+  ])('treats %j as a fast-tier request: %s', (name, expected) => {
+    expect(aliasRequestsFastTier(name)).toBe(expected);
   });
 
   it('formats a canonical HTTP-proxy target', () => {

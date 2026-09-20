@@ -308,6 +308,14 @@ describe('help text', () => {
     expect(patchHelpText()).toContain('executes trusted JavaScript');
   });
 
+  it('documents the -fast alias suffix where users look for it', () => {
+    // Both surfaces matter: --fast is where someone discovers Codex fast mode,
+    // and --alias is where they act on it for a single agent.
+    expect(modelsHelpText()).toContain('-fast');
+    expect(modelsHelpText()).toContain('sol-fast=clodex:openai-oauth:gpt-5.6-sol');
+    expect(claudeHelpText()).toContain('-fast alias');
+  });
+
   it('no longer mentions the removed --http-proxy alias', () => {
     for (const help of helps) {
       expect(help).not.toContain('--http-proxy');

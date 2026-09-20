@@ -15,6 +15,9 @@ import {
   claudeSessionPromptCacheKey,
   sdkTranslationErrorSignature,
   resetServiceTierWarningForTests,
+  resolveServiceTier,
+  collectFastTierAliasNames,
+  isOpenAiOAuthRoute,
   silenceSdkWarnings,
 } from '../src/sdk-adapter.js';
 import { installParentNoticeSink } from '../src/parent-notice.js';
@@ -1601,5 +1604,212 @@ describe('translateRequest openai promptCacheKey', () => {
 
   it('omits the key for non-OpenAI providers', () => {
     expect(keyOf(req(), '@ai-sdk/xai')).toBeUndefined();
+  });
+});
+
+describe('per-alias Codex fast mode', () => {
+  const OAUTH_ROUTE = { npm: '@ai-sdk/openai', authType: 'oauth', providerId: 'openai-oauth' };
+  const COPILOT_ROUTE = { npm: '@ai-sdk/openai', authType: 'oauth', providerId: 'github-copilot' };
+  const PUBLIC_API_ROUTE = { npm: '@ai-sdk/openai', authType: 'api', providerId: 'openai' };
+  const OPENROUTER_ROUTE = { npm: '@ai-sdk/openai-compatible', authType: 'api', providerId: 'openrouter' };
+
+  /** Run `body` with CLODEX_SERVICE_TIER set to `value` (or unset for undefined). */
+  function withEnvTier(value: string | undefined, body: () => void): void {
+    const prior = process.env.CLODEX_SERVICE_TIER;
+    try {
+      if (value === undefined) delete process.env.CLODEX_SERVICE_TIER;
+      else process.env.CLODEX_SERVICE_TIER = value;
+      resetServiceTierWarningForTests();
+      body();
+    } finally {
+      if (prior === undefined) delete process.env.CLODEX_SERVICE_TIER;
+      else process.env.CLODEX_SERVICE_TIER = prior;
+      resetServiceTierWarningForTests();
+    }
+  }
+
+  describe('collectFastTierAliasNames', () => {
+    it('collects only -fast aliases whose target is the ChatGPT-OAuth backend', () => {
+      const targets: Record<string, typeof OAUTH_ROUTE> = {
+        'sol-fast': OAUTH_ROUTE,
+        'terra-fast': OAUTH_ROUTE,
+        sol: OAUTH_ROUTE,
+        // Copilot sells fast mode as a sibling model, not a service tier: a
+        // -fast alias there must not start sending a tier its gateway never
+        // asked for.
+        'opus-fast': COPILOT_ROUTE,
+        // On the public API `priority` is a per-token surcharge, not a plan
+        // feature, so an API-key route is excluded on purpose.
+        'api-fast': PUBLIC_API_ROUTE,
+        'glm-fast': OPENROUTER_ROUTE,
+      };
+      const names = collectFastTierAliasNames(
+        Object.keys(targets).map(name => ({ name })),
+        alias => targets[alias.name],
+        isOpenAiOAuthRoute,
+      );
+      expect([...names].sort()).toEqual(['sol-fast', 'terra-fast']);
+    });
+
+    it('drops an alias whose target does not resolve', () => {
+      const names = collectFastTierAliasNames(
+        [{ name: 'ghost-fast' }, { name: 'sol-fast' }],
+        alias => (alias.name === 'sol-fast' ? OAUTH_ROUTE : undefined),
+        isOpenAiOAuthRoute,
+      );
+      expect([...names]).toEqual(['sol-fast']);
+    });
+  });
+
+  describe('resolveServiceTier', () => {
+    it('lifts a -fast alias to priority with no launch-wide tier set', () => {
+      withEnvTier(undefined, () => {
+        expect(resolveServiceTier(OAUTH_ROUTE, 'sol-fast', new Set(['sol-fast'])))
+          .toBe('priority');
+        // The sibling alias for the same model stays on the backend default —
+        // this is the whole point: one agent fast, the rest not.
+        expect(resolveServiceTier(OAUTH_ROUTE, 'sol', new Set(['sol-fast'])))
+          .toBeUndefined();
+      });
+    });
+
+    it('lets the alias override a conflicting launch-wide tier', () => {
+      withEnvTier('flex', () => {
+        expect(resolveServiceTier(OAUTH_ROUTE, 'sol-fast', new Set(['sol-fast'])))
+          .toBe('priority');
+        expect(resolveServiceTier(OAUTH_ROUTE, 'sol', new Set(['sol-fast'])))
+          .toBe('flex');
+      });
+    });
+
+    it('keeps --fast applying to every model that did not name its own tier', () => {
+      withEnvTier('fast', () => {
+        expect(resolveServiceTier(OAUTH_ROUTE, 'sol', new Set(['sol-fast'])))
+          .toBe('priority');
+        expect(resolveServiceTier(OAUTH_ROUTE, 'sol-fast', new Set(['sol-fast'])))
+          .toBe('priority');
+      });
+    });
+
+    it('never sends a tier on a route that does not carry one', () => {
+      withEnvTier('fast', () => {
+        for (const route of [COPILOT_ROUTE, PUBLIC_API_ROUTE, OPENROUTER_ROUTE, undefined]) {
+          expect(resolveServiceTier(route, 'sol-fast', new Set(['sol-fast'])))
+            .toBeUndefined();
+        }
+      });
+    });
+
+    it('ignores a catalog model id that merely ends in -fast', () => {
+      // GitHub Copilot ships `claude-opus-4.8-fast` as a real model id, so the
+      // decision is keyed off the configured alias table, never off the
+      // spelling that arrived on the wire.
+      withEnvTier(undefined, () => {
+        expect(resolveServiceTier(OAUTH_ROUTE, 'gpt-5.5-fast', new Set(['sol-fast'])))
+          .toBeUndefined();
+        expect(resolveServiceTier(OAUTH_ROUTE, 'sol-fast', undefined)).toBeUndefined();
+        expect(resolveServiceTier(OAUTH_ROUTE, 'sol-fast', new Set())).toBeUndefined();
+      });
+    });
+
+    it('matches the alias through Claude\'s synthetic window suffix', () => {
+      withEnvTier(undefined, () => {
+        expect(resolveServiceTier(OAUTH_ROUTE, 'sol-fast[1m]', new Set(['sol-fast'])))
+          .toBe('priority');
+      });
+    });
+
+    it('ignores a non-string model id', () => {
+      withEnvTier(undefined, () => {
+        expect(resolveServiceTier(OAUTH_ROUTE, undefined, new Set(['sol-fast'])))
+          .toBeUndefined();
+        expect(resolveServiceTier(OAUTH_ROUTE, 42, new Set(['sol-fast']))).toBeUndefined();
+      });
+    });
+  });
+
+  describe('translateRequest', () => {
+    const body = {
+      model: 'gpt-5.6-sol',
+      messages: [{ role: 'user' as const, content: 'hello' }],
+    };
+
+    it('puts a resolved alias tier in providerOptions with no env var set', () => {
+      withEnvTier(undefined, () => {
+        const params = translateRequest(body, '@ai-sdk/openai', {
+          openAiOAuth: true,
+          serviceTier: 'priority',
+        });
+        expect(params.providerOptions?.openai?.serviceTier).toBe('priority');
+      });
+    });
+
+    it('prefers the resolved tier over the env default', () => {
+      withEnvTier('flex', () => {
+        const params = translateRequest(body, '@ai-sdk/openai', {
+          openAiOAuth: true,
+          serviceTier: 'priority',
+        });
+        expect(params.providerOptions?.openai?.serviceTier).toBe('priority');
+      });
+    });
+
+    it('falls back to the env default for callers that resolve no tier', () => {
+      withEnvTier('fast', () => {
+        const params = translateRequest(body, '@ai-sdk/openai', { openAiOAuth: true });
+        expect(params.providerOptions?.openai?.serviceTier).toBe('priority');
+      });
+    });
+
+    it('sends no tier off the OAuth route even when one was resolved', () => {
+      withEnvTier(undefined, () => {
+        const params = translateRequest(body, '@ai-sdk/openai', { serviceTier: 'priority' });
+        expect(params.providerOptions?.openai?.serviceTier).toBeUndefined();
+      });
+    });
+  });
+
+  it('serializes the alias tier onto the Codex Responses request body', async () => {
+    // The gate the whole feature depends on: @ai-sdk/openai drops
+    // `service_tier` for a model it does not believe supports priority
+    // processing. Pinned here so an SDK bump that narrows that allowlist fails
+    // loudly instead of silently downgrading every -fast alias.
+    const requestBodies: Array<Record<string, unknown>> = [];
+    const notices: string[] = [];
+    const releaseNotices = installParentNoticeSink(line => notices.push(line));
+    try {
+      silenceSdkWarnings();
+      resetServiceTierWarningForTests();
+      const provider = createOpenAI({
+        apiKey: 'synthetic-test-key',
+        fetch: async (_input, init) => {
+          requestBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return new Response(JSON.stringify({
+            id: 'resp_synthetic',
+            model: 'gpt-5.6-sol',
+            output: [],
+            usage: {
+              input_tokens: 1,
+              input_tokens_details: { cached_tokens: 0 },
+              output_tokens: 0,
+              output_tokens_details: { reasoning_tokens: 0 },
+            },
+          }), { status: 200, headers: { 'content-type': 'application/json' } });
+        },
+      });
+      const params = translateRequest({
+        model: 'gpt-5.6-sol',
+        messages: [{ role: 'user', content: 'synthetic prompt' }],
+      }, '@ai-sdk/openai', { openAiOAuth: true, serviceTier: 'priority' });
+
+      await generateAnthropicResponse(provider.responses('gpt-5.6-sol'), params, 'gpt-5.6-sol');
+
+      expect(requestBodies).toHaveLength(1);
+      expect(requestBodies[0]!.service_tier).toBe('priority');
+      expect(notices).toHaveLength(0);
+    } finally {
+      releaseNotices();
+      resetServiceTierWarningForTests();
+    }
   });
 });

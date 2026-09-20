@@ -21,7 +21,7 @@ import {
 import { HTTP_PROXY_MODEL_PREFIX, type ResolvedHttpProxyAlias } from './routes.js';
 import { anthropicEffortFromRequest, extractClaudeSessionId, type AnthropicRequest } from '../sdk-adapter.js';
 import { anthropicMessagesEndpoint } from '../anthropic-endpoints.js';
-import { isOpenAiOAuthRoute, oauthServiceTier } from '../sdk-adapter.js';
+import { collectFastTierAliasNames, isOpenAiOAuthRoute, resolveServiceTier } from '../sdk-adapter.js';
 import {
   getLatestMessagePreview,
   INFERENCE_PROGRESS_INTERVAL_MS,
@@ -820,6 +820,15 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
     if (!route) continue;
     routesById.set(aliasId, route);
   }
+  // Only for this layer's request diagnostic. The MITM hands the body to the
+  // in-process adapter unrewritten, and the adapter resolves the alias — and the
+  // tier — itself; recomputing it here is what keeps the log honest about what
+  // the adapter will do rather than asserting a second, independent answer.
+  const fastTierAliasNames = collectFastTierAliasNames(
+    options.modelAliases ?? [],
+    alias => routesById.get(normalizeRouteLookupId(alias.routeId)),
+    isOpenAiOAuthRoute,
+  );
   for (const modelId of options.reservedModelIds ?? []) {
     reservedModelIds.add(normalizeRouteLookupId(modelId));
   }
@@ -925,7 +934,7 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
           effort: parsed ? anthropicEffortFromRequest(parsed) : undefined,
           // Only for the route that actually carries one, using the same
           // predicate and the same resolver the adapter applies.
-          serviceTier: isOpenAiOAuthRoute(route) ? oauthServiceTier() : undefined,
+          serviceTier: resolveServiceTier(route, parsed?.model, fastTierAliasNames),
           provider,
           route: route ? 'translated' : 'passthrough',
           stream: Boolean(parsed?.stream),

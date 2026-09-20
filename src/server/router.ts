@@ -64,7 +64,7 @@ import {
   anthropicEffortFromRequest,
   extractClaudeSessionId,
   isOpenAiOAuthRoute,
-  oauthServiceTier,
+  resolveServiceTier,
   type AnthropicRequest,
 } from '../sdk-adapter.js';
 import { withResponsesWebSocketDiagnosticContext } from '../oauth/responses-websocket.js';
@@ -84,6 +84,13 @@ export interface ServerOptions {
    * auto-compaction/context-window echo invariant).
    */
   aliasNames?: ReadonlySet<string>;
+  /**
+   * The subset of `aliasNames` that opted into Codex fast mode with the `-fast`
+   * suffix and resolve to a ChatGPT-OAuth model. A request addressed to one of
+   * these names is sent at the priority tier even when the server was started
+   * without CLODEX_SERVICE_TIER.
+   */
+  fastTierAliasNames?: ReadonlySet<string>;
   /** When set, append structured debug lines to this file path. */
   debugLogPath?: string;
   /** When set, append privacy-minimal inference routing records as JSONL. */
@@ -408,14 +415,19 @@ async function handleAnthropicMessages(
       });
       return;
     }
+    // Use the adapter's own resolver so the record and the dispatch below read
+    // the same request intent. It does not prove SDK serialization.
+    const anthropicServiceTier = resolveServiceTier(
+      model,
+      body.model,
+      options.fastTierAliasNames,
+    );
     auditInference(options, {
       requestId,
       modelId: body.model,
       effort: anthropicEffortFromRequest(body as AnthropicRequest) ?? model.defaultEffort,
       claudeSessionId,
-      // Use the adapter's route predicate and resolver so this records the same
-      // pre-dispatch request intent. It does not prove SDK serialization.
-      serviceTier: isOpenAiOAuthRoute(model) ? oauthServiceTier() : undefined,
+      serviceTier: anthropicServiceTier,
       provider: inferenceProvider(model),
       route: 'translated',
       requestPreview: getLatestMessagePreview(body.messages, body.system),
@@ -429,6 +441,7 @@ async function handleAnthropicMessages(
     const params = sdkTranslateRequest(body as unknown as AnthropicRequest, model.npm!, {
       defaultEffort: anthropicEffortFromRequest(body as AnthropicRequest) ? undefined : model.defaultEffort,
       openAiOAuth,
+      serviceTier: anthropicServiceTier,
       claudeSessionId,
       reasoningMetadata: {
         providerId: model.providerId,
@@ -740,17 +753,21 @@ async function handleOpenAIChatCompletions(
     });
     return;
   }
+  const openAiServiceTier = resolveServiceTier(model, body.model, options.fastTierAliasNames);
   auditInference(options, {
     modelId: body.model,
     effort: openAiEffort(body),
-    serviceTier: isOpenAiOAuthRoute(model) ? oauthServiceTier() : undefined,
+    serviceTier: openAiServiceTier,
     provider: inferenceProvider(model),
     route: 'translated',
     requestPreview: getLatestMessagePreview(body.messages, body.system),
   });
   const baseURL = model.modelFormat === 'anthropic' ? model.baseUrl : model.apiBaseUrl;
   const openAiOAuth = isOpenAiOAuthRoute(model);
-  const params = translateOpenAiRequest(body as unknown as OpenAiRequest, { openAiOAuth });
+  const params = translateOpenAiRequest(body as unknown as OpenAiRequest, {
+    openAiOAuth,
+    serviceTier: openAiServiceTier,
+  });
   const clientWantsStream = Boolean(body.stream);
   const responseModelId = getResponseModelId(body.model, model, options);
 

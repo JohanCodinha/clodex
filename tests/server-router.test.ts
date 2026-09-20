@@ -1273,6 +1273,118 @@ describe('server router', () => {
     });
   });
 
+  describe('per-alias Codex fast mode', () => {
+    const codexModel: ServerModelInfo = {
+      id: 'gpt-5.6-sol',
+      name: 'GPT-5.6 Sol',
+      isFree: false,
+      brand: 'OpenAI',
+      providerId: 'openai-oauth',
+      sourceBackend: 'openai-oauth',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai',
+      authType: 'oauth',
+      apiKey: 'synthetic-oauth-token',
+    };
+    const aliases = [
+      { name: 'sol', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' },
+      { name: 'sol-fast', providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' },
+    ];
+
+    async function startFastAliasServer(inferenceLogPath?: string): Promise<ServerHandle> {
+      return startTestServer({
+        catalog: createGatewayModelCatalog([codexModel], undefined, aliases),
+        aliasNames: new Set(aliases.map(alias => alias.name)),
+        fastTierAliasNames: new Set(['sol-fast']),
+        ...(inferenceLogPath ? { inferenceLogPath } : {}),
+      });
+    }
+
+    it('sends the priority tier for the -fast alias on the Anthropic endpoint', async () => {
+      // No CLODEX_SERVICE_TIER: the alias is the only thing asking for a tier.
+      const previousTier = process.env.CLODEX_SERVICE_TIER;
+      delete process.env.CLODEX_SERVICE_TIER;
+      try {
+        const server = await startFastAliasServer();
+        for (const modelId of ['sol-fast', 'sol']) {
+          const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }] }),
+          });
+          expect(response.status, modelId).toBe(200);
+        }
+
+        // The translated params actually handed to the SDK, not a log line.
+        const calls = vi.mocked(generateAnthropicResponse).mock.calls;
+        expect(calls).toHaveLength(2);
+        const [fastParams, plainParams] = calls.map(call => call[1] as {
+          providerOptions?: { openai?: { serviceTier?: string } };
+        });
+        expect(fastParams.providerOptions?.openai?.serviceTier).toBe('priority');
+        expect(plainParams.providerOptions?.openai?.serviceTier).toBeUndefined();
+      } finally {
+        if (previousTier === undefined) delete process.env.CLODEX_SERVICE_TIER;
+        else process.env.CLODEX_SERVICE_TIER = previousTier;
+      }
+    });
+
+    it('sends the priority tier for the -fast alias on the OpenAI endpoint', async () => {
+      const previousTier = process.env.CLODEX_SERVICE_TIER;
+      delete process.env.CLODEX_SERVICE_TIER;
+      try {
+        const server = await startFastAliasServer();
+        for (const modelId of ['sol-fast', 'sol']) {
+          const response = await fetch(`${server.url}/openai/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }] }),
+          });
+          expect(response.status, modelId).toBe(200);
+        }
+
+        const calls = vi.mocked(generateOpenAiResponse).mock.calls;
+        expect(calls).toHaveLength(2);
+        const [fastParams, plainParams] = calls.map(call => call[1] as {
+          providerOptions?: { openai?: { serviceTier?: string } };
+        });
+        expect(fastParams.providerOptions?.openai?.serviceTier).toBe('priority');
+        expect(plainParams.providerOptions?.openai?.serviceTier).toBeUndefined();
+      } finally {
+        if (previousTier === undefined) delete process.env.CLODEX_SERVICE_TIER;
+        else process.env.CLODEX_SERVICE_TIER = previousTier;
+      }
+    });
+
+    it('records the alias tier in the inference log exactly as dispatched', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'clodex-fast-alias-audit-'));
+      const inferenceLogPath = join(dir, 'requests.jsonl');
+      const previousTier = process.env.CLODEX_SERVICE_TIER;
+      delete process.env.CLODEX_SERVICE_TIER;
+      try {
+        const server = await startFastAliasServer(inferenceLogPath);
+        for (const modelId of ['sol-fast', 'sol']) {
+          const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }] }),
+          });
+          expect(response.status, modelId).toBe(200);
+        }
+        const entries = readFileSync(inferenceLogPath, 'utf8')
+          .trim().split('\n').map(line => JSON.parse(line));
+        expect(entries).toHaveLength(2);
+        expect(entries[0]).toMatchObject({ modelId: 'sol-fast', serviceTier: 'priority' });
+        expect(entries[1]).toMatchObject({ modelId: 'sol' });
+        expect(entries[1]).not.toHaveProperty('serviceTier');
+      } finally {
+        if (previousTier === undefined) delete process.env.CLODEX_SERVICE_TIER;
+        else process.env.CLODEX_SERVICE_TIER = previousTier;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe('saved alias and masked-id request resolution', () => {
     const lunaModel: ServerModelInfo = {
       id: 'gpt-5.6-luna',
