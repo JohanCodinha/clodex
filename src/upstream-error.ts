@@ -24,9 +24,9 @@ export interface SdkUpstreamErrorDetails {
 /** Default downstream backoff hint when the upstream throttle gives none. */
 export const DEFAULT_RETRY_AFTER_SECONDS = 5;
 /**
- * Upper bound for any retry-after hint clodex produces or forwards. Keeps the
- * AI SDK's bounded backoff (default maxRetries=2) and downstream clients well
- * clear of clodex's 120s no-event stream abort.
+ * Upper bound for any retry-after hint clodex produces or forwards. This caps
+ * one provider-directed delay at a minute; translated streams still request
+ * cancellation at their configured idle and total deadlines across attempts.
  */
 export const MAX_RETRY_AFTER_SECONDS = 60;
 
@@ -38,11 +38,38 @@ export function clampRetryAfterSeconds(value?: number): number {
   return Math.min(Math.round(value), MAX_RETRY_AFTER_SECONDS);
 }
 
-/**
- * Recover a backoff hint from message prose. The OAuth WebSocket transport's
- * synthetic error frames can only carry the hint this way — the AI SDK's chunk
- * schema is a closed zod object, so it strips `retry_after_seconds`.
- */
+/** Cap below 60s so the AI SDK accepts the hint independent of its current backoff rung. */
+export function clampAiSdkRetryAfterSeconds(value?: number): number {
+  return Math.min(clampRetryAfterSeconds(value), MAX_RETRY_AFTER_SECONDS - 1);
+}
+
+export type RetryAfterProvenance =
+  | { source: 'default' }
+  | { source: 'upstream'; rawSeconds: number };
+
+const RETRY_AFTER_PARAM_PREFIX = 'clodex_retry_after:';
+
+/** Preserve retry-hint provenance through the OpenAI stream schema's string `param`. */
+export function retryAfterProvenanceParam(provenance: RetryAfterProvenance): string {
+  return provenance.source === 'default'
+    ? `${RETRY_AFTER_PARAM_PREFIX}default`
+    : `${RETRY_AFTER_PARAM_PREFIX}upstream:${String(provenance.rawSeconds)}`;
+}
+
+export function retryAfterProvenanceFromParam(
+  value: unknown,
+): RetryAfterProvenance | undefined {
+  if (value === `${RETRY_AFTER_PARAM_PREFIX}default`) return { source: 'default' };
+  if (typeof value !== 'string' || !value.startsWith(`${RETRY_AFTER_PARAM_PREFIX}upstream:`)) {
+    return undefined;
+  }
+  const rawValue = value.slice(`${RETRY_AFTER_PARAM_PREFIX}upstream:`.length);
+  if (rawValue.length === 0) return undefined;
+  const rawSeconds = Number(rawValue);
+  return Number.isFinite(rawSeconds) ? { source: 'upstream', rawSeconds } : undefined;
+}
+
+/** Recover a backoff hint from the message retained by the OpenAI stream schema. */
 function retryAfterFromText(message: unknown): number | undefined {
   if (typeof message !== 'string') return undefined;
   const match = /retry after (\d+)s\b/i.exec(message);
@@ -428,8 +455,24 @@ export function upstreamHttpStatus(err: unknown, message: string): number {
   return 500;
 }
 
-/** Anthropic SSE error `type` for a status code — lets clients tell retryable from terminal failures. */
-export function anthropicErrorType(status: number): string {
+/**
+ * Anthropic SSE error `type` for a status code — lets clients tell retryable
+ * from terminal failures.
+ *
+ * A mid-stream SSE error frame reaches Claude Code with no HTTP status, and its
+ * retry predicate rejects every status-less error except `overloaded_error`
+ * (matched on the type text). A WebSocket transport drop is exactly the
+ * transient failure that deserves a retry, so a frame carrying the bounded
+ * transport marker is presented as overloaded rather than as the generic
+ * `api_error` Claude Code would surface once and abandon. The recovered status
+ * (500) is untouched: logs, retryability, and the `(HTTP 500)` message text
+ * still describe what actually happened.
+ */
+export function anthropicErrorType(
+  status: number,
+  transportCode?: 'websocket_transport_error',
+): string {
+  if (transportCode === 'websocket_transport_error') return 'overloaded_error';
   switch (status) {
     case 400: return 'invalid_request_error';
     case 401: return 'authentication_error';

@@ -40,12 +40,11 @@ import {
   CHATGPT_CODEX_UNSUPPORTED_MODELS,
   openAiPricingMetadata,
 } from '../data/openai-oauth-models.js';
-import { DEFAULT_EFFECTIVE_CONTEXT_PERCENT } from '../context-modes.js';
 import { isChatGptOAuthProvider } from './provider-kind.js';
-import { modelPrefersResponsesApi } from '../provider-factory.js';
 import { deriveBrand } from '../models.js';
 import { resolveContextWindow } from '../context-window.js';
 import { getInstalledClaudeVersion } from '../launch.js';
+import { modelPrefersResponsesApi } from '../provider-factory.js';
 import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
 import { isLegacyAnonymousCustomEndpoint } from './materialize.js';
 import { OPENCODE_GO_PROVIDER_NAME } from '../data/opencode-go-models.js';
@@ -165,7 +164,17 @@ function parseOpenAiModelEntries(body: unknown): OpenAiModelEntry[] {
  * authoritative for context and capability flags: when the model is also seeded,
  * live values are merged over the seed (the seed is only a fallback).
  */
-function buildDynamicOAuthModel(entry: OpenAiModelEntry, seedById: Map<string, CachedModel>): CachedModel {
+function buildDynamicOAuthModel(
+  entry: OpenAiModelEntry,
+  seedById: Map<string, CachedModel>,
+  /**
+   * True only for the Codex-specific listing. That endpoint returns just the
+   * agentic models Codex supports, which is what makes the reasoning default
+   * below safe; the general ChatGPT catalog is the web model picker and includes
+   * plainly non-reasoning models.
+   */
+  codexCatalog: boolean,
+): CachedModel {
   const seed = seedById.get(entry.id);
   if (seed) {
     return {
@@ -192,13 +201,27 @@ function buildDynamicOAuthModel(entry: OpenAiModelEntry, seedById: Map<string, C
     brand: deriveBrand(prefix),
     contextWindow: entry.context_window ?? resolveContextWindow(id),
     maxContextWindow: entry.max_context_window,
-    effectiveContextPercent: entry.effective_context_window_percent
-      ?? DEFAULT_EFFECTIVE_CONTEXT_PERCENT,
+    // Absent means no reduction. clodex reports the window the provider actually
+    // gives; deciding how much of it to leave free is the client's job, and Claude
+    // Code already reserves a flat 33,000 tokens below whatever it is told.
+    effectiveContextPercent: entry.effective_context_window_percent,
     maxOutputTokens: entry.max_output_tokens,
     ...openAiPricingMetadata(id),
     modelFormat: 'openai' as const,
     npm: '@ai-sdk/openai',
-    reasoning: modelPrefersResponsesApi(id),
+    // Assume a model from the Codex listing reasons. That endpoint reports no
+    // reasoning field of its own, so the old `modelPrefersResponsesApi(id)` was an
+    // id-pattern GUESS that silently said "no" to every family it had not been
+    // taught yet — gpt-6-astra and gpt-daybreak-blue-latest both landed as
+    // non-reasoning that way, which dropped the user's chosen effort and removed
+    // the effort selector from the patched binary (getPatchReasoningCapabilities
+    // early-returns on a `false`). Verified against all 11 models in the live
+    // catalog on 2026-09-04.
+    //
+    // This only decides what the effort UI offers. It is NOT on its own enough to
+    // put reasoning.effort on the wire — effortProviderOptions admits by family —
+    // so a wrong `true` here costs an unusable menu entry, not a 400.
+    reasoning: codexCatalog ? true : modelPrefersResponsesApi(id),
     useResponsesLite: entry.useResponsesLite,
     preferWebSockets: entry.preferWebSockets,
   };
@@ -210,9 +233,9 @@ async function fetchJsonWithAuth(
   accessToken: string,
   timeoutMs: number,
 ): Promise<{ body: unknown | null; error?: string }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
     const response = await fetch(url, {
       headers: {
         Accept: 'application/json',
@@ -220,7 +243,7 @@ async function fetchJsonWithAuth(
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
       },
       signal: controller.signal,
-    }).finally(() => clearTimeout(timer));
+    });
     if (!response.ok) {
       const detail = await response.text().then(t => t.slice(0, 200)).catch(() => '');
       return { body: null, error: `HTTP ${response.status}${detail ? `: ${detail}` : ''}` };
@@ -228,6 +251,11 @@ async function fetchJsonWithAuth(
     return { body: await response.json() };
   } catch (err) {
     return { body: null, error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    clearTimeout(timer);
+    if (!controller.signal.aborted) {
+      controller.abort(new Error('OpenAI catalog request completed'));
+    }
   }
 }
 
@@ -253,8 +281,8 @@ async function refreshOpenAiOAuthModels(
 }> {
   const TIMEOUT_MS = 10_000;
   const seedById = new Map(buildOpenAiOAuthModels().map(m => [m.id, m]));
-  const toModels = (entries: OpenAiModelEntry[]) =>
-    entries.map(entry => buildDynamicOAuthModel(entry, seedById));
+  const toModels = (entries: OpenAiModelEntry[], codexCatalog: boolean) =>
+    entries.map(entry => buildDynamicOAuthModel(entry, seedById, codexCatalog));
 
   const claudeVersion = getInstalledClaudeVersion();
 
@@ -266,7 +294,7 @@ async function refreshOpenAiOAuthModels(
   );
   const codexEntries = parseOpenAiModelEntries(codexResult.body);
   if (codexEntries.length > 0) {
-    return { models: toModels(codexEntries), source: 'live' };
+    return { models: toModels(codexEntries, true), source: 'live' };
   }
 
   // Tier 2: General ChatGPT model list, filtered by known Codex restrictions.
@@ -278,7 +306,7 @@ async function refreshOpenAiOAuthModels(
   const chatGptEntries = parseOpenAiModelEntries(chatGptResult.body)
     .filter(({ id }) => !CHATGPT_CODEX_UNSUPPORTED_MODELS.has(id));
   if (chatGptEntries.length > 0) {
-    return { models: toModels(chatGptEntries), source: 'live' };
+    return { models: toModels(chatGptEntries, false), source: 'live' };
   }
 
   // Tier 3: Static seed — reuse already-built map instead of calling the builder again.

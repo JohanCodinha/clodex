@@ -14,6 +14,25 @@ import {
 
 export const REQUIRE_SERVER_ENV = 'CLODEX_REQUIRE_SERVER';
 
+/**
+ * Whether the wrapper's spawn fallback needs a shell for `target` on `platform`.
+ *
+ * Only Windows, and only for `.cmd`/`.bat` launcher scripts: Node refuses to spawn those without
+ * a shell (the `spawn EINVAL` class), and cmd.exe is their interpreter. A native executable — the
+ * `claude.exe` the VS Code extension hands the wrapper, or the npm package's own `bin/claude.exe` —
+ * must be spawned directly, because a shell hop through cmd.exe rewrites the arguments Claude Code
+ * is given (`%VAR%` expansion, quote and metacharacter handling), and the extension passes JSON,
+ * quoted and empty arguments that have to arrive untouched.
+ *
+ * npm's other two Windows shims are out of reach either way: the `.ps1` needs PowerShell and the
+ * extensionless one is a POSIX shell script, and Node can spawn neither on Windows. A
+ * `CLODEX_CLAUDE_PATH` naming one of those fails at spawn; clodex's own Windows discovery selects
+ * the `.cmd`.
+ */
+export function wrapperSpawnShell(platform: NodeJS.Platform, target: string): boolean {
+  return platform === 'win32' && /\.(cmd|bat)$/i.test(target);
+}
+
 export function removeAnthropicProxyBypass(env: NodeJS.ProcessEnv): void {
   const noProxyValues = [env['NO_PROXY'], env['no_proxy']]
     .filter((value): value is string => value !== undefined);
@@ -51,6 +70,37 @@ export const LOCAL_GATEWAY_API_KEY = 'clodex-local';
 
 export function wrapperRequiresServer(env: NodeJS.ProcessEnv): boolean {
   return env[REQUIRE_SERVER_ENV] === '1';
+}
+
+/** The extension's top-level host shape, shared with missing-path handling. */
+export function wrapperIsTopLevelVsCodeHost(env: NodeJS.ProcessEnv): boolean {
+  return env['CLAUDE_CODE_ENTRYPOINT'] === 'claude-vscode'
+    && !env['CLAUDE_CODE_CHILD_SESSION']
+    && !env['CLAUDECODE'];
+}
+
+/**
+ * Whether this wrapper spawn may select the manifest's verified patched install.
+ *
+ * Every supported platform is eligible. Windows was held back until the `windows-launcher` CI job
+ * could prove the selector's file-identity checks on NTFS and drive the substitution end to end
+ * through the native launcher (`tests/wrapper-substitution.windows.test.ts`); what differs there
+ * now lives in `wrapper-target.ts` (`requireWrapperExecutable`), not in this gate.
+ */
+export function wrapperSubstitutionEligible(
+  env: NodeJS.ProcessEnv,
+  state: ServerRuntimeState | null,
+): boolean {
+  return wrapperIsTopLevelVsCodeHost(env)
+    && state?.mode === 'proxy';
+}
+
+/** Main chat is the persistent SDK stream-json spawn; programmatic queries are not. */
+export function wrapperInvocationIsChat(args: readonly string[]): boolean {
+  const streamJson = args.some((arg, index) =>
+    arg === 'stream-json'
+      && (args[index - 1] === '--output-format' || args[index - 1] === '--input-format'));
+  return streamJson && !args.includes('--no-session-persistence');
 }
 
 export function computeWrapperEnv(

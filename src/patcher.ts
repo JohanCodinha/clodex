@@ -20,6 +20,7 @@
 
 import { createHash } from 'node:crypto';
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
   mkdtempSync,
@@ -39,6 +40,11 @@ import { basename, dirname, join } from 'node:path';
 import pc from 'picocolors';
 import * as p from '@clack/prompts';
 import { getAppHome } from './paths.js';
+import {
+  getPatchManifestPath,
+  readPatchManifest,
+  type PatchManifest,
+} from './patch-manifest.js';
 import { loadPreferences, savePreferences } from './config.js';
 import {
   contextLimitsFrom,
@@ -63,6 +69,11 @@ import { projectProviderCachedModels } from './registry/materialize.js';
 import { isRetainedOpenCodeGoProvider } from './registry/resolve-template.js';
 import { findModelsDevModel } from './registry/models-dev.js';
 import { findClaudeBinary, getClaudeVersionForBinary } from './launch.js';
+import { resolveThroughNpmShims } from './npm-shim.js';
+import {
+  inspectClaudeNativeBinaryPlaceholder,
+  type ClaudeNativePackageState,
+} from './claude-native-placeholder.js';
 import {
   resignMachOBinary,
   restoreEntryModuleName,
@@ -84,11 +95,15 @@ import {
   backupDir,
   collectPristineFacts,
   contentAddressedBackupPath,
+  installProvenancePath,
   isPatchedClaudeSource,
+  legacyBackupPath,
   looksLikeLegacyClodexPatch,
   planInspectedPristineSource,
   planPristineSource,
   planRestoreOnly,
+  readInstallProvenance,
+  recordBackupProvenance,
   sha256File,
   tweakccMirrorBackupPath,
   type PristineFacts,
@@ -117,46 +132,13 @@ import {
 
 // ── Manifest ────────────────────────────────────────────────────────────────
 
-export interface PatchManifest {
-  /** Resolved (real) path of the patched claude binary. */
-  binaryPath: string;
-  /** `claude --version` at patch time. */
-  claudeVersion: string;
-  /** sha256 of the transform-set version and desired patch model config. */
-  configHash: string;
-  /** Size in bytes of the binary after patching (cheap staleness probe). */
-  patchedSize: number;
-  /** sha256 of the binary after patching. */
-  patchedSha256: string;
-  /** Pristine backup used for restore. */
-  backupPath: string;
-  /**
-   * sha256 of the pristine bytes in `backupPath`. Written since content-addressed
-   * backups landed; absent in manifests from older installs, so readers must
-   * treat it as optional.
-   */
-  pristineSha256?: string;
-  patchedAt: string;
-}
-
-export function getPatchManifestPath(): string {
-  return join(getAppHome(), 'patch-state.json');
-}
+// Preserve the patcher's public surface while the manifest reader is shared
+// with the lightweight clodex-claude wrapper. Writes remain owned here.
+export { getPatchManifestPath, readPatchManifest };
+export type { PatchManifest };
 
 export function getPatchLockPath(): string {
   return join(getAppHome(), 'patch.lock');
-}
-
-export function readPatchManifest(path = getPatchManifestPath()): PatchManifest | null {
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as PatchManifest;
-    if (parsed && typeof parsed.binaryPath === 'string' && typeof parsed.configHash === 'string') {
-      return parsed;
-    }
-  } catch {
-    // missing or invalid manifest → unpatched
-  }
-  return null;
 }
 
 function writePatchManifest(manifest: PatchManifest, path = getPatchManifestPath()): void {
@@ -475,13 +457,76 @@ export function tryAcquirePatchLock(
 export type ClaudePatchTarget =
   | { ok: true; binaryPath: string; version: string }
   | { ok: false; reason: 'binary-not-found' }
-  | { ok: false; reason: 'version-unknown'; binaryPath: string };
+  | {
+      ok: false;
+      /**
+       * TWEAKCC_CC_INSTALLATION_PATH names a file that is not there. Distinct from
+       * `binary-not-found` so the message can say which variable to fix rather
+       * than report that no Claude Code was found while one is installed.
+       */
+      reason: 'patch-target-missing';
+      declaredPath: string;
+    }
+  | { ok: false; reason: 'version-unknown'; binaryPath: string }
+  | {
+      ok: false;
+      reason: 'native-binary-missing';
+      binaryPath: string;
+      nativePackageState: ClaudeNativePackageState;
+      installScriptPath: string | null;
+    }
+  | {
+      ok: false;
+      reason: 'launcher-unresolved';
+      /**
+       * The program the launcher names when that could be read — so `--restore`
+       * can still match a manifest recorded against it — and the launcher
+       * itself when it could not. `declaredTarget` says which of the two this
+       * is, because the difference decides what `--restore` may attempt.
+       */
+      binaryPath: string;
+      shimPath: string;
+      declaredTarget: string | null;
+      detail: string;
+    };
 
 /**
  * Locate the REAL native binary, bypassing wrapper shims (e.g. cmux) that a
  * plain PATH lookup can return. Order (ported from the relay-ai wrapper):
  * TWEAKCC_CC_INSTALLATION_PATH → ~/.local/bin/claude (stable native-install
  * symlink) → findClaudeBinary() PATH lookup.
+ *
+ * **The patch target override is TWEAKCC_CC_INSTALLATION_PATH, not
+ * CLODEX_CLAUDE_PATH.** The latter governs which claude gets LAUNCHED and is only
+ * reached here through `findClaudeBinary()`, i.e. last — deliberately. A user
+ * whose CLODEX_CLAUDE_PATH points at a wrapper shim needs that for launching, and
+ * honouring it here patches the wrapper instead of Claude Code: `resolveThroughNpmShims`
+ * follows npm launchers, not arbitrary wrappers, so the wrapper is what would be
+ * handed to tweakcc — issue #193's "Unable to detect installation type", with a
+ * shim's older version selecting the wrong pristine backup on top (the version
+ * note below). Issue #217 asked for it to be honoured; that is why it is not.
+ * What #217 was right about is that the behaviour was undocumented and that the
+ * remedy printed for an unfollowable launcher named the wrong variable — both
+ * fixed, and `clodex patch` now says when it is ignoring a CLODEX_CLAUDE_PATH.
+ *
+ * `%USERPROFILE%\.local\bin\claude.exe`, which the Windows native installer
+ * writes, is still NOT probed here. Adding it as a fallback made a restore
+ * weakness reachable: `findClaudeBinary()` returns the same null for
+ * "CLODEX_CLAUDE_PATH names a file that is gone" as for "nothing was found", so
+ * a stale explicit override silently became that other install, and `--restore`
+ * copied the missing install's pristine bytes over it and dropped the manifest.
+ * Reproduced on real 2.1.266 binaries. `--restore` now refuses when the manifest
+ * records another install rather than selecting a backup by version tag (issue
+ * #199), so this fallback can land — but as its own change with its own Windows
+ * evidence, and only once the no-manifest case is covered too.
+ *
+ * Whatever that finds is then followed through any npm launcher script to the
+ * program it starts (see `npm-shim.ts`). `findBinaryOnPath` prefers
+ * `claude.cmd` on Windows ON PURPOSE — launching claude there needs a shell
+ * script — but that file is a launcher, not Claude Code, and handing it to the
+ * patcher produced issue #193's "Unable to detect installation type from path"
+ * on every npm-installed Windows machine. Following it here, rather than in
+ * `findClaudeBinary`, keeps the launch path untouched.
  *
  * The version is probed from THAT binary, never from whatever `claude` PATH
  * resolves to. The two chains diverge exactly when the overrides matter (a shim
@@ -490,10 +535,27 @@ export type ClaudePatchTarget =
  * another install publishes those other bytes over the user's Claude Code. There
  * is no fallback version for the same reason: an unprobeable binary is an error.
  */
+/**
+ * Set by the last `resolveClaudeBinaryForPatch` when CLODEX_CLAUDE_PATH was set and
+ * something else decided the patch target. Reported by the command, so the warning
+ * lands next to the target it chose rather than from inside a pure resolver.
+ */
+let ignoredLaunchOverride: { used: string; ignored: string } | null = null;
+
+/** The ignored CLODEX_CLAUDE_PATH the last resolve saw, if any. Clears on read. */
+export function takeIgnoredLaunchOverride(): { used: string; ignored: string } | null {
+  const ignored = ignoredLaunchOverride;
+  ignoredLaunchOverride = null;
+  return ignored;
+}
+
 export function resolveClaudeBinaryForPatch(): ClaudePatchTarget {
-  const envOverride = process.env['TWEAKCC_CC_INSTALLATION_PATH'];
+  const envOverride = process.env['TWEAKCC_CC_INSTALLATION_PATH']?.trim() || null;
   const nativeSymlink = join(homedir(), '.local', 'bin', 'claude');
-  const source = envOverride?.trim()
+  if (envOverride && !existsSync(envOverride)) {
+    return { ok: false, reason: 'patch-target-missing', declaredPath: envOverride };
+  }
+  const source = envOverride
     || (existsSync(nativeSymlink) ? nativeSymlink : null)
     || findClaudeBinary();
   if (!source) return { ok: false, reason: 'binary-not-found' };
@@ -503,18 +565,109 @@ export function resolveClaudeBinaryForPatch(): ClaudePatchTarget {
   } catch {
     return { ok: false, reason: 'binary-not-found' };
   }
+  // Before anything is copied, backed up or renamed: an unfollowable launcher is
+  // a hard stop, not a file to patch. Everything downstream — the candidate
+  // directory, the pristine backup, the manifest, the final rename and
+  // `--restore` — keys off the single path returned here.
+  const followed = resolveThroughNpmShims(resolved);
+  if (!followed.ok) {
+    return {
+      ok: false,
+      reason: 'launcher-unresolved',
+      binaryPath: followed.declaredTarget ?? followed.shimPath,
+      shimPath: followed.shimPath,
+      declaredTarget: followed.declaredTarget,
+      detail: followed.detail,
+    };
+  }
+  resolved = followed.path;
+  // A CLODEX_CLAUDE_PATH that is set but did not decide this is worth one line: it
+  // is documented as overriding discovery, and for the patch target it does not.
+  // Compare the fully resolved program, so naming the install by its symlink or by
+  // the launcher in front of it counts as naming it and says nothing.
+  const launchOverride = process.env['CLODEX_CLAUDE_PATH']?.trim() || null;
+  let launchOverrideResolved: string | null = null;
+  if (launchOverride) {
+    try {
+      const followedOverride = resolveThroughNpmShims(realpathSync(launchOverride));
+      launchOverrideResolved = followedOverride.ok ? followedOverride.path : realpathSync(launchOverride);
+    } catch {
+      launchOverrideResolved = launchOverride;
+    }
+  }
+  ignoredLaunchOverride = launchOverrideResolved && launchOverrideResolved !== resolved
+    ? { used: resolved, ignored: launchOverride as string }
+    : null;
   try {
     if (!statSync(resolved).isFile()) return { ok: false, reason: 'binary-not-found' };
   } catch {
     return { ok: false, reason: 'binary-not-found' };
+  }
+  const placeholder = inspectClaudeNativeBinaryPlaceholder(resolved);
+  if (placeholder) {
+    return {
+      ok: false,
+      reason: 'native-binary-missing',
+      binaryPath: resolved,
+      ...placeholder,
+    };
   }
   const version = getClaudeVersionForBinary(resolved);
   if (!version) return { ok: false, reason: 'version-unknown', binaryPath: resolved };
   return { ok: true, binaryPath: resolved, version };
 }
 
-/** Accurate, actionable message per failure reason — the two are NOT the same problem. */
-export function describePatchTargetFailure(target: Extract<ClaudePatchTarget, { ok: false }>): string {
+type PatchTargetCommand = 'patch' | 'restore' | 'launch';
+
+function installScriptCommand(path: string | null): string {
+  return path === null
+    ? '`node node_modules/@anthropic-ai/claude-code/install.cjs` '
+      + '(adjust the path for a local or global install)'
+    : `\`node "${path}"\``;
+}
+
+/** Accurate, actionable message per failure reason — the reasons are NOT interchangeable. */
+export function describePatchTargetFailure(
+  target: Extract<ClaudePatchTarget, { ok: false }>,
+  command: PatchTargetCommand = 'patch',
+): string {
+  if (target.reason === 'launcher-unresolved') {
+    return `${target.shimPath} starts Claude Code but is not Claude Code itself, and clodex could `
+      + `not follow it: ${target.detail}. clodex will not patch a launcher script — that fails with `
+      + '"Unable to detect installation type". Set TWEAKCC_CC_INSTALLATION_PATH to the Claude Code '
+      + 'program itself (for an npm install on Windows that is '
+      + 'node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe under the directory holding the '
+      + 'launcher), then run the command again.';
+  }
+  if (target.reason === 'native-binary-missing') {
+    const installer = installScriptCommand(target.installScriptPath);
+    const remedy = target.nativePackageState === 'present'
+      ? `The platform-native package is installed, so run ${installer} to finish the installation.`
+      : target.nativePackageState === 'missing'
+        ? 'The platform-native optional package is missing, so `install.cjs` cannot repair this '
+          + 'state. Reinstall Claude Code without `--ignore-scripts` / `--omit=optional`.'
+        : 'clodex could not determine whether the platform-native package is installed. If it is, '
+          + `run ${installer}; otherwise reinstall Claude Code without \`--ignore-scripts\` / `
+          + '`--omit=optional`.';
+    const retry = command === 'restore'
+      ? 'Then run `clodex patch --restore` again.'
+      : command === 'launch'
+        ? 'Then run the command again.'
+        : 'Then run `clodex patch` again.';
+    const restore = command === 'restore'
+      ? ` If you need to restore by hand, pristine backups are in ${backupDir()}.`
+      : '';
+    return `${target.binaryPath} is Claude Code's npm placeholder, not its native binary, so the `
+      + `npm install is incomplete. ${remedy} ${retry}${restore} If this is a custom wrapper `
+      + 'rather than the npm placeholder, set TWEAKCC_CC_INSTALLATION_PATH to the native Claude '
+      + 'Code binary.';
+  }
+  if (target.reason === 'patch-target-missing') {
+    return `TWEAKCC_CC_INSTALLATION_PATH is set to ${target.declaredPath}, which does not exist. `
+      + 'clodex will not look for another Claude Code instead — patching or restoring a different '
+      + 'install than the one you named is how one install\'s pristine bytes end up over another\'s. '
+      + 'Point it at the Claude Code program, or unset it to let clodex find your install.';
+  }
   return target.reason === 'binary-not-found'
     ? 'claude binary not found. Install Claude Code or set TWEAKCC_CC_INSTALLATION_PATH.'
     : `Could not determine the version of ${target.binaryPath} (\`claude --version\` failed). `
@@ -584,10 +737,20 @@ function verifyPristineSource(
  * `rename` within one directory is atomic, so a backup file is either absent or
  * complete — never half-written.
  */
-function publishBackupFile(from: string, to: string): void {
+/**
+ * Copy `from` over `to` by writing a temp file beside it and renaming, so `to` is
+ * replaced as a whole new inode rather than rewritten underneath anything holding
+ * it. Used for backup files, and for the live binary on `--restore`.
+ *
+ * `mode` is applied to the temp file before the rename. `copyFileSync` takes the
+ * SOURCE's mode, not the destination's, so a rename without this would publish a
+ * binary carrying whatever permissions the backup file happened to have.
+ */
+export function publishFileByRename(from: string, to: string, mode?: number): void {
   const temp = `${to}.tmp-${process.pid}-${Date.now().toString(36)}`;
   try {
     copyFileSync(from, temp);
+    if (mode !== undefined) chmodSync(temp, mode);
     renameSync(temp, to);
   } catch (err) {
     try {
@@ -700,6 +863,8 @@ export async function applyPatch(
   let patchedSha256: string;
   let backup: string;
   let pristineSha256: string;
+  /** What tied `backup` to this install, carried into the manifest. */
+  const pristine: { provenance: 'established' | 'assumed' } = { provenance: 'established' };
   try {
     mkdirSync(backupDir(), { recursive: true });
 
@@ -803,6 +968,52 @@ export async function applyPatch(
     // poisoned backup must not be laundered into a content-addressed name (which
     // later runs then trust without a probe), and must not clobber the tweakcc
     // mirror on its way to failing.
+    // A guessed association is recorded AS a guess rather than skipped: the record
+    // is what stops a later run from promoting it (the live bytes now match the
+    // backup because the guess put them there, and the manifest this run writes was
+    // itself derived from it). It never selects and never refuses.
+    //
+    // Every plan INHERITS the confidence already recorded for these bytes. `reuse`
+    // matches bytes a guess may have put there; canonicalizing a legacy backup would
+    // otherwise launder a guess through a filename change; and a `snapshot` is no
+    // exception either, even though it inspected the live bytes itself — if a guess
+    // restored those very bytes onto this install, "the install holds them" is a fact
+    // the guess created, so establishing on it would hand these bytes' true owner a
+    // refusal. Nothing promotes a guess. The protection a promotion was supposed to
+    // buy is already provided by refusing the fallback for an install these bytes were
+    // guessed onto.
+    //
+    // Confidence belongs to the CONTENT, not to a filename. Asking only about the name
+    // this plan chose left a third name carrying the guess: restore B from a legacy
+    // backup by version tag, patch A so the legacy file is adopted under its content
+    // address, then patch B — which picks the canonical name, finds no record of B
+    // beside it, and established what the legacy name still called a guess. So every
+    // alias of these exact bytes is consulted, and the two names a record can sit
+    // beside while its backup is gone (the content address and the legacy name) are
+    // read directly, because the scan only finds records next to an existing `.orig`.
+    const inheritsAGuess = (path: string): boolean => {
+      const existing = readInstallProvenance(installProvenancePath(path, binaryPath));
+      return existing === 'damaged' || (existing !== null && existing.assumed);
+    };
+    const provenanceAssumed = (plan.action === 'restore' && plan.assumedForThisInstall)
+      || inheritsAGuess(plan.backupPath)
+      || inheritsAGuess(contentAddressedBackupPath(version, plan.pristineSha256))
+      || inheritsAGuess(legacyBackupPath(version))
+      || facts.backups.some(
+        candidate => candidate.sha256 === plan.pristineSha256
+          && candidate.assumedInstalls.includes(binaryPath),
+      );
+    // From what the write LEFT on disk, not from what it asked for. The two agree
+    // today — an established request promotes, so the writer never answers `assumed`
+    // to one — but the manifest is the next run's evidence, and reading it from the
+    // result rather than the intent means that stays true without depending on the
+    // writer's promotion rule.
+    const recordProvenance = (path: string) => {
+      if (recordBackupProvenance(path, binaryPath, { assumed: provenanceAssumed }) === 'assumed') {
+        pristine.provenance = 'assumed';
+      }
+    };
+
     if (!loaded) {
       loaded = await seedCandidate(backup);
       if (isPatchedClaudeSource(loaded.source)) {
@@ -828,7 +1039,13 @@ export async function applyPatch(
           + `to publish it as ${plan.backupPath}`,
         );
       }
-      publishBackupFile(candidatePath, plan.backupPath);
+      // Record BEFORE the backup becomes visible. A published `.orig` with no record
+      // beside it is exactly the unattributed same-version file this exists to
+      // prevent, and a crash or a full disk between the two writes would leave one
+      // for good. The reverse order is safe: a record whose backup never appeared is
+      // inert, because scanning starts from the `.orig` files.
+      recordProvenance(plan.backupPath);
+      publishFileByRename(candidatePath, plan.backupPath);
     }
 
     // Adopt a legacy `claude-<ver>.orig` under its content address so later runs
@@ -841,16 +1058,32 @@ export async function applyPatch(
     // is absent from it and gets replaced rather than adopted and published.
     const canonical = contentAddressedBackupPath(version, pristineSha256);
     if (canonical !== backup) {
+      // Both names first, for the same reason the snapshot path records before it
+      // publishes: whichever file exists must already say whose bytes it holds.
+      recordProvenance(backup);
+      recordProvenance(canonical);
       const alreadyStored = facts.backups.some(
         candidate => candidate.path === canonical && candidate.sha256 === pristineSha256,
       );
-      if (!alreadyStored) publishBackupFile(backup, canonical);
+      if (!alreadyStored) publishFileByRename(backup, canonical);
       backup = canonical;
     }
 
     // Mirror the pristine copy to tweakcc's restore location (always from the
     // backup, never the live binary — so it stays pristine after patching).
-    publishBackupFile(backup, tweakccMirrorBackupPath());
+    publishFileByRename(backup, tweakccMirrorBackupPath());
+
+    // Record which install these bytes are the pristine content of, beside the
+    // backup itself. The manifest written at the end of this function says the same
+    // thing, but it holds one install and `--restore` deletes it, so this is what
+    // still answers "whose bytes are these?" on a later run — and refuses to hand
+    // them to a different install (issue #204). Both names are recorded when a
+    // legacy backup was adopted under its content address: the legacy file is left
+    // on disk deliberately, for `tweakcc --restore` and older clodex, so leaving it
+    // unattributed would leave the one file this change cannot speak for.
+    // Idempotent, so repeating the snapshot path's write costs nothing.
+    recordProvenance(backup);
+    if (plan.backupPath !== backup) recordProvenance(plan.backupPath);
 
     const builtIn = applyClodexPatches(loaded.source, desired.config);
     results = builtIn.results;
@@ -976,6 +1209,7 @@ export async function applyPatch(
     patchedSha256,
     backupPath: backup,
     pristineSha256,
+    ...(pristine.provenance === 'assumed' ? { pristineProvenance: 'assumed' as const } : {}),
     patchedAt: new Date().toISOString(),
   };
   writePatchManifest(manifest);
@@ -994,17 +1228,35 @@ export async function applyPatch(
 /**
  * `clodex patch --restore` — put the pristine bytes back over the live binary.
  *
- * A pristine backup exists PRECISELY for the case where the install is broken, so
- * recovery must not require the broken binary to run. When `--version` cannot be
- * probed, the version comes from the manifest instead — it recorded
+ * A pristine backup exists PRECISELY for the case where a patched install is broken,
+ * so generic recovery must not require the broken binary to run. When `--version`
+ * cannot be probed, the version comes from the manifest instead — it recorded
  * `claudeVersion`, `backupPath` and `pristineSha256` when the binary was patched,
- * which establishes provenance without executing anything. The patch path keeps
- * the hard failure: patching an unidentifiable binary is elective, restoring one
- * is the user's way out.
+ * which establishes provenance without executing anything.
+ *
+ * The manifest fallback is sound only while clodex was the last writer of the
+ * unprobeable target — the bad-patch recovery case. An npm placeholder proves a
+ * package manager replaced those bytes, so that old manifest is no longer
+ * authoritative for this path even though the wrapper package version is readable.
+ * That state refuses above; generic unprobeable binaries retain manifest recovery.
  */
 function runRestoreCommand(target: ClaudePatchTarget): number {
-  if (!target.ok && target.reason === 'binary-not-found') {
-    p.log.error(describePatchTargetFailure(target));
+  if (!target.ok && (
+    target.reason === 'binary-not-found'
+    // A named path that is not there names no program to restore over, and looking
+    // for another install is exactly what must not happen here.
+    || target.reason === 'patch-target-missing'
+    || target.reason === 'native-binary-missing'
+  )) {
+    p.log.error(describePatchTargetFailure(target, 'restore'));
+    return 1;
+  }
+  // A launcher clodex could not read names no program, so there is no path to
+  // look up in the manifest and nothing safe to restore over. Falling through
+  // would report a failed `claude --version` — the wrong cause, pointing the
+  // user at the wrong remedy — for a refusal that happens before any probe.
+  if (!target.ok && target.reason === 'launcher-unresolved' && target.declaredTarget === null) {
+    p.log.error(describePatchTargetFailure(target, 'restore'));
     return 1;
   }
   const binaryPath = target.binaryPath;
@@ -1029,8 +1281,15 @@ function runRestoreCommand(target: ClaudePatchTarget): number {
     return 1;
   }
 
-  // Unlike the patch path, this copies straight over the live binary — there is
-  // nothing to publish atomically — so it carries the full provenance check.
+  // Publish the same way the patch path does. Rewriting a binary IN PLACE leaves
+  // it on the same inode, and macOS caches a code signature per vnode for a
+  // binary that has been executed — an in-place overwrite invalidates the pages
+  // under that cache and has been reported to leave every later launch killed
+  // with `Code Signature Invalid` (issue #216) until the file was replaced
+  // through a new inode. The earlier reasoning here was that a restore has
+  // "nothing to publish atomically", which is true and beside the point: what
+  // matters is inode identity, not atomicity. This path still carries the full
+  // provenance check.
   const plan = planRestoreOnly(collectPristineFacts({ version, binaryPath, manifest }));
   if (plan.action === 'error') {
     p.log.error(plan.message);
@@ -1042,11 +1301,104 @@ function runRestoreCommand(target: ClaudePatchTarget): number {
     p.log.error(verified.message);
     return 1;
   }
-  copyFileSync(plan.backupPath, binaryPath);
+  // Record what this restore knows BEFORE the binary changes and before the manifest
+  // is cleared.
+  //
+  // Before the copy, because a version-tag guess changes the live bytes to the
+  // backup's: once that has happened, "the live bytes match this backup" is no
+  // longer independent evidence, so the record saying it was a guess has to already
+  // be on disk. If it cannot be, the guess is refused — it is the optional
+  // compatibility path, and skipping it costs the user nothing but a message.
+  //
+  // Before the manifest is cleared, because the manifest may be the ONLY thing tying
+  // that backup to this install — an upgrading user's backup predates these records
+  // — and clearing it without writing one leaves the backup unattributed for good,
+  // which is the state issue #204 turns destructive on a second install.
+  // A manifest for this same path but a DIFFERENT claude version is about an older
+  // install of Claude Code whose backup is still on disk, and clearing it below would
+  // leave that backup unattributed. `clodex patch` migrates the same case.
+  if (manifest && manifest.backupPath && manifest.binaryPath === binaryPath
+    && manifest.claudeVersion !== version && manifest.backupPath !== plan.backupPath) {
+    try {
+      if (existsSync(manifest.backupPath)) {
+        recordBackupProvenance(manifest.backupPath, manifest.binaryPath, {
+          assumed: manifest.pristineProvenance === 'assumed',
+        });
+      }
+    } catch (err) {
+      p.log.warn(
+        `Could not record in ${backupDir()} that ${manifest.backupPath} holds the pristine bytes of `
+        + `claude ${manifest.claudeVersion} at ${manifest.binaryPath} `
+        + `(${err instanceof Error ? err.message : String(err)}). That version may need to be `
+        + 'reinstalled rather than restored.',
+      );
+    }
+  }
+
+  let recorded: 'established' | 'assumed' | 'failed';
   try {
-    unlinkSync(getPatchManifestPath());
+    recorded = recordBackupProvenance(plan.backupPath, binaryPath, { assumed: plan.assumedForThisInstall });
+  } catch (err) {
+    recorded = 'failed';
+    const detail = err instanceof Error ? err.message : String(err);
+    if (plan.assumedForThisInstall) {
+      p.log.error(
+        `Refusing to restore ${binaryPath} from ${plan.backupPath}: nothing but the claude `
+        + `${version} version tag ties those bytes to this install, and clodex cannot record that in `
+        + `${backupDir()} (${detail}). Writing them without that record would leave the machine unable `
+        + 'to tell afterwards that the match was a guess. Fix the backup directory, or reinstall '
+        + 'Claude Code to make this install pristine.',
+      );
+      return 1;
+    }
+    p.log.warn(
+      `Could not record in ${backupDir()} that ${plan.backupPath} holds the pristine bytes of `
+      + `${binaryPath} (${detail}). Restoring anyway and keeping the patch manifest, so that record `
+      + 'is not lost — a later restore would otherwise have nothing tying that backup to this install.',
+    );
+  }
+
+  // Keep the live binary's own permissions: `copyFileSync` would hand it the
+  // backup file's instead, and a non-executable claude is a worse outcome than
+  // the one being fixed.
+  let publishedMode: number | undefined;
+  try {
+    publishedMode = statSync(binaryPath).mode;
   } catch {
-    // no manifest to remove
+    // The target is gone between the plan and the write; let the rename create it
+    // with the backup's mode rather than refuse a rescue this late.
+  }
+  try {
+    publishFileByRename(plan.backupPath, binaryPath, publishedMode);
+  } catch (err) {
+    // A rename can fail where the old in-place copy would have worked — Windows
+    // refuses to replace a file another process holds open, and a temp file beside
+    // the binary needs a writable directory. This is a rescue command, so fall back
+    // to the in-place write rather than leave a broken install unrestored; the user
+    // is told, because on macOS that write is the fault this path exists to avoid.
+    p.log.warn(
+      `Could not replace ${binaryPath} through a new file (${err instanceof Error ? err.message : String(err)}); `
+      + 'writing the pristine bytes in place instead. If claude then fails to start with a code-signing '
+      + 'error, copy the backup to a new file and move it over the binary by hand.',
+    );
+    copyFileSync(plan.backupPath, binaryPath);
+  }
+
+  // The manifest records ONE install, and clearing it is meant to say "this install
+  // is no longer patched". Two things must hold first. Only this install's own
+  // record may be cleared: a provenance record lets a restore succeed while the
+  // manifest still holds a DIFFERENT install (both are recorded, so each can be
+  // restored), and deleting the manifest there would throw away the other install's
+  // only rescue record — the damage issue #199 named, arrived at from the other
+  // direction. And an ESTABLISHED record must now stand in its place: a manifest is
+  // stronger evidence than a guess, so dropping it in exchange for one destroys
+  // testimony rather than migrating it.
+  if (recorded === 'established' && (!manifest || manifest.binaryPath === binaryPath)) {
+    try {
+      unlinkSync(getPatchManifestPath());
+    } catch {
+      // no manifest to remove
+    }
   }
   p.log.success(`Restored pristine claude ${version} from ${plan.backupPath}.`);
   return 0;
@@ -1058,6 +1410,14 @@ export async function runPatchCommand(opts: {
   localPatches?: boolean;
 } = {}): Promise<number> {
   const target = resolveClaudeBinaryForPatch();
+  const ignoredOverride = takeIgnoredLaunchOverride();
+  if (ignoredOverride) {
+    p.log.warn(
+      `CLODEX_CLAUDE_PATH is set to ${ignoredOverride.ignored}, but it does not choose what gets `
+      + `patched — ${ignoredOverride.used} does. CLODEX_CLAUDE_PATH selects the claude that gets `
+      + 'LAUNCHED; set TWEAKCC_CC_INSTALLATION_PATH to patch a specific install.',
+    );
+  }
 
   // Handled BEFORE the patch path's version check, because `--restore` has its
   // own rules: it must still work on a binary that no longer runs.
@@ -1110,6 +1470,29 @@ export async function runPatchCommand(opts: {
     return 1;
   }
 
+  // This run is about to REPLACE the manifest, which holds one install. When the one
+  // it holds is a different install (or this install at a different claude version),
+  // that manifest is the only thing attributing its backup — an upgrading user's
+  // backup predates the per-install records — so migrate its testimony first or
+  // patching one install silently strips the other's rescue record (issue #204).
+  if (manifest && manifest.backupPath
+    && (manifest.binaryPath !== binaryPath || manifest.claudeVersion !== version)) {
+    try {
+      if (existsSync(manifest.backupPath)) {
+        recordBackupProvenance(manifest.backupPath, manifest.binaryPath, {
+          assumed: manifest.pristineProvenance === 'assumed',
+        });
+      }
+    } catch (err) {
+      p.log.warn(
+        `Could not record in ${backupDir()} that ${manifest.backupPath} holds the pristine bytes of `
+        + `${manifest.binaryPath} before replacing the patch manifest `
+        + `(${err instanceof Error ? err.message : String(err)}). That install may need to be `
+        + 'reinstalled rather than restored.',
+      );
+    }
+  }
+
   try {
     // Never patch on top of a patch: applyPatch decides from the pristine
     // backups for THIS version (and the manifest) whether the live binary is
@@ -1151,10 +1534,10 @@ export async function runLaunchPatchCheck(opts: { agentStdout?: boolean; dryRun?
     const target = resolveClaudeBinaryForPatch();
     if (!target.ok) {
       // A patch check must never break a launch. "Not found" is silent (the user
-      // may not use the patcher at all); an unreadable version is a real problem
-      // worth one dim line, since it also blocks `clodex patch`.
-      if (target.reason === 'version-unknown' && !opts.agentStdout) {
-        console.error(pc.dim(`clodex: ${describePatchTargetFailure(target)}`));
+      // may not use the patcher at all); every other resolution failure is worth
+      // one dim line, since each also blocks `clodex patch`.
+      if (target.reason !== 'binary-not-found' && !opts.agentStdout) {
+        console.error(pc.dim(`clodex: ${describePatchTargetFailure(target, 'launch')}`));
       }
       return;
     }
