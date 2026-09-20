@@ -18,6 +18,7 @@ import {
   resolveServiceTier,
   collectFastTierAliasNames,
   isOpenAiOAuthRoute,
+  resetCompactPromptDriftWarningsForTests,
   silenceSdkWarnings,
 } from '../src/sdk-adapter.js';
 import { installParentNoticeSink } from '../src/parent-notice.js';
@@ -110,6 +111,77 @@ describe('translateTools', () => {
         }],
       }),
     ]);
+  });
+
+  it('sends Artifact without the pattern OpenAI cannot compile (#194)', async () => {
+    // Claude Code 2.1.266 sends this schema on every request; OpenAI compiles
+    // each `pattern` with Python's `re`, answers `bad escape \p`, and 400s the
+    // turn before the model sees it.
+    const fieldPattern = String.raw`^(?!__.*__$)[^\p{Cc}\p{Cf}\p{Zl}\p{Zp}"\\./[\]]{1,200}$`;
+    const collectionPattern = String.raw`^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$`;
+    const requestBodies: unknown[] = [];
+    const provider = createOpenAI({
+      apiKey: 'synthetic-test-key',
+      fetch: async (_input, init) => {
+        requestBodies.push(JSON.parse(String(init?.body)));
+        return new Response(JSON.stringify({
+          id: 'resp_synthetic',
+          model: 'gpt-5.6-terra',
+          output: [],
+          usage: {
+            input_tokens: 1,
+            input_tokens_details: { cached_tokens: 0 },
+            output_tokens: 0,
+            output_tokens_details: { reasoning_tokens: 0 },
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      },
+    });
+    const params = translateRequest({
+      model: 'gpt-5.6-terra',
+      messages: [{ role: 'user', content: 'hello' }],
+      tools: [{
+        name: 'Artifact',
+        description: 'Render an HTML file to an Artifact',
+        input_schema: {
+          type: 'object',
+          properties: {
+            field: { type: 'string', pattern: fieldPattern },
+            collection: { type: 'string', pattern: collectionPattern },
+          },
+        },
+      }],
+    }, '@ai-sdk/openai', { openAiOAuth: true });
+
+    await generateAnthropicResponse(
+      provider.responses('gpt-5.6-terra'), params, 'gpt-5.6-terra');
+
+    expect(requestBodies).toEqual([
+      expect.objectContaining({
+        tools: [{
+          type: 'function',
+          name: 'Artifact',
+          description: 'Render an HTML file to an Artifact',
+          strict: false,
+          parameters: {
+            type: 'object',
+            properties: {
+              field: { type: 'string' },
+              collection: { type: 'string', pattern: collectionPattern },
+            },
+          },
+        }],
+      }),
+    ]);
+  });
+
+  it('leaves the pattern intact on an Anthropic-format route', () => {
+    const pattern = String.raw`^\p{L}+$`;
+    const input_schema = { type: 'object', properties: { field: { type: 'string', pattern } } };
+    for (const npm of ['@ai-sdk/anthropic', '@ai-sdk/google-vertex/anthropic']) {
+      const tools = translateTools([{ name: 'Artifact', input_schema }], npm);
+      expect((tools!.Artifact.inputSchema as { jsonSchema: unknown }).jsonSchema).toBe(input_schema);
+    }
   });
 
   it('returns undefined for empty/missing tools', () => {
@@ -686,6 +758,620 @@ describe('translateRequest', () => {
     expect(compact.providerOptions?.openai?.promptCacheKey)
       .toBe(ordinary.providerOptions?.openai?.promptCacheKey);
   });
+
+  // Head and tail verbatim from the Claude Code 2.1.259 bundle (the summary
+  // instructions between them are elided). Claude Code wraps EVERY compaction
+  // turn in these, whatever tools the session happens to be carrying.
+  const CC_COMPACT_HEAD = [
+    'CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.',
+    '',
+    '- Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.',
+    '- You already have all the context you need in the conversation above.',
+    '- Tool calls will be REJECTED and will waste your only turn — you will fail the task.',
+    '- Your entire response must be plain text: an <analysis> block followed by a <summary> block.',
+  ].join('\n');
+  const CC_COMPACT_TAIL = '\n\nREMINDER: Do NOT call any tools. Respond with plain text only — '
+    + 'an <analysis> block followed by a <summary> block. Tool calls will be rejected and you will '
+    + 'fail the task.';
+  const ccCompactPrompt = `${CC_COMPACT_HEAD}\n\nYour task is to create a detailed summary of the `
+    + `conversation so far.${CC_COMPACT_TAIL}`;
+  // A shell-heavy session: no StructuredOutput anywhere, which is the normal
+  // shape for an interactive session and for a schema-less workflow agent.
+  const shellSessionTools = [
+    { name: 'Bash', input_schema: { type: 'object' } },
+    { name: 'Read', input_schema: { type: 'object' } },
+    { name: 'Grep', input_schema: { type: 'object' } },
+  ];
+
+  const driftedCompactPrompt = (opening = 'IMPORTANT: Return only plain text. Never invoke any tools.') => [
+    opening,
+    '',
+    '- Do not use Read, Bash, or any other tool.',
+    '- You already have all the context you need in the conversation above.',
+    '- Tool calls will be REJECTED and will waste your only turn — you will fail the task.',
+    '- Put your summary in plain text.',
+    '',
+    'Create a detailed summary of the conversation so far.',
+    '',
+    'FINAL NOTE: Return plain text without invoking tools.',
+  ].join('\n');
+
+  it('warns once for a reworded compact prompt and logs every duplicate sighting', () => {
+    const notices: string[] = [];
+    const traces: string[] = [];
+    const releaseNotices = installParentNoticeSink(line => notices.push(line));
+    resetCompactPromptDriftWarningsForTests();
+    try {
+      const body = {
+        model: 'gpt-5.6-sol',
+        system: [{
+          text: 'x-anthropic-billing-header: cc_version=2.1.261.a1b; cc_entrypoint=cli;',
+        }],
+        messages: [{
+          role: 'user' as const,
+          content: driftedCompactPrompt('Respond with plain text only. Do not call any tools.'),
+        }],
+        tools: shellSessionTools,
+        tool_choice: { type: 'auto' as const },
+      };
+
+      const first = translateRequest(body, '@ai-sdk/openai', { openAiOAuth: true, log: m => traces.push(m) });
+      const duplicate = translateRequest(body, '@ai-sdk/openai', { openAiOAuth: true, log: m => traces.push(m) });
+
+      // The loose tier diagnoses only. The strict tier still owns behavior and
+      // deliberately leaves tools available when its exact markers are absent.
+      expect(first.toolChoice).toBe('auto');
+      expect(duplicate.toolChoice).toBe('auto');
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain('Claude Code 2.1.261.a1b');
+      expect(notices[0]).toContain("no longer matches clodex's text-only guard");
+      expect(notices[0]).toContain('https://github.com/bman654/clodex/issues');
+      // Trace logging happens before terminal dedupe, preserving both sightings.
+      expect(traces).toEqual([
+        'possible Claude Code compact prompt drift: 2.1.261.a1b',
+        'possible Claude Code compact prompt drift: 2.1.261.a1b',
+      ]);
+    } finally {
+      resetCompactPromptDriftWarningsForTests();
+      releaseNotices();
+    }
+  });
+
+  it('warns on a block-array compact turn when the header changes but its reminder remains', () => {
+    const notices: string[] = [];
+    const traces: string[] = [];
+    const releaseNotices = installParentNoticeSink(line => notices.push(line));
+    resetCompactPromptDriftWarningsForTests();
+    try {
+      const result = translateRequest({
+        model: 'gpt-5.6-sol',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'call_1', content: 'shell output' },
+            { type: 'text', text: `${driftedCompactPrompt()}${CC_COMPACT_TAIL}` },
+          ],
+        }],
+        tools: shellSessionTools,
+        tool_choice: { type: 'auto' },
+      }, '@ai-sdk/openai', { openAiOAuth: true, log: message => traces.push(message) });
+
+      expect(result.toolChoice).toBe('auto');
+      expect(notices).toHaveLength(1);
+      expect(traces).toEqual(['possible Claude Code compact prompt drift: unknown-version']);
+    } finally {
+      resetCompactPromptDriftWarningsForTests();
+      releaseNotices();
+    }
+  });
+
+  it('caps compact-prompt drift notices while continuing to trace later sightings', () => {
+    const notices: string[] = [];
+    const traces: string[] = [];
+    const releaseNotices = installParentNoticeSink(line => notices.push(line));
+    resetCompactPromptDriftWarningsForTests();
+    try {
+      for (const version of ['2.1.261.0', '2.1.262.0', '2.1.263.0', '2.1.264.0']) {
+        translateRequest({
+          model: 'gpt-5.6-sol',
+          system: `x-anthropic-billing-header: cc_version=${version}; cc_entrypoint=cli;`,
+          messages: [{ role: 'user', content: driftedCompactPrompt() }],
+          tools: shellSessionTools,
+          tool_choice: { type: 'auto' },
+        }, '@ai-sdk/openai', { openAiOAuth: true, log: m => traces.push(m) });
+      }
+
+      expect(notices.filter(line => line.includes('looks like a compaction turn'))).toHaveLength(3);
+      expect(notices.at(-1)).toContain('further compact-prompt drift warnings suppressed');
+      expect(notices).toHaveLength(4);
+      expect(traces).toHaveLength(4);
+      expect(traces.at(-1)).toBe('possible Claude Code compact prompt drift: 2.1.264.0');
+    } finally {
+      resetCompactPromptDriftWarningsForTests();
+      releaseNotices();
+    }
+  });
+
+  it('uses only a bounded version from a real billing-header system block', () => {
+    const cases = [
+      `quoted metadata: x-anthropic-billing-header: cc_version=2.1.999; cc_entrypoint=cli;`,
+      `x-anthropic-billing-header: cc_version=${'a'.repeat(65)}; cc_entrypoint=cli;`,
+    ];
+
+    for (const system of cases) {
+      const notices: string[] = [];
+      const traces: string[] = [];
+      const releaseNotices = installParentNoticeSink(line => notices.push(line));
+      resetCompactPromptDriftWarningsForTests();
+      try {
+        translateRequest({
+          model: 'gpt-5.6-sol',
+          system,
+          messages: [{ role: 'user', content: driftedCompactPrompt() }],
+          tools: shellSessionTools,
+        }, '@ai-sdk/openai', { openAiOAuth: true, log: message => traces.push(message) });
+
+        expect(notices).toHaveLength(1);
+        expect(notices[0]).not.toContain('from Claude Code');
+        expect(traces).toEqual(['possible Claude Code compact prompt drift: unknown-version']);
+      } finally {
+        resetCompactPromptDriftWarningsForTests();
+        releaseNotices();
+      }
+    }
+  });
+
+  it('does not warn on probes, quotes, tool results, split blocks, history, or prefills', () => {
+    const notices: string[] = [];
+    const traces: string[] = [];
+    const releaseNotices = installParentNoticeSink(line => notices.push(line));
+    resetCompactPromptDriftWarningsForTests();
+    const base = {
+      model: 'gpt-5.6-sol',
+      tools: shellSessionTools,
+      tool_choice: { type: 'auto' as const },
+    };
+    try {
+      const requests = [
+        {
+          ...base,
+          diagnostics: { previous_message_id: null },
+          messages: [{ role: 'user' as const, content: driftedCompactPrompt() }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: `Why does Claude Code send this?\n\n${driftedCompactPrompt()}\n\nExplain it.`,
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: `QUOTED PROMPT: ${driftedCompactPrompt('Return only plain text. Never invoke any tools.')}`,
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: driftedCompactPrompt('STOP: Respond with plain text only. Do not call any tools.'),
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: [
+              'Return only plain text. Never invoke any tools.',
+              '- Tool calls will be REJECTED and nothing else.',
+            ].join('\n'),
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: [
+              'Return only plain text. Never invoke any tools.',
+              `This prose quotes "${'- Tool calls will be REJECTED and will waste your only turn'}" for discussion.`,
+            ].join('\n'),
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: [
+              `Respond with plain text only. Never ${'delay '.repeat(12)}invoke tools.`,
+              '- Tool calls will be REJECTED and will waste your only turn — explain this.',
+            ].join('\n'),
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: [
+              `Respond with plain text only. Never invoke tools. ${'Continue briefly. '.repeat(10)}`,
+              '- Tool calls will be REJECTED and will waste your only turn — explain this.',
+            ].join('\n'),
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: [
+              'Respond quickly, do not stop.',
+              '- Tool calls will be REJECTED and will waste your only turn — explain this.',
+            ].join('\n'),
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: [
+              'Respond immediately. Do not call any tools.',
+              '- Tool calls will be REJECTED and will waste your only turn — explain this.',
+            ].join('\n'),
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: [
+              'Respond with plain text only. Be concise.',
+              '- Tool calls will be REJECTED and will waste your only turn — explain this.',
+            ].join('\n'),
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: [
+              'Respondent: use plain text only and do not call tools.',
+              '- Tool calls will be REJECTED and will waste your only turn — explain this.',
+            ].join('\n'),
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: [
+              'Respond with plain text only. Never invoke any tools.',
+              '- Tool calls are discussed here, but this is not the compaction instruction.',
+            ].join('\n'),
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: [
+              { type: 'tool_result', tool_use_id: 'call_1', content: driftedCompactPrompt() },
+              { type: 'text', text: 'summarize that file for me' },
+            ],
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: `${CC_COMPACT_HEAD}\n\nSummarise the work.\n\nAnswer in plain text only.`,
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: `CRITICAL: Respond with TEXT ONLY when you summarise, but run tests first.${CC_COMPACT_TAIL}`,
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: [
+              { type: 'text', text: `${CC_COMPACT_HEAD}\n\nis what it opens with.` },
+              { type: 'text', text: `and it closes with${CC_COMPACT_TAIL}` },
+            ],
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: `Why does Claude Code send this?\n\n${ccCompactPrompt}`,
+          }],
+        },
+        {
+          ...base,
+          messages: [{
+            role: 'user' as const,
+            content: [
+              { type: 'text', text: 'IMPORTANT: Return only plain text. Never invoke any tools.' },
+              {
+                type: 'text',
+                text: '- Tool calls will be REJECTED and will waste your only turn — explain this.',
+              },
+            ],
+          }],
+        },
+        {
+          ...base,
+          messages: [
+            { role: 'user' as const, content: driftedCompactPrompt() },
+            { role: 'assistant' as const, content: '<summary>earlier work</summary>' },
+            { role: 'user' as const, content: 'now finish the refactor' },
+          ],
+        },
+        {
+          ...base,
+          messages: [
+            { role: 'user' as const, content: 'quote the old compaction instructions' },
+            { role: 'assistant' as const, content: driftedCompactPrompt() },
+          ],
+        },
+      ];
+
+      for (const request of requests) {
+        translateRequest(request, '@ai-sdk/openai', { openAiOAuth: true, log: m => traces.push(m) });
+      }
+      expect(notices).toEqual([]);
+      expect(traces).toEqual([]);
+    } finally {
+      resetCompactPromptDriftWarningsForTests();
+      releaseNotices();
+    }
+  });
+
+  it('disables tools for a compact request from a session that has no StructuredOutput tool', () => {
+    // The dominant shape on the wire: Claude Code merges the compact prompt into
+    // the preceding tool_result turn, so the final user message is
+    // [tool_result, text]. 193 of 194 real compact requests in the local
+    // diagnostics ledgers arrive exactly like this.
+    const blockContent = translateRequest({
+      model: 'gpt-5.6-sol',
+      messages: [
+        { role: 'user', content: 'run the build' },
+        {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'call_133', name: 'Bash', input: { command: 'make' } }],
+        },
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'call_133', content: 'build output' },
+            { type: 'text', text: ccCompactPrompt },
+          ],
+        },
+      ],
+      tools: shellSessionTools,
+      tool_choice: { type: 'auto' },
+    }, '@ai-sdk/openai', { openAiOAuth: true });
+
+    expect(blockContent.toolChoice).toBe('none');
+    // Definitions stay so the cached prompt prefix still matches.
+    expect(blockContent.tools && Object.keys(blockContent.tools)).toEqual(['Bash', 'Read', 'Grep']);
+
+    // The other observed shape (1 of 194): another text block precedes the
+    // prompt. The envelope has to be found per block, not in the joined text —
+    // and Claude Code appends reminder blocks after it as well, so neither the
+    // first nor the last block can be the only one inspected.
+    for (const content of [
+      [
+        { type: 'text', text: '<system-reminder>Plan mode is active.</system-reminder>' },
+        { type: 'text', text: ccCompactPrompt },
+      ],
+      [
+        { type: 'tool_result', tool_use_id: 'call_1', content: 'build output' },
+        { type: 'text', text: `${ccCompactPrompt}\n` },
+        { type: 'text', text: '<system-reminder>Background task finished.</system-reminder>' },
+      ],
+    ]) {
+      const siblingBlocks = translateRequest({
+        model: 'gpt-5.6-sol',
+        messages: [{ role: 'user', content }],
+        tools: shellSessionTools,
+        tool_choice: { type: 'auto' },
+      }, '@ai-sdk/openai', { openAiOAuth: true });
+      expect(siblingBlocks.toolChoice).toBe('none');
+    }
+
+    // Claude Code builds the compact prompt as a single string message; assert
+    // the plain-string arrival shape too, not only the block-array one.
+    const stringContent = translateRequest({
+      model: 'gpt-5.6-sol',
+      messages: [{ role: 'user', content: ccCompactPrompt }],
+      tools: shellSessionTools,
+      tool_choice: { type: 'any' },
+    }, '@ai-sdk/openai', { openAiOAuth: true });
+
+    expect(stringContent.toolChoice).toBe('none');
+    expect(stringContent.tools && Object.keys(stringContent.tools)).toEqual(['Bash', 'Read', 'Grep']);
+
+    // The manual /compact builder emits the same envelope around a different
+    // body, and its "Additional Instructions" variant appends after the body,
+    // before the reminder. Both must still be recognised.
+    for (const variant of [
+      `${CC_COMPACT_HEAD}\n\nSummarize the conversation up to the selected message.${CC_COMPACT_TAIL}`,
+      `${CC_COMPACT_HEAD}\n\nYour task is to create a detailed summary.`
+        + `\n\nAdditional Instructions:\nfocus on the auth work${CC_COMPACT_TAIL}`,
+    ]) {
+      const manual = translateRequest({
+        model: 'gpt-5.6-sol',
+        messages: [{ role: 'user', content: variant }],
+        tools: shellSessionTools,
+        tool_choice: { type: 'auto' },
+      }, '@ai-sdk/openai', { openAiOAuth: true });
+      expect(manual.toolChoice).toBe('none');
+    }
+  });
+
+  it('ignores a compact envelope that is quoted rather than issued', () => {
+    // Claude Code's prompt always OPENS its text block. Everything below merely
+    // contains the envelope: a user pasting it, an agent's report repeating it,
+    // and a file read whose content is this repo's own source. Each must keep
+    // its tools — the last one is why the envelope has to be anchored, since
+    // clodex's own sources carry both markers verbatim.
+    const quoted = [
+      `Why does Claude Code send this?\n\n${ccCompactPrompt}\n\nCheck the bundle and tell me.`,
+      `[agent report] I verified the envelope. It reads:\n${ccCompactPrompt}\nBoth markers matched.`,
+    ];
+    for (const content of quoted) {
+      const params = translateRequest({
+        model: 'gpt-5.6-sol',
+        messages: [{ role: 'user', content }],
+        tools: shellSessionTools,
+        tool_choice: { type: 'auto' },
+      }, '@ai-sdk/openai', { openAiOAuth: true });
+      expect(params.toolChoice).toBe('auto');
+    }
+
+    // Same text arriving as a text block alongside a tool_result, which is the
+    // shape a file read or a subagent result actually takes.
+    const quotedBlock = translateRequest({
+      model: 'gpt-5.6-sol',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'call_1', content: 'ok' },
+          { type: 'text', text: `Here is what the file said:\n${ccCompactPrompt}` },
+        ],
+      }],
+      tools: shellSessionTools,
+      tool_choice: { type: 'auto' },
+    }, '@ai-sdk/openai', { openAiOAuth: true });
+    expect(quotedBlock.toolChoice).toBe('auto');
+
+    // The tool_result channel is deliberately not searched at all: a Read or a
+    // Bash `cat` of a file holding the envelope must never disarm the turn.
+    for (const content of [
+      ccCompactPrompt,
+      [{ type: 'text', text: ccCompactPrompt }] as unknown as string,
+    ]) {
+      const viaToolResult = translateRequest({
+        model: 'gpt-5.6-sol',
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'call_1', content },
+            { type: 'text', text: 'summarize that file for me' },
+          ],
+        }],
+        tools: shellSessionTools,
+        tool_choice: { type: 'auto' },
+      }, '@ai-sdk/openai', { openAiOAuth: true });
+      expect(viaToolResult.toolChoice).toBe('auto');
+    }
+
+    // Both markers must be in the SAME block. Claude Code builds one string, so
+    // header in one block and reminder in another is someone else's text.
+    const splitAcrossBlocks = translateRequest({
+      model: 'gpt-5.6-sol',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: `${CC_COMPACT_HEAD}\n\nis what it opens with.` },
+          { type: 'text', text: `and it closes with${CC_COMPACT_TAIL}` },
+        ],
+      }],
+      tools: shellSessionTools,
+      tool_choice: { type: 'auto' },
+    }, '@ai-sdk/openai', { openAiOAuth: true });
+    expect(splitAcrossBlocks.toolChoice).toBe('auto');
+
+    // Near misses. Each marker has to stay a whole sentence: a message that
+    // merely opens the same way, or that ends with the same phrase, is ordinary
+    // prose and must keep its tools.
+    const nearMisses = [
+      'Respond with TEXT ONLY where you can, and keep to plain text only if possible.',
+      // Opens like the header, then diverges — only a truncated header matches.
+      `CRITICAL: Respond with TEXT ONLY when you summarise, but run the tests first.`
+        + `${CC_COMPACT_TAIL}`,
+      // Real header, but the closing reminder is ordinary prose.
+      `${CC_COMPACT_HEAD}\n\nSummarise the work.\n\nAnswer in plain text only.`,
+    ];
+    for (const content of nearMisses) {
+      const params = translateRequest({
+        model: 'gpt-5.6-sol',
+        messages: [{ role: 'user', content }],
+        tools: shellSessionTools,
+        tool_choice: { type: 'auto' },
+      }, '@ai-sdk/openai', { openAiOAuth: true });
+      expect(params.toolChoice).toBe('auto');
+    }
+  });
+
+  it('leaves tool choice alone on an ordinary turn carrying the same tools', () => {
+    const auto = translateRequest({
+      model: 'gpt-5.6-sol',
+      messages: [
+        { role: 'user', content: 'summarize the conversation so far, then keep going' },
+      ],
+      tools: shellSessionTools,
+      tool_choice: { type: 'auto' },
+    }, '@ai-sdk/openai', { openAiOAuth: true });
+    expect(auto.toolChoice).toBe('auto');
+
+    const required = translateRequest({
+      model: 'gpt-5.6-sol',
+      messages: [{ role: 'user', content: 'do not call any tools, just answer' }],
+      tools: shellSessionTools,
+      tool_choice: { type: 'any' },
+    }, '@ai-sdk/openai', { openAiOAuth: true });
+    expect(required.toolChoice).toBe('required');
+
+    const named = translateRequest({
+      model: 'gpt-5.6-sol',
+      messages: [{ role: 'user', content: 'read the file' }],
+      tools: shellSessionTools,
+      tool_choice: { type: 'tool', name: 'Read' },
+    }, '@ai-sdk/openai', { openAiOAuth: true });
+    expect(named.toolChoice).toEqual({ type: 'tool', toolName: 'Read' });
+
+    // Both markers are required. The existing structured-output case pins the
+    // head-only half; this pins the tail-only half.
+    const tailOnly = translateRequest({
+      model: 'gpt-5.6-sol',
+      messages: [{ role: 'user', content: `quote it back to me:${CC_COMPACT_TAIL}` }],
+      tools: shellSessionTools,
+      tool_choice: { type: 'auto' },
+    }, '@ai-sdk/openai', { openAiOAuth: true });
+    expect(tailOnly.toolChoice).toBe('auto');
+
+    // A trailing assistant prefill is not a compact turn, whatever it contains.
+    const prefill = translateRequest({
+      model: 'gpt-5.6-sol',
+      messages: [
+        { role: 'user', content: 'echo the compaction preamble' },
+        { role: 'assistant', content: ccCompactPrompt },
+      ],
+      tools: shellSessionTools,
+      tool_choice: { type: 'auto' },
+    }, '@ai-sdk/openai', { openAiOAuth: true });
+    expect(prefill.toolChoice).toBe('auto');
+
+    // The markers only count on the FINAL user message — an earlier compact
+    // envelope left in history must not disarm a later real turn.
+    const historic = translateRequest({
+      model: 'gpt-5.6-sol',
+      messages: [
+        { role: 'user', content: ccCompactPrompt },
+        { role: 'assistant', content: '<summary>earlier work</summary>' },
+        { role: 'user', content: 'now finish the refactor' },
+      ],
+      tools: shellSessionTools,
+      tool_choice: { type: 'auto' },
+    }, '@ai-sdk/openai', { openAiOAuth: true });
+    expect(historic.toolChoice).toBe('auto');
+  });
 });
 
 describe('generateAnthropicResponse', () => {
@@ -699,7 +1385,8 @@ describe('generateAnthropicResponse', () => {
       finishReason: 'stop',
       usage: { inputTokens: 1, outputTokens: 1 },
     }));
-    vi.doMock('ai', () => ({
+    vi.doMock('ai', async () => ({
+      ...(await vi.importActual<typeof import('ai')>('ai')),
       generateText,
       streamText: vi.fn(),
       tool: vi.fn((spec: unknown) => spec),
@@ -728,7 +1415,8 @@ describe('generateAnthropicResponse', () => {
       yield { type: 'finish', finishReason: 'stop' };
     }
     const streamText = vi.fn(() => ({ stream: stream() }));
-    vi.doMock('ai', () => ({
+    vi.doMock('ai', async () => ({
+      ...(await vi.importActual<typeof import('ai')>('ai')),
       generateText: vi.fn(),
       streamText,
       tool: vi.fn((spec: unknown) => spec),
@@ -768,7 +1456,8 @@ describe('generateAnthropicResponse', () => {
         inputTokenDetails: { cacheReadTokens: 280_000, cacheWriteTokens: 1_000 },
       },
     }));
-    vi.doMock('ai', () => ({
+    vi.doMock('ai', async () => ({
+      ...(await vi.importActual<typeof import('ai')>('ai')),
       generateText,
       streamText: vi.fn(),
       tool: vi.fn((spec: unknown) => spec),
@@ -803,7 +1492,8 @@ describe('generateAnthropicResponse', () => {
       finishReason: 'stop',
       usage: undefined,
     }));
-    vi.doMock('ai', () => ({
+    vi.doMock('ai', async () => ({
+      ...(await vi.importActual<typeof import('ai')>('ai')),
       generateText,
       streamText: vi.fn(),
       tool: vi.fn((spec: unknown) => spec),
@@ -833,7 +1523,8 @@ describe('generateAnthropicResponse', () => {
         totalUsage: { inputTokens: 300_000, outputTokens: 5 },
       };
     }
-    vi.doMock('ai', () => ({
+    vi.doMock('ai', async () => ({
+      ...(await vi.importActual<typeof import('ai')>('ai')),
       generateText: vi.fn(),
       streamText: vi.fn(() => ({ stream: stream() })),
       tool: vi.fn((spec: unknown) => spec),
@@ -867,7 +1558,8 @@ describe('generateAnthropicResponse', () => {
       finishReason: 'tool-calls',
       usage: { inputTokens: 1, outputTokens: 2 },
     }));
-    vi.doMock('ai', () => ({
+    vi.doMock('ai', async () => ({
+      ...(await vi.importActual<typeof import('ai')>('ai')),
       generateText,
       streamText: vi.fn(),
       tool: vi.fn((spec: unknown) => spec),
@@ -900,7 +1592,8 @@ describe('generateAnthropicResponse', () => {
       });
     }
     const streamText = vi.fn(() => result);
-    vi.doMock('ai', () => ({
+    vi.doMock('ai', async () => ({
+      ...(await vi.importActual<typeof import('ai')>('ai')),
       generateText,
       streamText,
       tool: vi.fn((spec: unknown) => spec),
@@ -948,7 +1641,8 @@ describe('generateAnthropicResponse', () => {
       yield { type: 'error', error: upstreamError };
     }
     const streamText = vi.fn(() => ({ stream: stream() }));
-    vi.doMock('ai', () => ({
+    vi.doMock('ai', async () => ({
+      ...(await vi.importActual<typeof import('ai')>('ai')),
       generateText: vi.fn(),
       streamText,
       tool: vi.fn((spec: unknown) => spec),
@@ -984,7 +1678,8 @@ describe('generateAnthropicResponse', () => {
       usage: Promise.resolve({ inputTokens: 0, outputTokens: 0 }),
       stream: stream(),
     }));
-    vi.doMock('ai', () => ({
+    vi.doMock('ai', async () => ({
+      ...(await vi.importActual<typeof import('ai')>('ai')),
       generateText: vi.fn(),
       streamText,
       tool: vi.fn((spec: unknown) => spec),
@@ -1014,7 +1709,8 @@ describe('streamAnthropicResponse idle timeout', () => {
       yield { type: 'finish', finishReason: 'stop' };
     }
     const streamText = vi.fn(() => ({ stream: stream() }));
-    vi.doMock('ai', () => ({
+    vi.doMock('ai', async () => ({
+      ...(await vi.importActual<typeof import('ai')>('ai')),
       generateText: vi.fn(),
       streamText,
       tool: vi.fn((spec: unknown) => spec),
@@ -1044,7 +1740,8 @@ describe('streamAnthropicResponse idle timeout', () => {
       options.onStepFinish?.({ warnings: [{ type: 'unsupported', feature: 'serviceTier' }] });
       return { stream: stream() };
     });
-    vi.doMock('ai', () => ({
+    vi.doMock('ai', async () => ({
+      ...(await vi.importActual<typeof import('ai')>('ai')),
       generateText: vi.fn(),
       streamText,
       tool: vi.fn((spec: unknown) => spec),
@@ -1088,7 +1785,8 @@ describe('streamAnthropicResponse idle timeout', () => {
       });
     }
     const streamText = vi.fn(() => result);
-    vi.doMock('ai', () => ({
+    vi.doMock('ai', async () => ({
+      ...(await vi.importActual<typeof import('ai')>('ai')),
       generateText: vi.fn(),
       streamText,
       tool: vi.fn((spec: unknown) => spec),
@@ -1285,6 +1983,97 @@ describe('writeAnthropicStream', () => {
     }
 
     await expect(writeAnthropicStream(parts() as any, 'm', () => {})).rejects.toBe(upstreamError);
+  });
+
+  const transportDropFrame = {
+    type: 'error',
+    sequence_number: 3,
+    error: {
+      type: 'transport_error',
+      code: 'websocket_transport_error',
+      message: 'WebSocket closed (1006)',
+      param: null,
+    },
+  };
+
+  async function collectUntilError(parts: AsyncIterable<unknown>): Promise<{ events: string[]; error: unknown }> {
+    let raw = '';
+    let error: unknown;
+    try {
+      await writeAnthropicStream(parts as any, 'm', c => { raw += c; });
+    } catch (err) {
+      error = err;
+    }
+    const events = raw.split('\n\n').filter(Boolean).map(block => block.split('\n')[0]!.replace('event: ', ''));
+    return { events, error };
+  }
+
+  it('leaves an open thinking block unclosed when the transport drops mid-stream', async () => {
+    async function* parts() {
+      yield { type: 'reasoning-start', id: 'r1' };
+      yield { type: 'reasoning-delta', id: 'r1', text: 'thinking...' };
+      yield { type: 'error', error: transportDropFrame };
+    }
+
+    const { events, error } = await collectUntilError(parts());
+    expect(error).toBe(transportDropFrame);
+    expect(events).toEqual(['message_start', 'content_block_start', 'content_block_delta']);
+  });
+
+  it('still closes an open thinking block for a mid-stream provider error that is not a transport drop', async () => {
+    const providerError = {
+      type: 'error',
+      sequence_number: 3,
+      error: { type: 'server_error', code: 'server_error', message: 'upstream failed', param: null },
+    };
+    async function* parts() {
+      yield { type: 'reasoning-start', id: 'r1' };
+      yield { type: 'reasoning-delta', id: 'r1', text: 'thinking...' };
+      yield { type: 'error', error: providerError };
+    }
+
+    const { events, error } = await collectUntilError(parts());
+    expect(error).toBe(providerError);
+    expect(events).toEqual([
+      'message_start', 'content_block_start', 'content_block_delta', 'content_block_delta', 'content_block_stop',
+    ]);
+  });
+
+  it('still closes an open text block when the transport drops mid-stream', async () => {
+    async function* parts() {
+      yield { type: 'text-start', id: 't1' };
+      yield { type: 'text-delta', id: 't1', text: 'partial' };
+      yield { type: 'error', error: transportDropFrame };
+    }
+
+    const { events, error } = await collectUntilError(parts());
+    expect(error).toBe(transportDropFrame);
+    expect(events).toEqual(['message_start', 'content_block_start', 'content_block_delta', 'content_block_stop']);
+  });
+
+  it('still flushes and closes an open tool block when the transport drops mid-stream', async () => {
+    let raw = '';
+    let error: unknown;
+    async function* parts() {
+      yield { type: 'tool-input-start', id: 'call_1', toolName: 'Read' };
+      yield { type: 'tool-input-delta', id: 'call_1', delta: '{"path":' };
+      yield { type: 'error', error: transportDropFrame };
+    }
+    try {
+      await writeAnthropicStream(parts() as any, 'm', c => { raw += c; });
+    } catch (err) {
+      error = err;
+    }
+
+    expect(error).toBe(transportDropFrame);
+    const blocks = raw.split('\n\n').filter(Boolean).map(block => ({
+      event: block.split('\n')[0]!.replace('event: ', ''),
+      data: JSON.parse(block.split('\n')[1]!.replace('data: ', '')),
+    }));
+    expect(blocks.map(b => b.event)).toEqual([
+      'message_start', 'content_block_start', 'content_block_delta', 'content_block_stop',
+    ]);
+    expect(blocks[2]!.data.delta).toEqual({ type: 'input_json_delta', partial_json: '{"path":' });
   });
 
   it('reports every SDK stream part to the lifecycle observer', async () => {
@@ -1811,5 +2600,58 @@ describe('per-alias Codex fast mode', () => {
       releaseNotices();
       resetServiceTierWarningForTests();
     }
+  });
+});
+
+describe('translated message ids', () => {
+  // Claude Code anchors server-side thread continuation on an assistant message
+  // whose id starts with `msg_`: the next request then carries only the messages
+  // after it, with `thread:{type:"continue"}`. No translated upstream holds that
+  // thread, so a translated reply must never look like an anchor, or the follow-
+  // up after a tool call arrives upstream as a bare tool result and is rejected.
+  it('streams a message id Claude Code will not anchor a thread on', async () => {
+    const { events } = await collect([
+      { type: 'start' },
+      { type: 'text-start', id: 't1' },
+      { type: 'text-delta', id: 't1', text: 'Hello' },
+      { type: 'text-end', id: 't1' },
+      { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1 } },
+    ]);
+    const id = events.find(e => e.event === 'message_start')?.data.message.id;
+    expect(typeof id).toBe('string');
+    expect(id.startsWith('msg_')).toBe(false);
+  });
+
+  it('returns a non-streamed message id Claude Code will not anchor a thread on', async () => {
+    const provider = createOpenAI({
+      apiKey: 'synthetic-test-key',
+      fetch: async () => new Response(JSON.stringify({
+        id: 'resp_synthetic',
+        model: 'm',
+        output: [],
+        usage: {
+          input_tokens: 1,
+          input_tokens_details: { cached_tokens: 0 },
+          output_tokens: 0,
+          output_tokens_details: { reasoning_tokens: 0 },
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    });
+    const params = translateRequest({
+      model: 'm',
+      messages: [{ role: 'user', content: 'synthetic prompt' }],
+    }, '@ai-sdk/openai');
+    const message = await generateAnthropicResponse(provider.responses('m'), params, 'm') as { id: string };
+    expect(typeof message.id).toBe('string');
+    expect(message.id.startsWith('msg_')).toBe(false);
+  });
+
+  it('gives each translated message a random id, not a timestamp', async () => {
+    const first = await collect([{ type: 'start' }, { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1 } }]);
+    const second = await collect([{ type: 'start' }, { type: 'finish', finishReason: 'stop', totalUsage: { inputTokens: 1, outputTokens: 1 } }]);
+    const idOf = (r: typeof first) => r.events.find(e => e.event === 'message_start')?.data.message.id;
+    expect(idOf(first)).toMatch(/^clodex_[0-9a-f]{32}$/);
+    expect(idOf(second)).toMatch(/^clodex_[0-9a-f]{32}$/);
+    expect(idOf(first)).not.toBe(idOf(second));
   });
 });

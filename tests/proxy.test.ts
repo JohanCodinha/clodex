@@ -9,6 +9,8 @@ import { makeRouteResolver, resolveCatalogModelAliases } from '../src/catalog.js
 import { getProxyDebugLogPath } from '../src/trace-log.js';
 import { anthropicMessagesEndpoint, estimateAnthropicInputTokens } from '../src/anthropic-endpoints.js';
 import type { LocalProvider, ModelAlias } from '../src/types.js';
+import { resetCompactPromptDriftWarningsForTests } from '../src/sdk-adapter.js';
+import { installParentNoticeSink } from '../src/parent-notice.js';
 
 /** POST JSON to a local proxy via node:http (avoids vi.stubGlobal('fetch') interception). */
 function postToProxy(
@@ -800,6 +802,46 @@ describe('token counting', () => {
   });
 });
 
+/**
+ * The proxy's raw Anthropic relays stay silent about a request the client
+ * abandoned, and that silence is keyed on `clientDisconnected` rather than on
+ * `signal.aborted` — which is now true on the success path too. These pin the
+ * other side of the guard: a client that is still connected must still be told
+ * the upstream failed.
+ */
+describe('raw Anthropic relay error reporting', () => {
+  const unreachable: ProxyRoute = {
+    aliasId: 'anthropic-local__unreachable-model',
+    realModelId: 'unreachable-model',
+    displayName: 'Unreachable Model',
+    // Port 1 refuses immediately, so the relay fails without a client leaving.
+    upstreamUrl: 'http://127.0.0.1:1',
+    apiKey: 'provider-key',
+    modelFormat: 'anthropic',
+    providerId: 'local',
+  };
+
+  it.each([
+    ['messages', '/v1/messages'],
+    ['count_tokens', '/v1/messages/count_tokens'],
+  ] as const)('answers a connected client with 502 when the %s upstream is unreachable', async (_name, path) => {
+    const handle = await startProxyCatalog([unreachable], unreachable.aliasId, false);
+    try {
+      const res = await postToProxy(handle.port, handle.token, {
+        model: unreachable.aliasId,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      }, undefined, path);
+
+      expect(res.status).toBe(502);
+      expect(res.body).toContain('error');
+    } finally {
+      handle.close();
+    }
+  });
+});
+
 describe('translated request cancellation', () => {
   it('aborts the SDK provider request and records translation cancellation', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'clodex-sdk-cancel-'));
@@ -877,6 +919,58 @@ describe('translated request cancellation', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 20_000);
+});
+
+describe('compact-prompt drift trace logging', () => {
+  it('records every sighting on the default proxy translation route', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'clodex-compact-drift-proxy-'));
+    const debugLogPath = join(dir, 'debug.log');
+    const notices: string[] = [];
+    const releaseNotices = installParentNoticeSink(line => notices.push(line));
+    resetCompactPromptDriftWarningsForTests();
+    const route: ProxyRoute = {
+      aliasId: 'clodex:test:translated-model',
+      realModelId: 'translated-model',
+      displayName: 'Translated Model',
+      upstreamUrl: '',
+      apiKey: 'provider-key',
+      modelFormat: 'openai',
+      npm: 'missing-sdk-provider-for-test',
+      providerId: 'test-provider',
+    };
+    const handle = await startProxyCatalog(
+      [route],
+      route.aliasId,
+      true,
+      undefined,
+      debugLogPath,
+    );
+
+    try {
+      const response = await postToProxy(handle.port, handle.token, {
+        model: route.aliasId,
+        max_tokens: 100,
+        messages: [{
+          role: 'user',
+          content: [
+            'Return only plain text. Never invoke any tools.',
+            '- Tool calls will be REJECTED and will waste your only turn — you will fail the task.',
+          ].join('\n'),
+        }],
+        stream: false,
+      });
+
+      expect(response.status).toBe(502);
+      expect(readFileSync(debugLogPath, 'utf8'))
+        .toContain('possible Claude Code compact prompt drift: unknown-version');
+      expect(notices).toHaveLength(1);
+    } finally {
+      handle.close();
+      resetCompactPromptDriftWarningsForTests();
+      releaseNotices();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('SDK translated error logging', () => {
@@ -1105,6 +1199,123 @@ describe('SDK translated error logging', () => {
       handle.close();
       await new Promise<void>(resolve => upstream.close(() => resolve()));
       rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  /**
+   * Stub the OpenAI Responses transport with a stream that has produced only
+   * reasoning and then fails in-band — the exact frame shape the WebSocket
+   * transport emits when the upstream socket drops mid-response, at the point
+   * where Claude Code is still willing to retry (no visible content yet).
+   */
+  function stubMidStreamResponsesFailure(errorFrame: Record<string, unknown>): void {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      [
+        'data: {"type":"response.created","response":{"id":"resp_1","created_at":1,"model":"gpt-5.6-test"}}',
+        'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}',
+        'data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":0,"delta":"thinking"}',
+        `data: ${JSON.stringify(errorFrame)}`,
+        '',
+      ].join('\n\n'),
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+    )));
+  }
+
+  const responsesRoute: ProxyRoute = {
+    aliasId: 'clodex:test:responses-model',
+    realModelId: 'gpt-5.6-test',
+    displayName: 'Responses Model',
+    upstreamUrl: '',
+    apiKey: 'provider-key',
+    modelFormat: 'openai',
+    npm: '@ai-sdk/openai',
+    providerId: 'test-provider',
+  };
+
+  function midStreamErrorFrames(body: string): Array<{ type: string; error: { type: string; message: string } }> {
+    return body
+      .split('\n\n')
+      .filter(block => block.startsWith('event: error'))
+      .map(block => JSON.parse(block.split('\n')[1]!.replace('data: ', '')));
+  }
+
+  function eventNames(body: string): string[] {
+    return body.split('\n\n').filter(Boolean).map(block => block.split('\n')[0]!.replace('event: ', ''));
+  }
+
+  it('reports a mid-stream WebSocket transport drop as overloaded_error with the thinking block left open', async () => {
+    stubMidStreamResponsesFailure({
+      type: 'error',
+      sequence_number: 3,
+      error: {
+        type: 'transport_error',
+        code: 'websocket_transport_error',
+        message: 'WebSocket closed (1006)',
+        param: null,
+      },
+    });
+    const handle = await startProxyCatalog([responsesRoute], responsesRoute.aliasId, false);
+
+    try {
+      const res = await postToProxy(handle.port, handle.token, {
+        model: responsesRoute.aliasId,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+      });
+
+      // Output had already started, so the failure must arrive in-band, and
+      // the thinking block must not be closed first: a completed content
+      // block is what stops Claude Code from retrying the turn.
+      expect(res.status).toBe(200);
+      expect(res.body).toContain('"content_block":{"type":"thinking"');
+      expect(eventNames(res.body)).toEqual([
+        'message_start', 'content_block_start', 'content_block_delta', 'error',
+      ]);
+      const frames = midStreamErrorFrames(res.body);
+      expect(frames).toHaveLength(1);
+      expect(frames[0]).toEqual({
+        type: 'error',
+        error: { type: 'overloaded_error', message: 'WebSocket closed (1006) (HTTP 500)' },
+      });
+    } finally {
+      handle.close();
+      vi.unstubAllGlobals();
+    }
+  }, 20_000);
+
+  it('keeps api_error for a mid-stream provider failure that is not a transport drop', async () => {
+    stubMidStreamResponsesFailure({
+      type: 'error',
+      sequence_number: 3,
+      error: {
+        type: 'server_error',
+        code: 'server_error',
+        message: 'The server had an error while processing your request',
+        param: null,
+      },
+    });
+    const handle = await startProxyCatalog([responsesRoute], responsesRoute.aliasId, false);
+
+    try {
+      const res = await postToProxy(handle.port, handle.token, {
+        model: responsesRoute.aliasId,
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: true,
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toContain('"content_block":{"type":"thinking"');
+      expect(eventNames(res.body)).toEqual([
+        'message_start', 'content_block_start', 'content_block_delta', 'content_block_delta', 'content_block_stop', 'error',
+      ]);
+      const frames = midStreamErrorFrames(res.body);
+      expect(frames).toHaveLength(1);
+      expect(frames[0]!.error.type).toBe('api_error');
+    } finally {
+      handle.close();
+      vi.unstubAllGlobals();
     }
   }, 20_000);
 
@@ -1762,5 +1973,146 @@ describe('OAuth route credential resolution', () => {
     } finally {
       handle.close();
     }
+  });
+});
+
+describe('thread continuations on routes that cannot hold a thread', () => {
+  // Claude Code sends only the messages after its anchor, with
+  // thread:{type:"continue"}, trusting the server to hold the rest. Only
+  // Anthropic's API reached by raw passthrough does.
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const passthrough = (upstreamUrl: string): ProxyRoute => ({
+    aliasId: 'anthropic-opencode-go__qwen3.8-max',
+    realModelId: 'qwen3.8-max',
+    displayName: 'Qwen',
+    upstreamUrl,
+    apiKey: 'key',
+    modelFormat: 'anthropic',
+    providerId: 'opencode-go',
+  });
+
+  const continuation = (model: string) => ({
+    model,
+    max_tokens: 100,
+    stream: false,
+    messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'step-one' }] }],
+    thread: { type: 'continue', previous_message_id: 'msg_4c571f9f' },
+  });
+
+  const upstreamMessage = (id: string) => vi.fn(async () => new Response(
+    JSON.stringify({ id, type: 'message', role: 'assistant', model: 'qwen3.8-max', content: [], usage: { input_tokens: 1, output_tokens: 1 } }),
+    { status: 200, headers: { 'Content-Type': 'application/json' } },
+  ));
+
+  async function post(route: ProxyRoute, body: unknown) {
+    const handle = await startProxyCatalog([route], route.aliasId, false);
+    try {
+      return await postToProxy(handle.port, handle.token, body);
+    } finally {
+      handle.close();
+    }
+  }
+
+  it('refuses a continuation to a non-Anthropic passthrough upstream without forwarding it', async () => {
+    const fetchMock = upstreamMessage('msg_unused');
+    vi.stubGlobal('fetch', fetchMock);
+    const route = passthrough('https://opencode.ai/zen/go');
+    const res = await post(route, continuation(route.aliasId));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(400);
+    expect(JSON.parse(res.body).error.details.error_code).toBe('thread_unsupported_request');
+  });
+
+  it('refuses a continuation on a translated route without calling the provider', async () => {
+    const fetchMock = upstreamMessage('msg_unused');
+    vi.stubGlobal('fetch', fetchMock);
+    const route: ProxyRoute = {
+      aliasId: 'anthropic-kilo__tencent/hy3:free',
+      realModelId: 'tencent/hy3:free',
+      displayName: 'Tencent Hy3',
+      upstreamUrl: '',
+      apiKey: '',
+      modelFormat: 'openai',
+      npm: 'missing-sdk-provider-for-test',
+      baseURL: 'https://api.kilo.ai/api/gateway',
+      providerId: 'kilo',
+    };
+    const res = await post(route, continuation(route.aliasId));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(400);
+    expect(JSON.parse(res.body).error.details.error_code).toBe('thread_unsupported_request');
+  });
+
+  it('refuses a continuation on a translated route even when its upstream is Anthropic', async () => {
+    // The SDK rebuilds the request and does not send `thread`, so even
+    // Anthropic would receive only the fragment.
+    const fetchMock = upstreamMessage('msg_unused');
+    vi.stubGlobal('fetch', fetchMock);
+    const route: ProxyRoute = {
+      aliasId: 'anthropic-acme__claude-via-sdk',
+      realModelId: 'claude-via-sdk',
+      displayName: 'Claude via SDK',
+      upstreamUrl: 'https://api.anthropic.com',
+      apiKey: 'key',
+      modelFormat: 'openai',
+      npm: 'missing-sdk-provider-for-test',
+      providerId: 'acme',
+    };
+    const res = await post(route, continuation(route.aliasId));
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(400);
+    expect(JSON.parse(res.body).error.details.error_code).toBe('thread_unsupported_request');
+  });
+
+  it.each([
+    ['a user-text fragment', { messages: [{ role: 'user', content: 'Now apply the same rule to the next item.' }] }],
+    ['a streaming request', { stream: true }],
+    ['an anchor id without the msg_ prefix', { thread: { type: 'continue', previous_message_id: 'req-header-anchor' } }],
+  ])('refuses a continuation carrying %s, whatever its content', async (_label, overrides) => {
+    const fetchMock = upstreamMessage('msg_unused');
+    vi.stubGlobal('fetch', fetchMock);
+    const route = passthrough('https://opencode.ai/zen/go');
+    const res = await post(route, { ...continuation(route.aliasId), ...overrides });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(400);
+    expect(JSON.parse(res.body).error.details.error_code).toBe('thread_unsupported_request');
+  });
+
+  it('forwards a continuation to Anthropic with its thread intact and keeps its message id', async () => {
+    const fetchMock = upstreamMessage('msg_01AnthropicOwn');
+    vi.stubGlobal('fetch', fetchMock);
+    const route = passthrough('https://api.anthropic.com');
+    const res = await post(route, continuation(route.aliasId));
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(String(init.body)).thread).toEqual({ type: 'continue', previous_message_id: 'msg_4c571f9f' });
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.body).id).toBe('msg_01AnthropicOwn');
+  });
+
+  it('forwards a full-history thread create to a non-Anthropic upstream and replaces its msg_ id', async () => {
+    const fetchMock = upstreamMessage('msg_8ed0ab5b-cb18-401d-aa24-f6b6d3b048e7');
+    vi.stubGlobal('fetch', fetchMock);
+    const route = passthrough('https://opencode.ai/zen/go');
+    const create = {
+      model: route.aliasId,
+      max_tokens: 100,
+      stream: false,
+      messages: [
+        { role: 'user', content: 'Run echo step-one.' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'echo step-one' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'step-one' }] },
+      ],
+      thread: { type: 'create' },
+    };
+    const res = await post(route, create);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(String(init.body)).messages).toHaveLength(3);
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.body).id).toMatch(/^clodex_[0-9a-f]{32}$/);
   });
 });

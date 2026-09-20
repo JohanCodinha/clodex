@@ -37,10 +37,163 @@ describe('registry/refresh-models', () => {
 
   afterEach(() => {
     global.fetch = originalFetch;
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
+  function bodyStalledUntilAbort(init?: RequestInit): Promise<never> {
+    const signal = init?.signal;
+    return new Promise<never>((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+  }
+
+  async function expectSettledAfterTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+    const pending = Symbol('pending');
+    let outcome: T | unknown = pending;
+    void operation.then(
+      value => { outcome = value; },
+      error => { outcome = error; },
+    );
+
+    await vi.advanceTimersByTimeAsync(timeoutMs - 1);
+    expect(outcome).toBe(pending);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(outcome).not.toBe(pending);
+    if (outcome instanceof Error) throw outcome;
+    return outcome as T;
+  }
+
   describe('refreshProviderModels (OpenAI OAuth 3-tier fetch)', () => {
+    it('aborts the catalog controller after a successful response body is consumed', async () => {
+      const mockRegistry: ProviderRegistry = {
+        version: 1,
+        providers: [{
+          id: 'openai-oauth',
+          templateId: 'openai',
+          name: 'OpenAI (ChatGPT)',
+          enabled: true,
+          authRef: 'keyring',
+          authType: 'oauth',
+          api: {},
+        }],
+      };
+      vi.mocked(io.loadRegistryStrict).mockReturnValue(mockRegistry);
+      let requestSignal: AbortSignal | undefined;
+      const json = vi.fn(async () => {
+        expect(requestSignal?.aborted).toBe(false);
+        return { models: [{ slug: 'gpt-4', title: 'GPT-4' }] };
+      });
+      vi.mocked(global.fetch).mockImplementationOnce(async (_input, init) => {
+        requestSignal = init?.signal ?? undefined;
+        return { ok: true, status: 200, json } as Response;
+      });
+
+      const result = await refreshProviderModels('openai-oauth', 'mock_token', mockRegistry);
+
+      expect(result).toEqual({
+        id: 'openai-oauth',
+        name: 'OpenAI (ChatGPT)',
+        ok: true,
+        modelCount: 1,
+        previousModelCount: undefined,
+        reason: undefined,
+      });
+      expect(json).toHaveBeenCalledOnce();
+      expect(requestSignal?.aborted).toBe(true);
+      expect(requestSignal?.reason).toBeInstanceOf(Error);
+      expect(requestSignal?.reason).toMatchObject({
+        name: 'Error',
+        message: 'OpenAI catalog request completed',
+      });
+    });
+
+    it('times out a stalled Codex catalog body before trying the general catalog', async () => {
+      vi.useFakeTimers();
+      const mockRegistry: ProviderRegistry = {
+        version: 1,
+        providers: [{
+          id: 'openai-oauth',
+          templateId: 'openai',
+          name: 'OpenAI',
+          enabled: true,
+          authRef: 'keyring',
+          authType: 'oauth',
+          api: {},
+        }],
+      };
+      vi.mocked(io.loadRegistryStrict).mockReturnValue(mockRegistry);
+      vi.mocked(global.fetch)
+        .mockImplementationOnce(async (_input, init) => ({
+          ok: true,
+          status: 200,
+          json: () => bodyStalledUntilAbort(init),
+        } as Response))
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: async () => ({ models: [{ slug: 'gpt-4', title: 'GPT-4' }] }),
+        } as Response);
+
+      const result = await expectSettledAfterTimeout(
+        refreshProviderModels('openai-oauth', 'mock_token', mockRegistry),
+        10_000,
+      );
+
+      expect(result).toMatchObject({ ok: true, modelCount: 1 });
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+      const codexSignal = vi.mocked(global.fetch).mock.calls[0]?.[1]?.signal as AbortSignal;
+      expect(codexSignal.aborted).toBe(true);
+      expect(codexSignal.reason).toMatchObject({
+        name: 'AbortError',
+        message: 'This operation was aborted',
+      });
+    });
+
+    it('times out a stalled general-catalog error body before using the static seed', async () => {
+      vi.useFakeTimers();
+      const mockRegistry: ProviderRegistry = {
+        version: 1,
+        providers: [{
+          id: 'openai-oauth',
+          templateId: 'openai',
+          name: 'OpenAI',
+          enabled: true,
+          authRef: 'keyring',
+          authType: 'oauth',
+          api: {},
+        }],
+      };
+      vi.mocked(io.loadRegistryStrict).mockReturnValue(mockRegistry);
+      vi.mocked(global.fetch)
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: async () => ({ models: [] }),
+        } as Response)
+        .mockImplementationOnce(async (_input, init) => ({
+          ok: false,
+          status: 500,
+          text: () => bodyStalledUntilAbort(init),
+        } as Response));
+
+      const result = await expectSettledAfterTimeout(
+        refreshProviderModels('openai-oauth', 'mock_token', mockRegistry),
+        10_000,
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.modelCount).toBeGreaterThan(0);
+      expect(global.fetch).toHaveBeenCalledTimes(2);
+      const generalSignal = vi.mocked(global.fetch).mock.calls[1]?.[1]?.signal as AbortSignal;
+      expect(generalSignal.aborted).toBe(true);
+      expect(generalSignal.reason).toMatchObject({
+        name: 'AbortError',
+        message: 'This operation was aborted',
+      });
+    });
+
     it('Tier 1: uses Codex endpoint if available', async () => {
       const mockRegistry: ProviderRegistry = {
         version: 1,
@@ -75,6 +228,118 @@ describe('registry/refresh-models', () => {
       const savedRegistry = vi.mocked(io.saveRegistry).mock.calls[0]?.[0] as ProviderRegistry;
       const models = savedRegistry.providers[0]?.modelsCache?.models;
       expect(models?.[0]?.id).toBe('gpt-4');
+    });
+
+    // A model id the seed table has never heard of must still arrive as a reasoning
+    // model. Deriving this from the id is what silently shipped gpt-6-astra and
+    // gpt-daybreak-blue-latest as non-reasoning: the effort the user picked was
+    // dropped, and the patched client offered no effort selector for them at all.
+    // Only an id ABSENT from the seed table reaches the changed default; a seeded id
+    // takes the seed branch instead. Keep this case on unseeded ids so it keeps
+    // testing the default rather than the seed.
+    it('treats an unrecognised Codex model as a reasoning model', async () => {
+      const mockRegistry: ProviderRegistry = {
+        version: 1,
+        providers: [{
+          id: 'openai-oauth',
+          templateId: 'openai',
+          name: 'OpenAI (ChatGPT)',
+          enabled: true,
+          authRef: 'keyring',
+          authType: 'oauth',
+          api: {},
+        }],
+      };
+      vi.mocked(io.loadRegistryStrict).mockReturnValue(mockRegistry);
+      vi.mocked(global.fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          models: [
+            { slug: 'gpt-something-not-invented-yet', title: 'future' },
+            { slug: 'gpt-8-codename', title: 'another' },
+            { slug: 'some-unversioned-codename', title: 'third' },
+          ],
+        }),
+      } as Response);
+
+      await refreshProviderModels('openai-oauth', 'mock_token', mockRegistry);
+
+      const savedRegistry = vi.mocked(io.saveRegistry).mock.calls[0]?.[0] as ProviderRegistry;
+      const models = savedRegistry.providers[0]?.modelsCache?.models ?? [];
+      expect(models).toHaveLength(3);
+      for (const model of models) {
+        expect(model.reasoning, `${model.id} should reason`).toBe(true);
+      }
+    });
+
+    // The Codex catalog reports effective_context_window_percent as null for every
+    // model it returns. Inventing a share here is what made clodex hand Claude Code
+    // a window 5% below the provider's real one, for no benefit: Claude Code already
+    // holds back a flat 33,000 tokens and applies no share of its own.
+    it('invents no context share when the catalog reports none', async () => {
+      const mockRegistry: ProviderRegistry = {
+        version: 1,
+        providers: [{
+          id: 'openai-oauth',
+          templateId: 'openai',
+          name: 'OpenAI (ChatGPT)',
+          enabled: true,
+          authRef: 'keyring',
+          authType: 'oauth',
+          api: {},
+        }],
+      };
+      vi.mocked(io.loadRegistryStrict).mockReturnValue(mockRegistry);
+      vi.mocked(global.fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          models: [
+            { slug: 'gpt-5.6-sol', title: 'Sol', context_window: 272000, max_context_window: 872000 },
+            { slug: 'gpt-brand-new', title: 'New', context_window: 272000 },
+          ],
+        }),
+      } as Response);
+
+      await refreshProviderModels('openai-oauth', 'mock_token', mockRegistry);
+
+      const saved = vi.mocked(io.saveRegistry).mock.calls[0]?.[0] as ProviderRegistry;
+      for (const model of saved.providers[0]?.modelsCache?.models ?? []) {
+        expect(model.effectiveContextPercent, model.id).toBeUndefined();
+      }
+    });
+
+    // Scope guard for the default above. Tier 2 is the general ChatGPT catalog — the
+    // web model picker — which carries plainly non-reasoning models, so the
+    // "only agentic models" premise that justifies the default does not hold there.
+    it('does not assume reasoning for the general ChatGPT catalog', async () => {
+      const mockRegistry: ProviderRegistry = {
+        version: 1,
+        providers: [{
+          id: 'openai-oauth',
+          templateId: 'openai',
+          name: 'OpenAI (ChatGPT)',
+          enabled: true,
+          authRef: 'keyring',
+          authType: 'oauth',
+          api: {},
+        }],
+      };
+      vi.mocked(io.loadRegistryStrict).mockReturnValue(mockRegistry);
+      // Tier 1 returns nothing, so discovery falls through to Tier 2.
+      vi.mocked(global.fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ models: [] }),
+      } as Response);
+      vi.mocked(global.fetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ models: [{ slug: 'gpt-4o', title: 'GPT-4o' }] }),
+      } as Response);
+
+      await refreshProviderModels('openai-oauth', 'mock_token', mockRegistry);
+
+      const savedRegistry = vi.mocked(io.saveRegistry).mock.calls[0]?.[0] as ProviderRegistry;
+      const models = savedRegistry.providers[0]?.modelsCache?.models ?? [];
+      expect(models.find(m => m.id === 'gpt-4o')?.reasoning).toBe(false);
     });
 
     it('Tier 2: falls back to general endpoint and filters unsupported if Codex fails', async () => {
@@ -312,7 +577,8 @@ describe('registry/refresh-models', () => {
       const sol = models.find(m => m.id === 'gpt-5.6-sol');
       expect(sol?.contextWindow).toBe(272_000);
       expect(sol?.maxContextWindow).toBe(872_000);
-      expect(sol?.effectiveContextPercent).toBe(95);
+      // Discovery no longer invents a share the catalog did not report.
+      expect(sol?.effectiveContextPercent).toBeUndefined();
       expect(sol?.pricingBoundary).toBe(272_000);
 
       // A discovered model outside the seed still gets no invented ceiling.
@@ -385,6 +651,20 @@ describe('registry/refresh-models', () => {
       expect(luna?.contextWindow).toBe(272_000);
       expect(luna?.useResponsesLite).toBe(true);
       expect(luna?.preferWebSockets).toBe(true);
+
+      // The same guarantee for the newer families. useResponsesLite is what decides
+      // whether the pinned Codex client version is sent at all, and without that
+      // header gpt-6-astra is refused outright — so a seed that loses the flag
+      // silently disconnects the model from the fix that makes it work.
+      for (const id of ['gpt-6-astra', 'gpt-daybreak-blue-latest']) {
+        const model = savedRegistry.providers[0]?.modelsCache?.models.find(m => m.id === id);
+        expect(model, `${id} missing from the seed`).toBeDefined();
+        expect(model?.useResponsesLite, id).toBe(true);
+        expect(model?.preferWebSockets, id).toBe(true);
+        expect(model?.contextWindow, id).toBe(272_000);
+        expect(model?.maxContextWindow, id).toBe(872_000);
+        expect(model?.reasoning, id).toBe(true);
+      }
     });
 
     it('returns error if OAuth token is missing', async () => {
@@ -436,7 +716,7 @@ describe('registry/refresh-models', () => {
     const savedRegistry = vi.mocked(io.saveRegistry).mock.calls[0]?.[0] as ProviderRegistry;
     const savedModel = savedRegistry.providers[0]?.modelsCache?.models[0];
     expect(result).toMatchObject({ ok: true, modelCount: 1 });
-    expect(savedModel?.cost).toEqual({ input: 0.435, output: 0.87, cache_read: 0.003625 });
+    expect(savedModel?.cost).toEqual({ input: 0.66, output: 1.98, cache_read: 0.022 });
     expect(pricing.enrichModelsWithPricing).not.toHaveBeenCalled();
   });
 

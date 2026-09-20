@@ -133,7 +133,8 @@ names an internal module (`adapter`, `transport`, `sdk`) where you have the choi
 ## Architecture map
 
 **Entry points:** `src/cli.ts` — arg parsing (`parseArgs`, `consumeBridgeModeFlag`), help texts, and
-dispatch for `claude`, `server`, `models`/`favorites`, `providers`, `patch` — and
+dispatch for `claude`, `server`, `models`/`favorites`, `providers`, `patch`,
+`install-vscode-launcher` — and
 `src/claude-wrapper.ts` (the `clodex-claude` bin). Every other module is a focused unit with no
 side effects at import time.
 
@@ -154,12 +155,21 @@ hand-rolled per-provider translation; don't add one. See `.claude/docs/translati
 
 These bite from outside the subsystem that owns them, so they live here rather than in a deep doc.
 
-- **Auto-compaction depends on the response-model echo.** The proxy-mode MITM forwards request
-  bodies **unrewritten** so responses echo the exact model id the client sent. Claude Code resolves
-  context windows from the response `model` field but uses the request alias for preflight —
-  substituting the canonical id in responses made patched/alias ids miss their window config,
-  auto-compact never fired, and agents died with "Prompt is too long". Endpoint mode's synthetic
-  `GET /v1/models` returns `context_window` per model so the status bar is accurate.
+- **The proxy-mode MITM forwards request bodies unrewritten** so responses echo the exact model id
+  the client sent. Substituting the canonical id made patched/alias ids miss their window config,
+  auto-compact never fired, and agents died with "Prompt is too long". Keep it that way.
+
+  **Keep the invariant; do not reuse the mechanism that used to be written here.** The claim that
+  Claude Code reads its window from the response `model` field does not hold in 2.1.261, and
+  repeating it cost a review. What the echo still buys is that the *request* id and the id the
+  client keys its own state on stay the same object — which is reason enough not to rewrite bodies.
+  Current internals live in `.claude/docs/claude-code-internals.md`; read that rather than
+  re-deriving, and re-stamp it when you verify against a new release.
+- **Report the provider's real context window; hold nothing back.** Claude Code already reserves
+  `min(maxOutputTokens, 20,000) + 13,000` below whatever window it is told — 33,000 for every clodex
+  identity — and applies no percentage of its own on the default path, so a window clodex
+  shrinks first is context the user simply loses. clodex once imposed a 95% share on ChatGPT OAuth
+  models; the catalog never asked for it. Honour a share a provider declares, never invent one.
 - **Anthropic-passthrough base URLs must NOT include `/v1`** — the Anthropic SDK appends
   `/v1/messages` itself.
 - **The alias IS the model identity** once a binary is patched: the short name is what lands in the
@@ -172,10 +182,17 @@ These bite from outside the subsystem that owns them, so they live here rather t
 - **`node-gyp-build` is a deliberate direct dependency that no clodex source imports.** Routine
   "remove the unused dependency" cleanup breaks fresh installs. Reason in
   `.claude/docs/patcher.md`.
-- **Every SDK generation entry point must resolve `CLODEX_UPSTREAM_MAX_RETRIES` through
-  `src/upstream-retry.ts`.** Adding a new streaming or non-streaming path without wiring it leaves
-  that path on a different retry policy than the rest. Details in
-  `.claude/docs/oauth-continuation.md`.
+- **clodex always installs package undici's global fetch dispatcher with HTTP/2 disabled**
+  (`installOutboundDispatcher()` at the top of `main()`), proxy env or not. Node 26's bundled
+  undici 8 negotiates HTTP/2 and keeps a dead pooled session forever after a fatal TLS alert, so
+  every request to that origin fails until restart (#233); Node 24 CI cannot see that. Do not gate
+  the install on proxy env again and do not drop the explicit `allowH2: false` because "undici 7
+  already defaults to it" — the option is what survives an undici 8 bump.
+- **Every AI SDK generation entry point must resolve its timeout and retry budget through
+  `src/upstream-retry.ts`.** Anthropic- and OpenAI-format `streamText` consumers abort at idle and
+  total deadlines; `generateText` consumers abort at total only. Cancellation remains cooperative
+  with the provider transport. Raw relays are not SDK generations and use no shared timeout. Details
+  in `.claude/docs/oauth-continuation.md`.
 
 ## Tests
 
@@ -210,6 +227,14 @@ and missed `linux-arm64`, `linux-arm64-musl` and `win32-arm64`. The probe now ap
 site to each build's own bundle; run it per format when you touch `src/patch-transforms.ts` too.
 
 **`claude -p` end-to-end tests are manual only — NEVER add them to the automated suite.**
+
+`tests/vscode-launcher.windows.test.ts` and `tests/wrapper-substitution.windows.test.ts` run only
+on the `windows-launcher` CI job (`windows-latest`, after `pnpm build`): the first compiles the
+Windows VS Code launcher with the runner's real `csc.exe` and drives the resulting `.exe`; the
+second patches a compiled fake `claude.exe` with the real `clodex patch` and proves the launcher
+runs it in place of a pristine copy, after pinning what Node reports about files on NTFS. Both are
+skipped everywhere else; `pnpm test` on macOS or Linux says nothing about them. See
+`.claude/docs/launch-and-wrapper.md`.
 
 ## Key constraints
 

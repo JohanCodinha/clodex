@@ -161,7 +161,10 @@ Two things that are easy to assume wrongly about the blob:
   `entryPointId` names the entry module directly and survives renames; the *name* is only how
   tweakcc happens to look it up.
 
-## Unknown-model context-window enforcement (verified 2.1.223+)
+## Unknown-model context-window enforcement (verified 2.1.223+, re-verified 2.1.261)
+
+In 2.1.261 the minified names are `RV` (gate) and `GS` (resolver); the pre-2.1.261 names below are
+`KJe` and `Q9` respectively. Names change every build — find these by behaviour, not by symbol.
 
 Enforcement hangs off a single gate: `KJe(e,t)` returns `Q9(e,t).source !== "auto"`. `Q9` returns
 `{window, configured, source}`; the enforcement branch and the fallthrough return the **identical**
@@ -180,7 +183,52 @@ startup notice (`if (n !== "unknown-model") return null`) and the auto-compact s
 labels the source and seeds its initial value differently. Both are **cosmetic**, so `KJe` remains the
 only behavioural gate — but the bundle already renders `model-default` as a first-class label.
 
-## The shared child-environment builder (verified 2.1.221, re-verified 2.1.239)
+## Where the context window and the compaction point come from (verified 2.1.261, darwin-arm64)
+
+Names are from 2.1.261 and will change; the constants will not.
+
+**Window** — `vp(model, betas)`, in order:
+1. the `/*ccpatch:ctx*/` table `clodex patch` injects (PATCH 7 anchors here, ahead of everything else)
+2. `JL()` — `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, but **only when `DISABLE_COMPACT` is truthy**. `Ie()`
+   accepts exactly `1`/`true`/`yes`/`on`, so `DISABLE_COMPACT=0` does not arm it.
+3. `ivn()` — clamp to 200,000 when the account's long-context credits are blocked
+4. `QL()`: `[1m]` suffix → 1e6 (via `tc`, itself gated on `KN()`) · 1m-beta header → 1e6 · served
+   model catalog (`svn`/`Ya`, clamped to 200,000 unless native-1M) — a per-model experiment `sCt`
+   is consulted *inside* this branch and outranks the catalog value · `_g()` native-1M → 1e6 ·
+   `sCt` again · **`CLAUDE_CODE_MAX_CONTEXT_TOKENS` when `XL(e)`** — no `DISABLE_COMPACT` needed;
+   this is the branch endpoint mode relies on, set by `src/env.ts`. `XL` is roughly "not an id the
+   baked catalog recognises", not literally "does not start with `claude-`" · else 200,000
+
+Getting step 2 and the `XL` branch confused is an easy mistake and has been made in this repo: the
+env var is read in **three** places with different preconditions — those two, plus `XS`, which
+gates the unrecognized-model startup notice on `eor()`, the deliberate union of both. Only the
+first two decide a window; `XS` is cosmetic.
+
+`GS()` then layers overrides. **No branch can exceed `vp`:** every override is `Math.min`'d against
+it, and the remaining branches return it unchanged. Order:
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` (validated 100,000–1,000,000, `source:"env"`) → settings →
+clientdata → experiment → model-default clamps → unknown-model → `auto`.
+
+**Compaction point** — `threshold = GS().window − min(maxOutputTokens, 20,000) − 13,000`. A flat
+reserve, 33,000 for every current model; there is **no percentage on the default path**.
+`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is a percent in `(0, 100]` — `parseFloat`, and anything outside
+that range, including `0`, is ignored silently applied as `Math.min(floor(effective × pct/100), effective − 13,000)` — it can only
+**lower** the threshold, and it multiplies the window *after* the 20,000 reserve, not the raw
+window. Identical in every cached bundle from 2.1.238 to 2.1.261. The one genuine
+percentage-of-window nearby (`0.2`) belongs to the speculative precompute arm, not the trigger.
+
+Because the reserve is flat, headroom as a *fraction* varies with window size: 16.5% at 200,000,
+12.1% at 272,000, 3.3% at 1,000,000.
+
+**The response body is not a source for the window.** A few consumers do read a model id off a
+response — one even calls `vp()` on it — but only to stamp a context window onto a cost record.
+None of them reach `GS`/`QF`/`MTe`/`RXo`, so nothing on the compaction path depends on the echo.
+The models-list fetch validates only `{id, display_name, description}`. The served-catalog lookup
+`Ya()` does prefer `runtime.max_input_tokens` over `context_window`, but in endpoint mode that
+lookup is unreachable anyway: it is gated on the Anthropic base URL being `api.anthropic.com`, and
+`src/env.ts` points the child at `127.0.0.1`.
+
+## The shared child-environment builder (verified 2.1.221, re-verified 2.1.239 and 2.1.260)
 
 The shared child-env builder — `pH()` in 2.1.221, with 14 call sites there and 16 in every 2.1.239
 build. The split that matters for bridge isolation:
@@ -193,14 +241,16 @@ env into its own binding (`r=<mod>.settingsColorEnv`) inside the opening `let`,
 builds of 2.1.239, which moved the agent-proxy env behind a registry lookup
 (`sUn.of(lr().host)`), turned the settings-colour binding into a **destructuring** declarator
 (`{settingsColorEnv:n}=e`), added a second computed deny list, and **deleted** the GitHub-Actions
-`INPUT_${…}` scrub from the tail entirely, and `Ai()`/`wi()`/`Es()`/`Rs()`/`Ti()` across the
-builds of 2.1.260, which stopped reading the remote flag through `process.env` at all
-(`i=a.CLAUDE_CODE_REMOTE===!0,l=i?…` off a module-level snapshot). That is why PATCH 10's anchor
-identifies the function by landmarks inside its body that survive all of that — a
-`.CLAUDE_CODE_REMOTE` read in the opening `let` (whatever object it is read from), the
-passthrough early-out `)return process.env;let <copy>={` (counted across the whole bundle), the
-back-referenced `return <copy>}` tail, and the required-literal, nested-function and brace-balance
-checks — rather than by counting bindings or by naming a statement upstream is free to delete.
+`INPUT_${…}` scrub from the tail entirely, and `Ai()`/`wi()`/`Es()`/`Rs()`/`Ti()` across the builds
+of 2.1.260, which stopped asking `process.env` whether it is running remote and reads the flag off
+the typed env accessor instead (`i=a.CLAUDE_CODE_REMOTE===!0`). That is why PATCH 10's anchor
+identifies the function by landmarks inside its body that survive all of that — the agent-proxy env
+it folds in (`getAgentProxyEnv`, spelled inline by every measured builder from 2.1.246 on, with the
+`CLAUDE_CODE_REMOTE` ternary the measured 2.1.238 builder uses still accepted as the alternative),
+the passthrough early-out `)return process.env;let <copy>={` (counted across the
+whole bundle), the back-referenced `return <copy>}` tail, and the required-literal, nested-function
+and brace-balance checks — rather than by counting bindings or by naming a statement upstream is
+free to delete.
 
 **Two paths overlay the child env AFTER PATCH 10's restore, and neither is inside the builder.**
 The merge is `{...<restored>,...<settingsColour>,...<agentProxy>,...<remote>}`, so the agent-proxy
@@ -235,6 +285,26 @@ built with `pH()` env.
 `utn() ? {...KIs(), ...Qdt()} : pH()`, and `KIs()` copies only
 `["HOME","LOGNAME","PATH","SHELL","TERM","USER"]`.
 
+### Process-wrapper host markers (verified 2.1.273, darwin-arm64; extension 2.1.267/2.1.273)
+
+The inspected VS Code extensions build their top-level Claude environment by setting
+`CLAUDE_CODE_ENTRYPOINT=claude-vscode` after configured environment variables, then deleting
+`CLAUDECODE` and `CLAUDE_CODE_CHILD_SESSION`. They invoke a configured
+`claudeProcessWrapper` as the executable with the bundled Claude path prepended to the SDK
+arguments. Main-chat wrapper stderr is logged to the **Claude VSCode** output channel with a
+`From claude: ...` prefix. The chat SDK uses that sanitized environment directly. Extension helper
+commands normally carry the same values but construct their environment as
+`{...process.env, ...sanitizedEnv}`. A deletion from the sanitized copy therefore cannot remove an
+ambient `CLAUDECODE` inherited by the extension host: in that unusual launch shape the chat remains
+top-level while helpers retain the marker.
+
+Nested CLI launch shapes differ. Tool, hook, and agent child environments set `CLAUDECODE` and/or
+`CLAUDE_CODE_CHILD_SESSION`. Background pty-host launches delete those markers but also pass their
+environment through the entrypoint scrubber, which removes `claude-vscode`, `claude-desktop`, and
+`claude-desktop-3p`. A wrapper can therefore identify the top-level VS Code shape by requiring the
+VS Code entrypoint and neither child marker; background pty hosts are excluded by the missing
+entrypoint rather than by a marker.
+
 ## `NO_PROXY` cannot solve child-env isolation (verified 2.1.221)
 
 It has **no process dimension** — parent and children read the same variables — and it is a denylist
@@ -260,6 +330,200 @@ this is why `src/parent-notice.ts` queues rather than paints. See
 Background pty hosts are started `detached: true` and resized via
 `process.kill(-process.pid, 'SIGWINCH')` to the process group — which is why the wrapper must `exec`
 rather than spawn.
+
+## Client-side stream deadlines (verified against 2.1.259)
+
+Claude Code applies its own deadlines independently of any server-side clodex timeout. Before
+response headers, proxy-mode requests default to the smaller of roughly 180s plus 1s per 32 KiB of
+request body and the Anthropic SDK's roughly 599s deadline. A foreign `ANTHROPIC_BASE_URL` does not
+use that custom first-byte watchdog, but the SDK still defaults to 600s.
+
+After headers, the byte-idle fallback is 180s for the first-party URL used in proxy mode and 300s
+for a foreign base URL used in endpoint mode. `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` and
+`CLAUDE_STREAM_FIRST_BYTE_TIMEOUT_MS` are bounded to 10s–30m. The separate event watchdog defaults
+to 300s and `CLAUDE_STREAM_IDLE_TIMEOUT_MS` can raise it beyond 30m, but the byte watchdog remains
+the effective ceiling unless `CLAUDE_ENABLE_BYTE_WATCHDOG=false`. `API_TIMEOUT_MS` controls the SDK
+request deadline. Raising a clodex server timeout alone never raises any of these client limits.
+
+## Mid-stream error retry gate (verified 2.1.261, darwin-arm64)
+
+What Claude Code does with an `event: error` frame that arrives after `message_start`, and why
+clodex leaves a thinking block open on a WebSocket transport drop. Byte offsets are into the
+extracted `claude-2.1.261-*.js` bundle.
+
+- **The frame becomes a status-less APIError.** The Anthropic SDK's SSE reader (@83888) throws
+  `new APIError(undefined, body, undefined, headers, body.error.type)`; `message` is the
+  JSON-stringified body. No HTTP status is attached, so nothing that keys on `status >= 500` fires.
+- **Retry keys on the type text, not the status.** `ED(e)` (@3409302) is
+  `status === 529 || message.includes('"type":"overloaded_error"')`. A status-less `api_error`
+  matches nothing; the request-level predicate (@7169742) has `if(!e.status)return!1` and the
+  streaming catch has no branch for it. Neither path retries a status-less `api_error`.
+- **A completed content block blocks the retry, whatever the type.** The streaming catch's outer gate
+  (@9501970) is `if(Ac.some(block => block.type !== 'fallback') || Kn)`; both are set by
+  `content_block_stop` (@9489300) for any non-fallback block, thinking included. Inside the gate,
+  visible content (`Un`, set on `content_block_start` of a non-thinking block) finalizes a partial
+  response; otherwise the gate's last statement (@9505233) throws with
+  `fallback_cause:"partial_yield"`. Neither path retries. Replaying clodex's own bytes to `claude -p`
+  gave one upstream request for a closed thinking block followed by `overloaded_error`, and one
+  for `api_error`.
+- **The retry lives past the gate.** `if(e instanceof APIError && ED(e))` (@9507262), log string
+  "Mid-stream 529 before content", retries the stream up to `Rle=3` times (@7156910) while `Un` is
+  false, then falls back to a non-streaming request. Eligible query sources (`$ve`, @2083457) are
+  `undefined`, every `agent:*`, `sdk`, and the named auxiliary sources. With a fallback model
+  configured, the switch happens only after the three retries are spent (@9508100). The same
+  replay with the thinking block left open gave four upstream requests.
+- **A subagent dies on its first API-error message** (`AgentApiErrorTerminationError`, @8197079,
+  thrown at @8203646) with no agent-level retry; partial-output recovery (@8197191) applies only
+  to `rate_limit`, `overloaded`, and `server_error` kinds.
+
+So for a transport drop to be recoverable, clodex must (a) label the frame `overloaded_error`
+(`anthropicErrorType` in `src/upstream-error.ts`) and (b) not emit `content_block_stop` for an
+open thinking block first (`case 'error'` in `src/sdk-adapter.ts`). Either alone is inert. Text
+and tool blocks are still closed: visible output already stops the retry, and a tool block's
+buffered arguments must be flushed.
+
+### Multiple thinking summaries (re-verified 2.1.263, darwin-arm64)
+
+In the pristine `claude-2.1.263-ef5d2909c8af49f3.js` bundle, the parser sets `la` on the
+start of a non-thinking, non-redacted-thinking, non-fallback block. A block stop pushes that
+block's assistant-message envelope into `dc` and sets `mr`, including for thinking. The catch first tests
+`dc.some(message => message.content.some(block => !isFallback(block))) || mr`.
+Inside this completed-content gate, an SSE server/overload error finalizes partial output
+only when `la` is true; its thinking-only case throws `Rb`, recording telemetry
+`fallback_cause: "partial_yield"` instead.
+The socket-error and watchdog branches have separate retry rules, but clodex's in-band
+`websocket_transport_error` is an API error, not a socket error at the client.
+
+The overload branch is still **after** that gate: `La instanceof Lt && AD(La)`, where
+`AD` (@3409360) accepts status 529 or the literal `"type":"overloaded_error"` in the
+message. With `la` false it increments `qp` and retries while `qp < Nle` (`Nle=3`,
+@7157194), for eligible query sources, then takes the non-streaming fallback unless disabled.
+Thus the ordinary exhausted path is three streaming attempts plus one non-streaming request,
+not four streaming attempts. A fallback model or low-priority capacity-wait policy can alter
+that path. The completed-content gate and overload branch are around @9502000–9509900.
+
+Leaving only the **last** thinking block open is insufficient if earlier summaries already
+closed blocks. Clodex now coalesces consecutive OpenAI Responses reasoning into one live
+thinking block, retaining original item/summary boundaries in an opaque signature envelope.
+The stream parser treats signatures as opaque strings (`sl.signature = hp.signature`) and appends
+thinking text verbatim; it does not understand or decode that envelope. This is not a guarantee
+of byte-exact request replay: immediately before sending a request, `oot`/`wZ` recursively scan
+all string values and replace lone UTF-16 surrogates with U+FFFD (@211704–212238 and @9461968).
+Clodex therefore keeps the original summary strings inside its JSON-encoded signature, whose
+escaped surrogate code units survive that sanitizer, rather than depending on unchanged display
+text or sanitizing individual deltas (which would break valid pairs split across deltas).
+
+## Voice dictation transport (verified 2.1.263, darwin-arm64)
+
+How the dictation client reaches the network, read from the extracted `claude-2.1.263-*.js` bundle
+while reviewing #188. This is why proxy mode must relay a WebSocket upgrade and endpoint mode does
+not have to.
+
+- **The voice URL never follows `ANTHROPIC_BASE_URL`.** The client dials
+  `VOICE_STREAM_BASE_URL || <oauth-config>.BASE_API_URL` with `https://` rewritten to `wss://`
+  (@27520823), path `/api/ws/speech_to_text/voice_stream`. That base is the OAuth-config module's
+  hardcoded `https://api.anthropic.com`; `ANTHROPIC_BASE_URL` appears 77 times in the bundle and
+  never in that module. So endpoint mode, which points `ANTHROPIC_BASE_URL` at the local gateway and
+  strips `HTTP(S)_PROXY`, sends voice straight to Anthropic and needs no gateway support.
+- **The socket is Bun's native WebSocket behind a `ws` shim, not npm `ws`.** The module imports
+  `ws` bare and passes `{headers, proxy, tls}`; the shim forwards those to Bun's client. The
+  `proxy` value comes from the same env resolver the HTTP client uses (the `HTTPS_PROXY` family,
+  honouring `NO_PROXY`), with nothing platform-specific, so macOS and Windows both CONNECT through
+  clodex in proxy mode. `tls.ca` is built explicitly from `NODE_EXTRA_CA_CERTS` plus bundled and
+  system roots (@1604656, @1605611, @1609521); there is no `rejectUnauthorized:false` on the path,
+  so a bad CA fails closed rather than silently.
+- **Nothing is sent before the 101.** `send()` drops frames unless `readyState === OPEN`, audio
+  captured while connecting is queued outside the socket, and the first frame (`KeepAlive`) is
+  written from the `open` handler. The client's parser `head` on an upgrade is therefore always
+  empty for this client; the relay's `head`/`upstreamHead` forwarding is hardening, not a
+  production path.
+- **Failure mapping.** An HTTP response instead of a 101 goes through the `unexpected-response`
+  handler (@27524262) and renders as `Voice stream error: WebSocket upgrade rejected with HTTP
+  <status>`; only 4xx is marked fatal, anything else is retried once after 250 ms. The friendly
+  "Voice connection failed. Check your network and try again." comes from a recording-level selector
+  (@27531209) that fires when a >2 s recording ends with audio but the socket never connected —
+  which is exactly what a hung handshake produces. The handshake itself sits on Bun's native
+  `BUN_CONFIG_WS_HANDSHAKE_TIMEOUT`, default 120 s.
+- **Why main hung (Node, not Claude Code).** An `http(s).Server` with no `upgrade` listener does
+  *not* close the connection on Node >= 22.11; it falls the request through to the ordinary request
+  handler. clodex's passthrough then made an `https.request` with no `upgrade` listener of its own,
+  so when the origin answered 101 Node destroyed that socket and `response` never fired, leaving
+  the client waiting on the 120 s timeout above. Verified on 22.11.0, 22.14.0 and 24.14.1.
+
+## Tool-call arguments are rewritten at ingest (verified 2.1.273; captured 2.1.267, 2.1.270, 2.1.273)
+
+The arguments a tool call is *echoed* with are not the arguments the model emitted. When an assistant
+message arrives from the API, the client rewrites every `tool_use.input` against the tool's schema
+and stores the rewritten form; the next request sends that. This is what #214 (defaults filled) and
+#225 (strings re-typed) reconcile in clodex. Line numbers are from
+`claude-2.1.273-darwin-arm64.js`; the bundle's own functions were executed with its zod (4.4.3) and
+the behaviour captured against a synthetic Anthropic-format server with each pristine binary in
+`~/.tweakcc`, in bypass mode, under `--allowedTools` and under `acceptEdits`.
+
+- **Where.** `Zq` (L12581) runs on every assistant message (call sites: four on L11543 and the
+  streamed tool-use path on L9596). For each `tool_use` whose tool is in the current tool list it
+  applies, inside one `try`:
+  1. `qKe` → `OYs` (L12552), a generic per-property repair that runs on **every** tool: a string
+     value is JSON-parsed and kept when the parse yields the kind the zod shape (or an MCP tool's
+     JSON schema, resolved by `cMt` — `type` string or array, `$ref` into `$defs`/`definitions`,
+     `anyOf`/`oneOf`, with array/object preferred, then string, then the first non-null scalar) declares
+     for that top-level property — array, object, boolean (no print-back check, one BOM strip), or a
+     finite number that prints back identically (`String(parsed) === raw`, integral for `integer`).
+     `optional`/`nullable`/`default` wrappers are unwrapped; a `preprocess` pipe resolves to
+     `"transform"` and is **skipped**, which is what limits coverage on built-ins. An annotation-only
+     property (`{description}`) counts as `"any"` and is re-typed too.
+  2. `rW` (L11539), per tool: **Read** re-types `offset` only through `UF` (`limit` stays a string —
+     captured); **Bash** runs the whole input through its strict schema, whose `timeout` carries
+     `_H` = `z.preprocess(UF)` (L9822: trim — which also strips U+FEFF — then
+     `/^[-+]?\d+(\.\d+)?$/` and `Number()`) and whose `run_in_background` /
+     `dangerouslyDisableSandbox` carry `sw` = `z.preprocess(k1)` (L7356: exactly `"true"`/`"false"`),
+     then rebuilds the object (also stripping a `cd <cwd> &&` prefix and rewriting `\\;` → `\;` in
+     `command`); **Edit** parses through its schema, filling `replace_all: false` and folding
+     `old_str`/`new_str` aliases; **Write**, **TaskOutput** (fills `block ?? true`,
+     `timeout ?? 30000`) and **ExitPlanMode** have their own cases.
+  If `rW` throws, the catch at L12581 keeps the `qKe` result and skips the per-tool step wholesale.
+  Bash's schema is a strict object, so **one uncoercible value or one unknown key means the
+  per-tool step is skipped and the transcript keeps the generic repair's output** — the scalar
+  strings untouched, unknown key included (captured: `foo:"bar"` echoed with every scalar
+  untouched). It does not drop the key; it is not necessarily the exact model input either, since
+  the generic repair (and its double-escaped-unicode pass) may already have changed another field.
+- **Which tools are re-typed on the transcript.** Bash (`timeout` and its two booleans, via `rW`),
+  Read (`offset` only), ToolSearch (`max_results`, plain schema → generic repair; captured `"5"`→`5`),
+  Agent (`run_in_background`, plain), TaskOutput (filled), Monitor/ExitWorktree/LSP/REPL (plain
+  scalars), and every MCP tool with a number/integer/boolean property. **Not** re-typed:
+  PowerShell, Grep and CronCreate — all their scalars are `_H`/`sw` preprocess pipes, which the
+  generic repair skips, and they have no `rW` case (captured: Grep `head_limit:"5"` echoed as a
+  string). ScheduleWakeup's `delaySeconds` is a pipe too; only its plain `stop`/`noop` are re-typed.
+- **The wire schema hides all of this.** Every pipe appears as plain `{type:"number"|"integer"|
+  "boolean"}`; 11 of the 12 built-in schemas carry `additionalProperties:false`. A server cannot tell
+  which client rule a property falls under.
+- **Not the permission path.** Bypass mode and `--allowedTools` echo identical rewritten arguments
+  (Bash and Edit, all three versions). The tool runner's `inputSchema.safeParse` (L10117,
+  `He=De.data` L10119) feeds permission checks and `tool.call`; neither it nor a decision's
+  `updatedInput` is written into `tool_use.input`.
+- **The wire-echo flag.** The raw wire input is also kept (`aFe`, L9197, as `wireToolInputs` on the
+  message). When `echoWireToolInputs` is on — `wI()` (L9197): env `CLAUDE_CODE_HUMBLE_HAMMOCK`, else
+  GrowthBook `tengu_humble_hammock`, default `false` — **and** the request builder's consistency
+  gate passes (L12575 → `sNr`, L12552; for Bash, `qYs` tolerates exactly the `UF`/`k1` coercions,
+  the `\;` rewrite and the cwd strip), the builder sends the raw input instead; the flag alone is
+  not sufficient. Captured with the env var set: Bash
+  echoes `"5000"` / `"false"` and Edit echoes without `replace_all`. clodex therefore normalizes both
+  sides rather than snapshotting one shape.
+
+Captured pairs (bypass mode, 2.1.273; identical on 2.1.267 and 2.1.270 where marked):
+
+| model emitted | echoed | |
+| --- | --- | --- |
+| Bash `{"command":"ls","timeout":"5000","run_in_background":"false"}` | `{"command":"ls","run_in_background":false,"timeout":5000}` | 267/270/273 |
+| Bash `timeout` `"5000.0"`, `" 5000 "`, `"05"`, `"+5"` | `5000`, `5000`, `5`, `5` | 273 |
+| Bash `{"command":"ls","timeout":"abc","run_in_background":"false"}` | unchanged | |
+| Bash `{"command":"ls","timeout":"5000.0","run_in_background":"0"}` | unchanged (`"0"` fails, so nothing is re-typed) | |
+| Bash `{...,"run_in_background":"False",...,"foo":"bar"}` | unchanged, `foo` kept | |
+| Read `{"file_path":"/etc/hosts","offset":"5","limit":"10"}` | `{"file_path":"/etc/hosts","limit":"10","offset":5}` | 267/270/273 |
+| Read `offset` `"5.5"`, `"05"`, `" 5 "` | `5.5`, `5`, `5` | 273 |
+| ToolSearch `max_results:"5"` | `5` | 273 |
+| Grep `head_limit:"5"` | unchanged | 273 |
+| Edit `{file_path,old_string,new_string}` | `+ "replace_all":false` | 267/270/273 |
 
 ## Things that looked like clodex bugs and were not (not version-specific)
 

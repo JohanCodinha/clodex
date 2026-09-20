@@ -17,7 +17,6 @@ describe('ChatGPT OAuth model seeds', () => {
       brand: 'GPT',
       contextWindow: 272_000,
       maxContextWindow: 872_000,
-      effectiveContextPercent: 95,
       maxOutputTokens: 128_000,
       pricingBoundary: 272_000,
       reasoning: true,
@@ -26,6 +25,9 @@ describe('ChatGPT OAuth model seeds', () => {
       modelFormat: 'openai',
       npm: '@ai-sdk/openai',
     });
+    // No context share: clodex reports the window the provider gives and holds
+    // nothing back — Claude Code does its own reserving.
+    expect(astra?.effectiveContextPercent).toBeUndefined();
   });
 
   it('lists the newest family first so the picker leads with it', () => {
@@ -34,7 +36,10 @@ describe('ChatGPT OAuth model seeds', () => {
 });
 
 describe('openAiPricingMetadata', () => {
-  it.each(['gpt-6-astra', 'gpt-6', 'gpt-5.6-sol', 'gpt-5.5'])(
+  // The boundary is read from the FAMILY VERSION, not from a list of ids, so a
+  // family that ships after this was written is covered the day it appears: an
+  // over-claim costs the user one notice, an under-claim costs them money.
+  it.each(['gpt-6-astra', 'gpt-6', 'gpt-5.6-sol', 'gpt-5.5', 'gpt-6.1-preview', 'gpt-60'])(
     'claims the 272K boundary for %s',
     (id) => {
       expect(openAiPricingMetadata(id).pricingBoundary).toBe(272_000);
@@ -42,7 +47,7 @@ describe('openAiPricingMetadata', () => {
   );
 
   // Only documented families carry a band; a lookalike id must not inherit one.
-  it.each(['gpt-5.4', 'gpt-6.1-preview', 'gpt-60', 'codex-auto-review', 'o3'])(
+  it.each(['gpt-5.4', 'codex-auto-review', 'o3'])(
     'claims no boundary for %s',
     (id) => {
       expect(openAiPricingMetadata(id)).toEqual({});

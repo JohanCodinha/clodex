@@ -47,6 +47,8 @@ import {
   builtInPatchProofsChanged,
   captureBuiltInPatchProofs,
 } from '../src/built-in-patch-proofs.js';
+import { MAX_MODEL_CATALOG } from '../src/constants.js';
+import { isModelAliasNameSyntax, isReservedModelAlias } from '../src/model-aliases.js';
 import {
   NETWORK_ENV_CONTRACT_VAR,
   networkEnvBaseline,
@@ -588,8 +590,8 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
       .join('\n');
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
-      version: 12,
-      digest: '77e3444f85192bbffe2095b8284e708fa976a94307135f47584ed04370ee11c6',
+      version: 13,
+      digest: '957653aa8315627b088345d487648e2f62ca314b31257f6fea695de5129e69e1',
     });
   });
 });
@@ -756,6 +758,267 @@ describe('applyClodexPatches input validation', () => {
     expect((caught as PatchApplyError).results).toEqual([
       { status: 'FAIL', name: 'PATCH 1: Agent tool model enum', extra: 'anchor not found' },
     ]);
+  });
+});
+
+/**
+ * PATCH 6 reads the "is this alias already present?" region from `case"best":{` forward, bounded by
+ * 2000 characters of drift headroom PLUS the bytes of the cases it injects itself. That bound GROWS
+ * with the alias config, and growing it is only safe because `case"best":{` is unique.
+ *
+ * The lazy quantifier is NOT what makes it safe: laziness fixes where the region ends only once its
+ * START is fixed. Given two anchors — an early one whose `default:return` is far away and the real
+ * resolver later — a small bound selects the real resolver and a large bound selects the decoy, so
+ * both ends of the region move and an alias present in the resolver drops out of the region and is
+ * injected a second time. What forecloses that is `applyOnce`'s `count > 1` refusal with
+ * `required: true`: a second viable region start implies a second anchor match, so the patch aborts
+ * before anything the mis-aimed region decided can be written. (The region IS consulted first —
+ * PATCH 6 matches it and builds its `cases` string before `applyOnce` runs — but that work is
+ * thrown away unused when the anchor count refusal fires.)
+ *
+ * Deleting that refusal (or PATCH 6's `required: true`) turns both aborts below into silent
+ * successes.
+ */
+describe('PATCH 6 refuses an ambiguous resolver anchor', () => {
+  const CONFIG = { 'clodex:openai-oauth:gpt-5.6-sol': { alias: 'sol' } };
+
+  /**
+   * An anchor-shaped decoy whose own `default:return` sits 2500 characters away — out of reach of
+   * the bound a small alias config produces (2000 + 23), within reach of the bound the largest
+   * config the favorites UI can produce does (2000 + 20 * 145 = 4900).
+   */
+  const DECOY = `function D(e){switch(e){case"best":{return 0}${'z'.repeat(2500)}default:return null}}`;
+
+  /** 20 aliases at the 64-character `MODEL_ALIAS_PATTERN` maximum. */
+  const MAX_LEGAL_CONFIG = Object.fromEntries(
+    Array.from({ length: 20 }, (_, i) => [
+      `clodex:openai:m${i}`,
+      { alias: `a${String(i).padStart(2, '0')}`.padEnd(64, 'x') },
+    ]),
+  ) as PatchScriptModelConfig;
+
+  it('aborts the whole patch rather than choosing between two case"best":{ anchors', () => {
+    let caught: unknown;
+    try {
+      applyClodexPatches(`${DECOY}\n${CLAUDE_FIXTURE}`, CONFIG);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(PatchApplyError);
+    expect((caught as Error).message)
+      .toBe('clodex patch: ambiguous anchor: PATCH 6: alias resolver switch');
+    expect((caught as PatchApplyError).results).toContainEqual({
+      status: 'FAIL',
+      name: 'PATCH 6: alias resolver switch',
+      extra: 'anchor matched 2 times (expected 1)',
+    });
+  });
+
+  it('aborts at the alias budget that would otherwise re-aim the region at the decoy', () => {
+    expect(() => applyClodexPatches(`${DECOY}\n${CLAUDE_FIXTURE}`, MAX_LEGAL_CONFIG))
+      .toThrow(/ambiguous anchor: PATCH 6/);
+  });
+
+  it('does not fire on the single anchor a real bundle carries, at either budget', () => {
+    for (const config of [CONFIG, MAX_LEGAL_CONFIG]) {
+      const out = applyClodexPatches(CLAUDE_FIXTURE, config);
+      expect(out.results.find(r => r.name.startsWith('PATCH 6'))!.status).toBe('OK');
+    }
+    expect(applyClodexPatches(CLAUDE_FIXTURE, CONFIG).content)
+      .toContain('case"sol":return "sol";');
+  });
+});
+
+/**
+ * PATCH 6's region bound is DYNAMIC — 2000 bytes of drift headroom PLUS exactly the bytes of the
+ * cases PATCH 6 injects itself (`case"<a>":return "<a>";`, i.e. `2 * a.length + 17` each). Every
+ * term is load-bearing, and NONE of them is pinned by a fixture whose `default:return` sits
+ * adjacent to the anchor: there the lazy match stops at byte 0 and the size of the bound is never
+ * consulted, so any coefficient at all passes.
+ *
+ * Each configuration below puts the region EXACTLY on the boundary — the bytes PATCH 6 really
+ * injected (read back off a real patch, never computed from the formula under test) plus exactly
+ * the documented 2000 of headroom — and then one byte past it. A bound one byte short loses the
+ * region on the RE-RUN `applyPatch`'s built-in verification performs, every alias reads as
+ * missing, the cases go in a second time, and the local patch set is rolled back.
+ *
+ * ONE configuration pins only one total: `1000 + Σ(2·len + 67)` also totals 4900 at 20 × 64 and
+ * passed a single-config version of this block, while cutting one short alias's headroom to 1050.
+ * The formula has three unknowns — headroom, per-alias constant, per-character slope — so there are
+ * three configurations with independent (count, total length) rows: 20 × 64, 1 × 64 and 1 × 1.
+ * Pinned on both sides at all three, no other linear formula survives.
+ *
+ * GROWING any term reds the "one byte past" tests, deliberately: if the headroom is intentionally
+ * raised, update `DRIFT_HEADROOM` here in the same commit.
+ */
+describe('PATCH 6 resolver budget on its exact boundary', () => {
+  /** The headroom literal in `RESOLVER_BUDGET` (src/patch-transforms.ts). */
+  const DRIFT_HEADROOM = 2000;
+
+  /** The anchor as src/patch-transforms.ts spells it; used only to LOCATE the site. */
+  const RESOLVER_ANCHOR = /case"best":\{[^{}]*\}/;
+  const ANCHOR = CLAUDE_FIXTURE.match(RESOLVER_ANCHOR)![0];
+
+  /**
+   * The longest alias `MODEL_ALIAS_PATTERN` accepts, measured through the real validator rather
+   * than restated, so a change to the pattern moves this fixture with it.
+   */
+  const ALIAS_MAX_LENGTH = (() => {
+    let n = 1;
+    while (n < 4096 && isModelAliasNameSyntax('a'.repeat(n + 1))) n++;
+    return n;
+  })();
+
+  const aliasesOf = (count: number, length: number) =>
+    count === 1 && length < 3
+      ? ['q'.repeat(length)]
+      : Array.from({ length: count }, (_, i) => `a${String(i).padStart(2, '0')}`.padEnd(length, 'x'));
+  const configOf = (aliases: string[]) => Object.fromEntries(
+    aliases.map((alias, i) => [`clodex:openai-oauth:m${i}`, { alias }]),
+  ) as PatchScriptModelConfig;
+
+  const CONFIGS = [
+    // The largest alias set the favorites UI can produce: MAX_MODEL_CATALOG at the maximum length.
+    { label: `${MAX_MODEL_CATALOG} x ${ALIAS_MAX_LENGTH}-char aliases`, aliases: aliasesOf(MAX_MODEL_CATALOG, ALIAS_MAX_LENGTH) },
+    { label: `1 x ${ALIAS_MAX_LENGTH}-char alias`, aliases: aliasesOf(1, ALIAS_MAX_LENGTH) },
+    { label: '1 x 1-char alias', aliases: aliasesOf(1, 1) },
+  ];
+
+  const p6 = (out: { results: Array<{ name: string; status: string }> }) =>
+    out.results.find(r => r.name.startsWith('PATCH 6'))!.status;
+
+  const needle = (a: string) => `case${JSON.stringify(a)}:return ${JSON.stringify(a)};`;
+
+  /** The bytes between the anchor and the switch's own `default:return`, in `js`. */
+  function regionBody(js: string): string {
+    const at = js.indexOf(ANCHOR) + ANCHOR.length;
+    return js.slice(at, js.indexOf('default:return', at));
+  }
+
+  /**
+   * `bytes` of plausible upstream churn to sit between the injected cases and `default:return`.
+   * Native-looking cases, none of which can collide with an alias name, and no second anchor.
+   */
+  function driftOf(bytes: number): string {
+    let out = '';
+    for (let i = 0; ; i++) {
+      const tag = String(i).padStart(3, '0');
+      const one = `case"drift${tag}":return "native${tag}";`;
+      if (out.length + one.length > bytes) break;
+      out += one;
+    }
+    const left = bytes - out.length;
+    if (left >= 4) out += `/*${'d'.repeat(left - 4)}*/`;
+    else out += ';'.repeat(left);
+    return out;
+  }
+
+  /** CLAUDE_FIXTURE with `bytes` of drift inserted before the resolver's own `default:return`. */
+  const fixtureWithDrift = (bytes: number) =>
+    CLAUDE_FIXTURE.replace(ANCHOR + 'default:return', ANCHOR + driftOf(bytes) + 'default:return');
+
+  it('builds the fixtures out of the real caps, and the drift really is drift', () => {
+    expect(ALIAS_MAX_LENGTH).toBe(64);
+    expect(isModelAliasNameSyntax('a'.repeat(ALIAS_MAX_LENGTH))).toBe(true);
+    expect(isModelAliasNameSyntax('a'.repeat(ALIAS_MAX_LENGTH + 1))).toBe(false);
+    for (const { aliases } of CONFIGS) {
+      expect(aliases.every(a => isModelAliasNameSyntax(a) && !isReservedModelAlias(a))).toBe(true);
+      expect(new Set(aliases).size).toBe(aliases.length);
+    }
+    // The three (count, total length) rows are linearly independent: (20, 1280), (1, 64), (1, 1).
+    expect(CONFIGS.map(c => [c.aliases.length, c.aliases.join('').length]))
+      .toEqual([[20, 1280], [1, 64], [1, 1]]);
+
+    // The drift is exactly the size asked for, is not a second anchor, and does not end the region
+    // early — otherwise the fixture would not test the bound at all.
+    for (const bytes of [DRIFT_HEADROOM, DRIFT_HEADROOM + 1]) {
+      const drift = driftOf(bytes);
+      expect(drift.length).toBe(bytes);
+      expect(drift).not.toContain('default:return');
+      expect(fixtureWithDrift(bytes).match(new RegExp(RESOLVER_ANCHOR.source, 'g'))).toHaveLength(1);
+      expect(regionBody(fixtureWithDrift(bytes))).toBe(drift);
+    }
+  });
+
+  describe.each(CONFIGS)('$label', ({ aliases }) => {
+    const config = configOf(aliases);
+    /**
+     * What PATCH 6 actually injects for this config, READ BACK off a real run rather than
+     * recomputed from the formula under test.
+     */
+    const injected = regionBody(applyClodexPatches(CLAUDE_FIXTURE, config).content);
+
+    it('injects exactly one case per alias, and nothing else, into the region', () => {
+      expect(injected).toBe(aliases.map(needle).join(''));
+    });
+
+    it('re-patches as a no-op with the region sitting exactly on the budget', () => {
+      const once = applyClodexPatches(fixtureWithDrift(DRIFT_HEADROOM), config);
+      expect(p6(once)).toBe('OK');
+      // The injected cases plus the whole headroom — the boundary, by construction.
+      expect(regionBody(once.content).length).toBe(injected.length + DRIFT_HEADROOM);
+
+      const twice = applyClodexPatches(once.content, config);
+      expect(p6(twice)).toBe('SKIP');
+      expect(twice.content).toBe(once.content);
+      for (const a of aliases) expect(twice.content.split(needle(a))).toHaveLength(2);
+      expect(() => captureBuiltInPatchProofs(twice.content, config, twice.results)).not.toThrow();
+    });
+
+    it('stops being a no-op one byte past the headroom — the bound is not larger than documented', () => {
+      const once = applyClodexPatches(fixtureWithDrift(DRIFT_HEADROOM + 1), config);
+      expect(p6(once)).toBe('OK');
+      expect(regionBody(once.content).length).toBe(injected.length + DRIFT_HEADROOM + 1);
+
+      const twice = applyClodexPatches(once.content, config);
+      expect(p6(twice)).toBe('OK');                     // not SKIP: every alias reads as missing
+      expect(twice.content).not.toBe(once.content);
+      for (const a of aliases) expect(twice.content.split(needle(a))).toHaveLength(3);
+    });
+  });
+});
+
+/**
+ * Why a region that swallows a mixed-case native case cannot cost an alias its case. It rests on a
+ * CONJUNCTION, and each half is pinned here in CI, not only in the bundle harness:
+ *
+ *  * PATCH 6 lowercases every alias before it builds anything from it, so however the alias was
+ *    spelled in the config, the needle it tests for is lowercase; and
+ *  * the presence test matches CASE-SENSITIVELY, so a lowercase needle does not match the
+ *    camelCase `case"projectSettings":return` / `case"policySettings":return` that older Claude
+ *    Code builds carry within reach of the largest region.
+ *
+ * "Aliases are lowercased, so match case-insensitively" is a well-meant change that would break the
+ * second half, and it reds the first test below.
+ */
+describe('PATCH 6 presence test is case-sensitive over lowercased aliases', () => {
+  const ANCHOR = 'case"best":{return "opus"}';
+  /** A native case inside the region, spelled the way the real swallowed labels are spelled. */
+  const withNative = (label: string) =>
+    CLAUDE_FIXTURE.replace(ANCHOR, `${ANCHOR}case${JSON.stringify(label)}:return 1;`);
+
+  it('injects a lowercase alias whose name matches a camelCase native case only ignoring case', () => {
+    const config = { 'clodex:openai-oauth:m': { alias: 'projectsettings' } };
+    const out = applyClodexPatches(withNative('projectSettings'), config);
+    expect(out.results.find(r => r.name.startsWith('PATCH 6'))!.status).toBe('OK');
+    expect(out.content).toContain('case"projectsettings":return "projectsettings";');
+    expect(() => captureBuiltInPatchProofs(out.content, config, out.results)).not.toThrow();
+  });
+
+  it('lowercases a mixed-case alias before injecting it', () => {
+    const config = { 'clodex:openai-oauth:m': { alias: 'ProjectSettings' } };
+    const out = applyClodexPatches(withNative('projectSettings'), config);
+    expect(out.content).toContain('case"projectsettings":return "projectsettings";');
+    expect(out.content).not.toContain('case"ProjectSettings":return');
+  });
+
+  it('control: the same native case, spelled exactly as the alias, IS read as present', () => {
+    // Proves the native case sits inside the region PATCH 6 reads, so the first test is not green
+    // merely because the region never reached it.
+    const out = applyClodexPatches(withNative('projectsettings'), {
+      'clodex:openai-oauth:m': { alias: 'projectsettings' },
+    });
+    expect(out.content).not.toContain('case"projectsettings":return "projectsettings";');
   });
 });
 
@@ -1516,16 +1779,22 @@ function executeChildEnv(
     'extra',
     'flag',
     'remote',
-    // Only the 2.1.228- and 2.1.239-shaped fixtures read this; the base fixture
-    // ignores it. `getExtra` stands in for the optional call 2.1.239 introduced.
+    // Only the 2.1.228-, 2.1.239- and 2.1.260-shaped fixtures read this; the base
+    // fixture ignores it. `getExtra` is the fixture's stand-in for the optional
+    // registry call; `getAgentProxyEnv` is the real property name every measured
+    // builder from 2.1.246 on spells inline, and what the anchor's head pins on.
     'settings',
+    // The typed env accessor 2.1.260 reads the remote-mode flag from instead of
+    // `process.env`. Empty, so remote mode is off exactly as `flag` reports.
+    'accessor',
     `${declaration};return childEnv;`,
   )(
     { env },
     () => extraEnv,
     () => false,
     () => ({}),
-    { settingsColorEnv: {}, getExtra: () => extraEnv },
+    { settingsColorEnv: {}, getExtra: () => extraEnv, getAgentProxyEnv: () => extraEnv },
+    {},
   ) as () => NodeJS.ProcessEnv;
   return childEnv();
 }
@@ -1837,14 +2106,60 @@ describe('patch script identity naming', () => {
     )
     .replace('delete v[k],delete v[`INPUT_${k}`];return v}', 'delete v[k];return v}');
 
-  // Claude Code 2.1.260 changed how the remote flag is READ. Through 2.1.259 the
-  // opening `let` called a helper on `process.env.CLAUDE_CODE_REMOTE`; 2.1.260
-  // compares a module-level env snapshot instead (`i=a.CLAUDE_CODE_REMOTE===!0,
-  // l=i?…`), so an anchor spelling the call form read every one of the eight
-  // published builds as "anchor not found" — and PATCH 10 is required.
-  const CLAUDE_FIXTURE_260 = CLAUDE_FIXTURE_239.replace(
-    's=flag(process.env.CLAUDE_CODE_REMOTE)?remote():{}',
-    'r=h.CLAUDE_CODE_REMOTE===!0,s=r?remote():{}',
+  // Claude Code 2.1.260 rewrote the remote-mode check the head anchor ended on.
+  // Through 2.1.259 it was a call wrapping a `process.env` read whose result fed a
+  // ternary — `<fn>(process.env.CLAUDE_CODE_REMOTE)?` — and the anchor spelled that
+  // shape out. 2.1.260 reads the flag off the typed env accessor and compares it
+  // inline (`i=a.CLAUDE_CODE_REMOTE===!0`), keeping neither the call nor the
+  // `process.env.` prefix, so the anchor found nothing and `clodex patch` refused
+  // all eight published builds. Other child-filtering behaviour changed in 2.1.260
+  // too; this fixture models only the head shape that caused the failure.
+  // The head can now reach `getAgentProxyEnv` instead — the agent-proxy env this
+  // builder folds into the child's environment, an unminified property name in
+  // every bundle measured so far, though that is an observation and not a promise
+  // about future builds — so this fixture must spell the real name, not a stand-in.
+  const CLAUDE_FIXTURE_260 = CLAUDE_FIXTURE
+    .replace(
+      'let e=extra(),t=Object.keys(e).length>0,n=Object.keys(e).length>0,'
+      + 's=flag(process.env.CLAUDE_CODE_REMOTE)?remote():{};',
+      'let h=settings,e=h.getAgentProxyEnv?.()??{},t=Object.keys(e).length>0,'
+      + '{settingsColorEnv:c}=h,n=Object.keys(c).length>0,'
+      + 'g=accessor.CLAUDE_CODE_REMOTE===!0,s=g?remote():{};',
+    )
+    .replace('delete v[k],delete v[`INPUT_${k}`];return v}', 'delete v[k];return v}');
+
+  // Two shapes the head must survive, because upstream has already made this exact move
+  // once: 2.1.239 turned the settings-colour env — the SIBLING property on the same
+  // registry entry the head now pins on — into a destructuring declarator. If
+  // `getAgentProxyEnv` follows it, the pin sits inside a `{...}` group, and a run that can
+  // only consume a group WHOLE can never stop there. `let{` is the same move again with the
+  // pattern first, where the minifier drops the space (each measured Darwin 2.1.260 bundle
+  // carries 4784 `let{` occurrences and opens 84 named zero-arg functions `function X(){let{`).
+  // Neither shape occurs in the 27 measured bundles; both refuse without the tolerances, and
+  // adding them changes nothing on those 27.
+  const CLAUDE_FIXTURE_260_DESTRUCTURED = CLAUDE_FIXTURE_260.replace(
+    'let h=settings,e=h.getAgentProxyEnv?.()??{},t=Object.keys(e).length>0,'
+    + '{settingsColorEnv:c}=h,n=Object.keys(c).length>0,',
+    'let h=settings,{getAgentProxyEnv:x,settingsColorEnv:c}=h,e=x?.()??{},'
+    + 't=Object.keys(e).length>0,n=Object.keys(c).length>0,',
+  );
+
+  const CLAUDE_FIXTURE_260_LET_PATTERN = CLAUDE_FIXTURE_260.replace(
+    'let h=settings,e=h.getAgentProxyEnv?.()??{},t=Object.keys(e).length>0,'
+    + '{settingsColorEnv:c}=h,n=Object.keys(c).length>0,',
+    'let{getAgentProxyEnv:x,settingsColorEnv:c}=settings,e=x?.()??{},'
+    + 't=Object.keys(e).length>0,n=Object.keys(c).length>0,',
+  );
+
+  // An ARRAY pattern gets the same treatment for the same reason — a minifier drops the
+  // space before either kind. Leaving `let[` out would have left the stated rationale
+  // half-applied, and every measured 2.1.260 build already opens 17 named zero-arg
+  // functions with it.
+  const CLAUDE_FIXTURE_260_LET_ARRAY = CLAUDE_FIXTURE_260.replace(
+    'let h=settings,e=h.getAgentProxyEnv?.()??{},t=Object.keys(e).length>0,'
+    + '{settingsColorEnv:c}=h,n=Object.keys(c).length>0,',
+    'let[h]=[settings],{settingsColorEnv:c}=h,e=h.getAgentProxyEnv?.()??{},'
+    + 't=Object.keys(e).length>0,n=Object.keys(c).length>0,',
   );
 
   // The tolerated run admits `[^;{}]` characters or one balanced `{...}` group,
@@ -1939,8 +2254,30 @@ describe('patch script identity naming', () => {
     expect(result.content).toContain('let v={..._clodexChildEnv,...e,...s}');
   });
 
-  it('restores the original network environment through the destructuring builder', () => {
-    const env = executeChildEnv(runPatchScript(config, CLAUDE_FIXTURE_239), {
+  it('patches a child builder that reads the remote flag off the typed env accessor', () => {
+    expect(CLAUDE_FIXTURE_260, 'fixture drifted from the shape this test mutates')
+      .not.toBe(CLAUDE_FIXTURE);
+    expect(CLAUDE_FIXTURE_260, 'the 2.1.260 head must spell the real agent-proxy accessor')
+      .toContain('e=h.getAgentProxyEnv?.()??{}');
+    expect(CLAUDE_FIXTURE_260, 'no `<fn>(process.env.CLAUDE_CODE_REMOTE)?` ternary may survive')
+      .not.toContain('(process.env.CLAUDE_CODE_REMOTE)?');
+
+    const result = applyClodexPatches(CLAUDE_FIXTURE_260, config);
+
+    expect(result.results.at(-1)).toEqual({
+      status: 'OK',
+      name: 'PATCH 10: child network environment',
+    });
+    expect(result.content.match(/\/\*ccpatch:child-network-env\*\//g)).toHaveLength(1);
+    expect(result.content).toContain('function childEnv(){/*ccpatch:child-network-env*/');
+    // The accessor read is left alone — it is not a `process.env` read, and
+    // CLAUDE_CODE_REMOTE is not one of the network variables clodex reverts.
+    expect(result.content).toContain('g=accessor.CLAUDE_CODE_REMOTE===!0');
+    expect(result.content).toContain('let v={..._clodexChildEnv,...e,...s}');
+  });
+
+  it('restores the original network environment through the typed-accessor builder', () => {
+    const env = executeChildEnv(runPatchScript(config, CLAUDE_FIXTURE_260), {
       PATH: '/usr/bin',
       HTTPS_PROXY: 'http://127.0.0.1:3457',
       NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
@@ -1965,24 +2302,30 @@ describe('patch script identity naming', () => {
     expect(env[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
   });
 
-  it('patches a child builder that reads the remote flag off an env snapshot', () => {
-    expect(CLAUDE_FIXTURE_260, 'fixture drifted from the shape this test mutates')
-      .not.toBe(CLAUDE_FIXTURE_239);
-    expect(CLAUDE_FIXTURE_260, 'the 2.1.260 head must not read the flag through process.env')
-      .not.toContain('process.env.CLAUDE_CODE_REMOTE');
-
-    const result = applyClodexPatches(CLAUDE_FIXTURE_260, config);
-
-    expect(result.results.at(-1)).toEqual({
-      status: 'OK',
-      name: 'PATCH 10: child network environment',
+  it('restores the original network environment through the destructuring builder', () => {
+    const env = executeChildEnv(runPatchScript(config, CLAUDE_FIXTURE_239), {
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://127.0.0.1:3457',
+      NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
+      [NETWORK_ENV_CONTRACT_VAR]: JSON.stringify({
+        version: 1,
+        original: {
+          HTTPS_PROXY: 'http://corp-proxy.example:8080',
+          NODE_EXTRA_CA_CERTS: null,
+        },
+        injected: {
+          HTTPS_PROXY: 'http://127.0.0.1:3457',
+          NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
+        },
+      }),
     });
-    expect(result.content.match(/\/\*ccpatch:child-network-env\*\//g)).toHaveLength(1);
-    expect(result.content).toContain('function childEnv(){/*ccpatch:child-network-env*/');
-    // The snapshot read is not a process.env read, so it is left alone; the
-    // merged copy is still redirected to the restored environment.
-    expect(result.content).toContain('r=h.CLAUDE_CODE_REMOTE===!0,s=r?remote():{}');
-    expect(result.content).toContain('let v={..._clodexChildEnv,...e,...s}');
+
+    expect(env).toMatchObject({
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://corp-proxy.example:8080',
+    });
+    expect(env['NODE_EXTRA_CA_CERTS']).toBeUndefined();
+    expect(env[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
   });
 
   it('restores the original network environment through the env-snapshot builder', () => {
@@ -2011,40 +2354,15 @@ describe('patch script identity naming', () => {
     expect(env[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
   });
 
-  // The remote-flag mention is what pins the head to the builder's OWN opening
-  // `let`. Without it the anchor could start at the nearest preceding function
-  // whose head happens to fit, so a builder that never mentions the flag must be
-  // refused rather than guessed at — loud, in the safe direction.
-  it('refuses a builder whose opening let never mentions the remote flag', () => {
-    const source = CLAUDE_FIXTURE_260.replace(
-      'r=h.CLAUDE_CODE_REMOTE===!0,s=r?remote():{}',
-      's=remote()',
-    );
-    expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_260);
-
-    let thrown: unknown;
-    try {
-      applyClodexPatches(source, config);
-    } catch (error) {
-      thrown = error;
-    }
-    expect(thrown).toBeInstanceOf(PatchApplyError);
-    expect((thrown as PatchApplyError).results.at(-1)).toEqual({
-      status: 'FAIL',
-      name: 'PATCH 10: child network environment',
-      extra: 'anchor not found',
-    });
-  });
-
-  // A preceding function whose own opening `let` also mentions the flag can start
-  // the match. What happens next depends on the boundary between the two: joined
-  // by `};` the lazy body runs into the real builder and the nested-function check
-  // refuses the span (loud, safe); across `}function ` the body guard stops the run
-  // at the boundary and the real builder binds, decoy untouched. Neither layout
+  // A preceding function whose own opening `let` also reaches the pinned name can
+  // start the match. What happens next depends on the boundary between the two:
+  // joined by `};` the lazy body runs into the real builder and the nested-function
+  // check refuses the span (loud, safe); across `}function ` the body guard stops the
+  // run at the boundary and the real builder binds, decoy untouched. Neither layout
   // occurs in a released build; both are pinned so the safe direction stays safe.
-  const REMOTE_DECOY = 'function zzRemoteDecoy(){let x=settings.CLAUDE_CODE_REMOTE;return x}';
+  const REMOTE_DECOY = 'function zzRemoteDecoy(){let x=settings.getAgentProxyEnv;return x}';
 
-  it('fails closed when a flag-mentioning decoy is joined to the builder by `};`', () => {
+  it('fails closed when a pin-mentioning decoy is joined to the builder by `};`', () => {
     const source = CLAUDE_FIXTURE_260.replace('function childEnv(){', REMOTE_DECOY + ';function childEnv(){');
     expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_260);
 
@@ -2062,7 +2380,7 @@ describe('patch script identity naming', () => {
     });
   });
 
-  it('binds the real builder when a flag-mentioning decoy precedes it across `}function`', () => {
+  it('binds the real builder when a pin-mentioning decoy precedes it across `}function`', () => {
     const source = CLAUDE_FIXTURE_260.replace('function childEnv(){', REMOTE_DECOY + 'function childEnv(){');
     expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_260);
 
@@ -2378,11 +2696,12 @@ describe('patch script identity naming', () => {
     );
   });
 
-  // `CLAUDE_CODE_REMOTE` is not in the literal list, because the ANCHOR already requires it inside
-  // the captured body — that is why removing it from the list was safe. Nothing else pins the
-  // anchor's copy of it, so widen it to any environment variable and the site would silently stop
-  // proving it bound to the builder that consults the remote flag.
-  it('rejects a child builder whose head consults a different environment variable', () => {
+  // The head pins on one of two names, so each has to be shown to carry its own weight:
+  // widen either to something the builder does not mean and the site must refuse rather
+  // than bind to whatever function happens to be nearby. `CLAUDE_CODE_REMOTE` is the
+  // pre-2.1.239 alternative and is not in the required-literal list, because the anchor
+  // is what requires it; on the base fixture nothing else pins it.
+  it('rejects a pre-2.1.239 child builder whose head consults a different environment variable', () => {
     const source = CLAUDE_FIXTURE.replace(
       'flag(process.env.CLAUDE_CODE_REMOTE)?remote():{}',
       'flag(process.env.CLAUDE_CODE_ELSEWHERE)?remote():{}',
@@ -2390,6 +2709,69 @@ describe('patch script identity naming', () => {
 
     expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE);
     expect(source).not.toContain('CLAUDE_CODE_REMOTE');
+    expect(source, 'the other alternative must not rescue this mutation')
+      .not.toContain('getAgentProxyEnv');
+
+    expect(() => runPatchScript(config, source)).toThrow(
+      'clodex patch: required patch failed: PATCH 10: child network environment',
+    );
+  });
+
+  it.each([
+    ['destructures the agent-proxy property beside the settings-colour one',
+      () => CLAUDE_FIXTURE_260_DESTRUCTURED],
+    ['destructures the agent-proxy property in an opening `let{` pattern',
+      () => CLAUDE_FIXTURE_260_LET_PATTERN],
+    ['reads the agent-proxy property after an opening `let[` pattern',
+      () => CLAUDE_FIXTURE_260_LET_ARRAY],
+  ])('patches a child builder that %s', (_label, build) => {
+    const source = build();
+    expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_260);
+    expect(source, 'the other alternative must not rescue this shape')
+      .not.toContain('(process.env.CLAUDE_CODE_REMOTE)?');
+
+    const result = applyClodexPatches(source, config);
+
+    expect(result.results.at(-1)).toEqual({
+      status: 'OK',
+      name: 'PATCH 10: child network environment',
+    });
+    expect(result.content.match(/\/\*ccpatch:child-network-env\*\//g)).toHaveLength(1);
+    expect(result.content).toContain('function childEnv(){/*ccpatch:child-network-env*/');
+    expect(result.content).toContain('let v={..._clodexChildEnv,...e,...s}');
+
+    // A patched builder is not the same claim as a correct one: run it.
+    const env = executeChildEnv(result.content, {
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://127.0.0.1:3457',
+      NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
+      [NETWORK_ENV_CONTRACT_VAR]: JSON.stringify({
+        version: 1,
+        original: {
+          HTTPS_PROXY: 'http://corp-proxy.example:8080',
+          NODE_EXTRA_CA_CERTS: null,
+        },
+        injected: {
+          HTTPS_PROXY: 'http://127.0.0.1:3457',
+          NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
+        },
+      }),
+    });
+    expect(env).toMatchObject({ PATH: '/usr/bin', HTTPS_PROXY: 'http://corp-proxy.example:8080' });
+    expect(env['NODE_EXTRA_CA_CERTS']).toBeUndefined();
+    expect(env[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
+  });
+
+  it('rejects a 2.1.260-shaped child builder that folds in some other env', () => {
+    const source = CLAUDE_FIXTURE_260.replace(
+      'e=h.getAgentProxyEnv?.()??{}',
+      'e=h.getSomeOtherEnv?.()??{}',
+    );
+
+    expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_260);
+    expect(source).not.toContain('getAgentProxyEnv');
+    expect(source, 'the other alternative must not rescue this mutation')
+      .not.toContain('(process.env.CLAUDE_CODE_REMOTE)?');
 
     expect(() => runPatchScript(config, source)).toThrow(
       'clodex patch: required patch failed: PATCH 10: child network environment',
@@ -2550,52 +2932,76 @@ describe('patch script identity naming', () => {
     });
   });
 
+  // Every malformed case carries a SECOND, well-formed `HTTP_PROXY` pair that would be
+  // reverted if the contract were accepted piecemeal. Without it these cases pass for the
+  // wrong reason — a missing or wrongly-typed injected value can never equal the live one,
+  // so nothing is restored whether the guard rejects the contract or not, and deleting the
+  // rejection left the sha256 transform-source pin as the only red. The valid pair makes
+  // partial acceptance observable: the host reader rejects the whole contract, so the patch
+  // must too.
+  const WELL_FORMED_PAIR = {
+    original: { HTTP_PROXY: 'http://corp.example.test:3128' },
+    injected: { HTTP_PROXY: 'http://127.0.0.1:3457' },
+  };
+  const alsoValid = (contract: {
+    version: number;
+    original: Record<string, unknown>;
+    injected: Record<string, unknown>;
+  }) => ({
+    version: contract.version,
+    original: { ...contract.original, ...WELL_FORMED_PAIR.original },
+    injected: { ...contract.injected, ...WELL_FORMED_PAIR.injected },
+  });
+
   it.each([
     ['valid pair', {
       version: 1,
       original: { HTTPS_PROXY: 'http://proxy.example.test:8080' },
       injected: { HTTPS_PROXY: 'http://127.0.0.1:3457' },
     }],
-    ['missing injected key', {
+    ['missing injected key', alsoValid({
       version: 1,
       original: { HTTPS_PROXY: null },
       injected: {},
-    }],
-    ['missing original key', {
+    })],
+    ['missing original key', alsoValid({
       version: 1,
       original: {},
       injected: { HTTPS_PROXY: 'http://127.0.0.1:3457' },
-    }],
-    ['unknown original key', {
+    })],
+    ['unknown original key', alsoValid({
       version: 1,
       original: { HTTPS_PROXY: null, EXTRA_PROXY: null },
       injected: { HTTPS_PROXY: 'http://127.0.0.1:3457', EXTRA_PROXY: null },
-    }],
-    ['unknown injected key', {
+    })],
+    ['unknown injected key', alsoValid({
       version: 1,
       original: { EXTRA_PROXY: null },
       injected: { EXTRA_PROXY: 'http://127.0.0.1:3457' },
-    }],
-    ['invalid original value', {
+    })],
+    ['invalid original value', alsoValid({
       version: 1,
       original: { HTTPS_PROXY: 42 },
       injected: { HTTPS_PROXY: 'http://127.0.0.1:3457' },
-    }],
-    ['invalid injected value', {
+    })],
+    ['invalid injected value', alsoValid({
       version: 1,
       original: { HTTPS_PROXY: null },
       injected: { HTTPS_PROXY: false },
-    }],
-    ['invalid version', {
+    })],
+    ['invalid version', alsoValid({
       version: 2,
       original: { HTTPS_PROXY: null },
       injected: { HTTPS_PROXY: 'http://127.0.0.1:3457' },
-    }],
+    })],
   ])('matches the host contract reader for %s', (_name, contract) => {
     const out = runPatchScript(config);
     const baseEnv = {
       PATH: '/usr/bin',
       HTTPS_PROXY: 'http://127.0.0.1:3457',
+      // Live value of the well-formed second pair, so a contract accepted piecemeal
+      // would visibly revert it to the corporate proxy above.
+      HTTP_PROXY: 'http://127.0.0.1:3457',
       [NETWORK_ENV_CONTRACT_VAR]: JSON.stringify(contract),
     };
 

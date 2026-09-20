@@ -7,14 +7,29 @@
 // only after proving the next translated conversation appends to the chain head.
 
 import { createHash } from 'node:crypto';
+import { closeSync, openSync } from 'node:fs';
+import { devNull } from 'node:os';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { FetchFunction } from '@ai-sdk/provider-utils';
 import type { RawData, WebSocket as WsWebSocket } from 'ws';
 import { CODEX_RESPONSES_WEBSOCKETS_BETA } from '../constants.js';
 import { outboundWsProxyAgent } from '../outbound-proxy.js';
 import { emitParentNotice } from '../parent-notice.js';
-import { anthropicErrorType, clampRetryAfterSeconds, frameStatusCode } from '../upstream-error.js';
+import {
+  anthropicErrorType,
+  clampRetryAfterSeconds,
+  frameStatusCode,
+  retryAfterProvenanceParam,
+  type RetryAfterProvenance,
+} from '../upstream-error.js';
 import { sanitizeToolInput } from '../tool-input-sanitize.js';
+import { coerceEchoedScalar, schemaScalarKind, type ScalarKind } from '../tool-input-coerce.js';
+import {
+  resetWsUpgradePacerForTests,
+  sharedWsUpgradePacer,
+  type ConnectionPacer,
+  type UpgradeAdmission,
+} from './ws-upgrade-pacer.js';
 
 const RESPONSES_LITE_HEADER = 'x-openai-internal-codex-responses-lite';
 const TERMINAL_EVENT_TYPES = new Set(['response.completed', 'response.failed', 'response.incomplete']);
@@ -23,8 +38,33 @@ const FAILURE_EVENT_TYPES = new Set(['error', 'response.failed', 'response.incom
 export const RESPONSES_WS_HARD_TTL_MS = 55 * 60_000;
 export const RESPONSES_WS_IDLE_TTL_MS = 30 * 60_000;
 export const RESPONSES_WS_NURSERY_IDLE_TTL_MS = 5 * 60_000;
-export const RESPONSES_WS_MAX_CONNECTIONS = 32;
-export const RESPONSES_WS_MAX_NURSERY_CONNECTIONS = 8;
+/**
+ * Pool caps: UNBOUNDED by default. The idle TTLs below are the retention
+ * policy; nothing else shrinks the pools unless the machine runs out of file
+ * descriptors, and that case is detected and handled as load shedding (see
+ * `shedIdleConnectionsForDescriptors`) rather than as a failure.
+ *
+ * A numeric cap was tried first (8/32, then 48/64) and every value was wrong for
+ * somebody: it had to be guessed per machine and per workload, and getting it
+ * wrong degraded SILENTLY — a cap eviction discards a reusable conversation whose
+ * next turn then resends its whole history uncached. The evidence that made the
+ * caps removable: over a 27.6-hour local ledger, head reuse was identical at
+ * every cap from 8 to unlimited, and the ten real cap evictions displaced heads
+ * idle 217-284s, approaching the 5-minute nursery TTL.
+ *
+ * Neither cap was a hard ceiling anyway: only IDLE entries are evictable, so a
+ * generation exceeded its cap while every head was busy, and isolated sockets
+ * are never registered and never counted. The ordinary cost of retention is
+ * memory — a retained head holds its conversation, plus a canonical copy once
+ * prefix comparison has memoized one (~0.73 MiB per head measured) — bounded by
+ * the pacer (60 dials/min) times the TTLs. Descriptors are the backstop, not the
+ * usual bound: Node raises the soft limit to the hard limit at startup, so only
+ * a service or container with a clamped HARD limit reaches `EMFILE`.
+ * `CLODEX_WS_MAX_CONNECTIONS` / `CLODEX_WS_MAX_NURSERY_CONNECTIONS` stay as an
+ * optional cap on the idle pool for anyone who wants one.
+ */
+export const RESPONSES_WS_MAX_CONNECTIONS = Number.POSITIVE_INFINITY;
+export const RESPONSES_WS_MAX_NURSERY_CONNECTIONS = Number.POSITIVE_INFINITY;
 
 export interface ResponsesWebSocketFetchOptions {
   providerId?: string;
@@ -35,6 +75,8 @@ export interface ResponsesWebSocketFetchOptions {
   nurseryIdleTtlMs?: number;
   maxConnections?: number;
   maxNurseryConnections?: number;
+  /** Test override; production shares the process-wide new-connection pacer. */
+  pacer?: ConnectionPacer;
   now?: () => number;
   /** Opt-in structured transport diagnostics; never receives conversation content. */
   onDiagnostic?: (event: ResponsesWebSocketDiagnosticEvent) => void;
@@ -57,16 +99,34 @@ export interface ResponsesWebSocketDiagnosticEvent extends Record<string, unknow
 export interface ResponsesWebSocketDiagnosticContext {
   requestId?: string;
   claudeSessionId?: string;
+  /**
+   * `x-claude-code-agent-id` from the inbound request: set only for an in-process
+   * Claude Code subagent, absent for the main agent and its auxiliary requests.
+   * Unlike the other fields this one is not just correlation — it joins the
+   * socket partition key (see `responsesWebSocketPartitionKey`).
+   */
+  claudeAgentId?: string;
+  /** `x-claude-code-parent-agent-id`, recorded in diagnostics only. */
+  claudeParentAgentId?: string;
 }
 
 const diagnosticContext = new AsyncLocalStorage<ResponsesWebSocketDiagnosticContext>();
 
-/** Correlate a gateway/proxy request with the lower-level SDK WebSocket fetch. */
+/**
+ * Correlate a gateway/proxy request with the lower-level SDK WebSocket fetch,
+ * and carry the request's Claude agent identity into the partition lookup. The
+ * fetch is built once per provider, so per-request facts arrive through here.
+ */
 export function withResponsesWebSocketDiagnosticContext<T>(
   context: ResponsesWebSocketDiagnosticContext,
   fn: () => T,
 ): T {
   return diagnosticContext.run(context, fn);
+}
+
+/** The context the current async chain runs under; lets a test observe what a caller plumbed. */
+export function responsesWebSocketDiagnosticContextForTests(): ResponsesWebSocketDiagnosticContext | undefined {
+  return diagnosticContext.getStore();
 }
 
 type JsonObject = Record<string, unknown>;
@@ -79,10 +139,25 @@ interface OutputAccumulator {
   done?: JsonObject;
 }
 
+type RetryAfterHint = { seconds: number } & RetryAfterProvenance;
+
 interface RequestContext {
   controller: ReadableStreamDefaultController<Uint8Array>;
   encoder: TextEncoder;
   originalPayload: JsonObject;
+  /**
+   * Memoized canonical items of `originalPayload`, for comparing an arriving
+   * request against the turn this response is generating. `originalPayload` is
+   * assigned once at construction and never reassigned — a transport retry resets
+   * `sendPayload` back to it and reuses this same context — so the memo cannot go
+   * stale, and it keeps a wide fan-out from re-serializing every in-flight
+   * conversation once per arriving sibling. It IS invalidated when the arriving
+   * request's tool-schema defaults differ from the ones it was built under: the
+   * payload is fixed, but the normalization applied to it is not.
+   */
+  canonicalInput?: string[];
+  /** Fingerprint of the tool-schema defaults `canonicalInput` was built under. */
+  canonicalInputToolDefaultsId?: string;
   sendPayload: JsonObject;
   promptFieldHashes: Record<string, string>;
   instructionsSnapshot?: string;
@@ -138,17 +213,32 @@ interface ConnectionEntry {
   /** Memoized canonical form of the stored prefix; cleared whenever it changes. */
   canonicalPrefix?: string[];
   canonicalEchoablePrefix?: string[];
+  /**
+   * Fingerprint of the tool-schema defaults the two memos above were built under.
+   * A head is reused across requests, and a request's defaults come from its own
+   * `tools`, so bytes canonicalized under a different map must be discarded rather
+   * than compared — otherwise one client's schema decides another client's verdict.
+   */
+  canonicalToolDefaultsId?: string;
   options: Required<Pick<ResponsesWebSocketFetchOptions, 'hardTtlMs' | 'idleTtlMs' | 'nurseryIdleTtlMs' | 'maxConnections' | 'now'>>;
   debug: (message: string) => void;
+  /**
+   * Connection-scoped diagnostic sink. `RequestContext.emitDiagnostic` only exists
+   * while a request is in flight, and `codex.rate_limits` frames can arrive between
+   * or after responses, so they belong to the CONNECTION. Without this they
+   * are observed by nobody: the message handler returns before parsing when there is
+   * no active context.
+   */
+  connectionDiagnostic?: (event: { event: string } & Record<string, unknown>) => void;
 }
 
 // A Claude session partition can have multiple valid conversation heads at
 // once: rewinds/branches, hidden title-generation requests, and stop hooks can
 // all share its model/effort/cache key. Retain each head and select by exact
 // conversation prefix instead of letting the newest branch replace the rest.
-// New heads live in a separately capped nursery LRU until their first reuse;
-// established heads therefore never consume nursery capacity, and one-shot
-// nursery traffic never consumes the established LRU's 32 reserved slots.
+// New heads live in a nursery generation until their first reuse, with its own
+// (shorter) idle TTL and, under an env cap, its own LRU — so one-shot nursery
+// traffic never displaces established heads.
 const connections = new Map<string, Set<ConnectionEntry>>();
 let nextConnectionDebugId = 1;
 
@@ -212,6 +302,9 @@ export function resetResponsesWebSocketConnectionsForTests(): void {
   }
   connections.clear();
   nextConnectionDebugId = 1;
+  // The shared pacer counts connections, so it has to be dropped with them:
+  // otherwise one test file's sockets pace the next test's first request.
+  resetWsUpgradePacerForTests();
 }
 
 /** Normalize the SDK's HeadersInit into a plain record for `ws`. */
@@ -325,12 +418,25 @@ function instructionChangeSummary(previous: string | undefined, current: string 
  * separately before previous_response_id is used. The authorization fingerprint
  * prevents a refreshed credential from inheriting a socket authenticated with the
  * token that the upstream rejected.
+ *
+ * The Claude agent id separates in-process subagents that share their parent's
+ * session id (and so its `prompt_cache_key`). A sibling whose opening turn
+ * differs from the turn in flight already keeps its own head —
+ * `couldPrecedeThisRequest` compares against what the busy head is generating.
+ * A sibling whose opening turn is byte-identical to it cannot be told from a
+ * retry of that turn, so the gate must isolate it; the agent id is the only
+ * signal that distinguishes the two. Partitioning per agent keeps
+ * `prompt_cache_key` shared (the server-side prefix cache still spans the
+ * fan-out) while each sibling keeps its own chain. The main agent and its
+ * auxiliary requests carry no agent id and keep sharing the session partition,
+ * so the isolation they depend on is unchanged.
  */
 export function responsesWebSocketPartitionKey(
   wsUrl: string,
   payload: JsonObject,
   options: Pick<ResponsesWebSocketFetchOptions, 'providerId' | 'accountId'> = {},
   authorizationFingerprint = '',
+  claudeAgentId = '',
 ): string | undefined {
   const promptCacheKey = payload.prompt_cache_key;
   const model = payload.model;
@@ -347,6 +453,7 @@ export function responsesWebSocketPartitionKey(
     effort,
     promptCacheKey,
     authorizationFingerprint,
+    claudeAgentId,
   ].join('\x1f');
   return createHash('sha256').update(material).digest('hex');
 }
@@ -355,12 +462,131 @@ function inputArray(payload: JsonObject): unknown[] {
   return Array.isArray(payload.input) ? payload.input : [];
 }
 
-function normalizeToolCallJson(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(normalizeToolCallJson);
+/**
+ * Schema rules per tool, derived from ONE request's `tools` array: the declared
+ * default of each property, and the scalar kind it declares.
+ *
+ * When Claude Code receives a tool call it re-types and fills the arguments
+ * against the tool's schema before storing the message, and the stored form is
+ * what the next request echoes (ingest-time, every permission mode; verified in
+ * the 2.1.273 bundle and captured on 2.1.267/2.1.270/2.1.273). An `Edit` the
+ * model emitted without `replace_all` returns as `replace_all: false` (#214),
+ * and a `Bash` call emitted with `"timeout":"5000","run_in_background":"false"`
+ * returns as `timeout: 5000, run_in_background: false` (#225), while the head
+ * snapshot holds the model's raw arguments. The strict-prefix comparison then
+ * fails on every such call and the whole conversation is re-sent uncached.
+ * Compare-only, on BOTH sides before hashing: a string is re-typed to the
+ * declared number/integer/boolean when either of the client's rules would (the
+ * rule in tool-input-coerce.ts), then a property whose value equals the
+ * declared default is dropped — a required property with a declared default
+ * included, because the client fills those at ingest too (TaskOutput's
+ * `block`/`timeout` are required on the wire and filled by `rW`). Outgoing
+ * payloads are untouched. Both sides because the client can also echo the raw
+ * strings (its wire-input flag, or Bash keeping the whole input as written when
+ * one value fails its strict parse); a genuinely different value still differs
+ * after the same rule is applied to each side. The symmetry also equates a
+ * typed head with a string echo, a direction no client path produces; that is
+ * harmless for the same reason default stripping is — upstream keeps the
+ * model's own emission, the tool already ran, and outputs compare byte-exact.
+ *
+ * The parameter name `defaults` is kept at every consumer below: the map
+ * predates the scalar rule and is threaded through this file unchanged.
+ *
+ * Deliberately per-request and pure, for the same reason `headRequiredToolProps`
+ * snapshots `required` from the head's own turn: a process-global map keyed only
+ * by tool name is last-writer-wins across every client, partition and session a
+ * `clodex server` handles, and reading another client's schema can flip the
+ * verdict in either direction with no code change. A request in the same
+ * partition can also carry a different tool list — for example, a main-agent
+ * auxiliary request or a mid-session tool-list change — and populate a memo
+ * under a map that the next request no longer uses. Without keyed invalidation,
+ * under-stripping loses a chain and over-stripping can accept changed history.
+ */
+interface SchemaPropertyRule {
+  /** Canonical JSON of the declared default, when the schema declares one. */
+  default?: string;
+  /** The declared scalar kind, when the client would re-type a string to it. */
+  scalar?: ScalarKind;
+}
+type ToolSchemaDefaults = Map<string, Map<string, SchemaPropertyRule>>;
+
+export function toolSchemaDefaults(payload: JsonObject): ToolSchemaDefaults {
+  const defaults: ToolSchemaDefaults = new Map();
+  const add = (tool: unknown): void => {
+    if (!tool || typeof tool !== 'object') return;
+    const record = tool as JsonObject;
+    if (record.type === 'namespace' && Array.isArray(record.tools)) {
+      for (const nested of record.tools) add(nested);
+      return;
+    }
+    if (record.type !== 'function' || typeof record.name !== 'string') return;
+    const parameters = record.parameters;
+    const properties = parameters && typeof parameters === 'object'
+      ? (parameters as JsonObject).properties : undefined;
+    if (!properties || typeof properties !== 'object') return;
+    const perTool = new Map<string, SchemaPropertyRule>();
+    for (const [prop, schema] of Object.entries(properties as JsonObject)) {
+      if (!schema || typeof schema !== 'object') continue;
+      const rule: SchemaPropertyRule = {};
+      if ('default' in (schema as JsonObject)) rule.default = canonicalJson((schema as JsonObject).default);
+      const scalar = schemaScalarKind(schema, parameters);
+      if (scalar) rule.scalar = scalar;
+      if (rule.default !== undefined || rule.scalar) perTool.set(prop, rule);
+    }
+    if (perTool.size) defaults.set(record.name, perTool);
+  };
+  if (Array.isArray(payload.tools)) for (const tool of payload.tools) add(tool);
+  return defaults;
+}
+
+/**
+ * Identity of a defaults map, for cache keys.
+ *
+ * `entry.canonicalPrefix` is memoized across requests, so the head side must not
+ * keep bytes that were normalized under a different map than the client side is
+ * being normalized under right now. While a request's tool defaults are unchanged,
+ * the fingerprint is stable and the memo still holds; when the tool list changes,
+ * keyed invalidation recomputes the prefix.
+ */
+function toolSchemaDefaultsFingerprint(defaults: ToolSchemaDefaults): string {
+  if (!defaults.size) return 'none';
+  // Each rule is built with its keys in one fixed order, so its JSON is stable.
+  const tuples = [...defaults.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([name, perTool]) => [
+      name,
+      [...perTool.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+    ] as const);
+  return createHash('sha256').update(JSON.stringify(tuples)).digest('hex').slice(0, 16);
+}
+
+/**
+ * Apply the request's schema rules to one call's parsed arguments: re-type a
+ * string to the declared scalar kind first (the client re-types before it
+ * fills defaults, so a `"false"` echoed for a `default: false` boolean is both
+ * re-typed and then filler), then drop a value equal to the declared default.
+ */
+function stripSchemaDefaults(name: unknown, args: unknown, defaults: ToolSchemaDefaults | undefined): unknown {
+  if (!defaults) return args;
+  if (typeof name !== 'string' || !args || typeof args !== 'object' || Array.isArray(args)) return args;
+  const perTool = defaults.get(name);
+  if (!perTool) return args;
+  const out: JsonObject = {};
+  for (const [key, value] of Object.entries(args as JsonObject)) {
+    const rule = perTool.get(key);
+    const typed = rule?.scalar ? coerceEchoedScalar(value, rule.scalar) : value;
+    if (rule?.default !== undefined && canonicalJson(typed) === rule.default) continue;
+    out[key] = typed;
+  }
+  return out;
+}
+
+function normalizeToolCallJson(value: unknown, defaults: ToolSchemaDefaults): unknown {
+  if (Array.isArray(value)) return value.map(item => normalizeToolCallJson(item, defaults));
   if (!value || typeof value !== 'object') return value;
   const record = value as JsonObject;
   const out: JsonObject = {};
-  for (const [key, child] of Object.entries(record)) out[key] = normalizeToolCallJson(child);
+  for (const [key, child] of Object.entries(record)) out[key] = normalizeToolCallJson(child, defaults);
 
   // Claude parses tool_use input into an object. The OpenAI SDK later serializes
   // it again, so insignificant whitespace and object-key order can differ from
@@ -371,7 +597,10 @@ function normalizeToolCallJson(value: unknown): unknown {
     : record.type === 'custom_tool_call' ? 'input' : undefined;
   if (jsonField && typeof record[jsonField] === 'string') {
     try {
-      out[jsonField] = canonicalJson(JSON.parse(record[jsonField] as string));
+      const parsed = JSON.parse(record[jsonField] as string);
+      out[jsonField] = canonicalJson(
+        jsonField === 'arguments' ? stripSchemaDefaults(record.name, parsed, defaults) : parsed,
+      );
     } catch {
       // A malformed/non-JSON custom-tool input must still match byte-for-byte.
     }
@@ -384,21 +613,23 @@ function normalizeToolCallJson(value: unknown): unknown {
   // never match its own echo. An empty array carries no information; drop it
   // from both sides. A populated `content` is real data and still compared.
   if (record.type === 'reasoning') {
+    // The round-trip envelope preserves the SDK itemId to rebuild summary groups.
+    // Expected-assistant snapshots omit this ephemeral field; compare like shapes
+    // without removing the original id from the payload actually sent upstream.
+    delete out.id;
     if (Array.isArray(record.content) && record.content.length === 0) delete out.content;
     // `encrypted_content` IS the reasoning item's identity, and the real state
     // lives upstream under previous_response_id — the summary is display text.
-    // It also cannot survive the round trip intact: the SDK emits one reasoning
-    // part per summary part, but only the LAST part's `reasoning-end` carries the
-    // encrypted content, so the unsigned earlier blocks are dropped on the way
-    // back and a multi-part summary returns holding only its final part. Compare
-    // on the blob and a head can match its own echo.
+    // Legacy thinking signatures retained only the last summary of each item.
+    // Keep accepting those histories even though new envelopes retain every part.
     if (typeof record.encrypted_content === 'string' && record.encrypted_content) delete out.summary;
   }
   return out;
 }
 
-function arraysEqual(left: unknown[], right: unknown[]): boolean {
-  return canonicalJson(normalizeToolCallJson(left)) === canonicalJson(normalizeToolCallJson(right));
+function arraysEqual(left: unknown[], right: unknown[], defaults: ToolSchemaDefaults): boolean {
+  return canonicalJson(normalizeToolCallJson(left, defaults))
+    === canonicalJson(normalizeToolCallJson(right, defaults));
 }
 
 type ContinuationMatchMode = 'exact' | 'omitted_reasoning';
@@ -416,8 +647,11 @@ function conversationItemKind(value: unknown): string {
   return 'object';
 }
 
-function conversationItemHash(value: unknown): string {
-  return createHash('sha256').update(canonicalJson(normalizeToolCallJson(value))).digest('hex').slice(0, 16);
+function conversationItemHash(value: unknown, defaults: ToolSchemaDefaults): string {
+  return createHash('sha256')
+    .update(canonicalJson(normalizeToolCallJson(value, defaults)))
+    .digest('hex')
+    .slice(0, 16);
 }
 
 /**
@@ -431,7 +665,11 @@ function conversationItemHash(value: unknown): string {
  * fresh turn) and the mismatch is correct, not a defect — reporting those would
  * bury the signal in noise.
  */
-function reasoningNormalizationGap(expected: unknown, actual: unknown): string[] | undefined {
+function reasoningNormalizationGap(
+  expected: unknown,
+  actual: unknown,
+  defaults: ToolSchemaDefaults,
+): string[] | undefined {
   if (conversationItemKind(expected) !== 'reasoning' || conversationItemKind(actual) !== 'reasoning') return undefined;
   const left = expected as JsonObject;
   const right = actual as JsonObject;
@@ -439,8 +677,8 @@ function reasoningNormalizationGap(expected: unknown, actual: unknown): string[]
   if (typeof blob !== 'string' || !blob || blob !== right.encrypted_content) return undefined;
   // Diff the NORMALIZED items. Diffing the raw ones names fields that
   // normalization already reconciles, which points a reader at a red herring.
-  const normalizedLeft = normalizeToolCallJson(left) as JsonObject;
-  const normalizedRight = normalizeToolCallJson(right) as JsonObject;
+  const normalizedLeft = normalizeToolCallJson(left, defaults) as JsonObject;
+  const normalizedRight = normalizeToolCallJson(right, defaults) as JsonObject;
   const fields = [...new Set([...Object.keys(normalizedLeft), ...Object.keys(normalizedRight)])].sort()
     .filter(key => canonicalJson(normalizedLeft[key]) !== canonicalJson(normalizedRight[key]));
   return fields.length ? fields : undefined;
@@ -535,8 +773,10 @@ export function resetReasoningGapWarningsForTests(): void {
  * clean.
  *
  * `equalAfterStrip` separates the two mechanisms. It re-compares the WHOLE
- * items with the shared filler-strip rule applied to `arguments` — not the
- * arguments alone, or a divergence in any other field would be reported as a
+ * items with head matching's schema normalization (scalar re-typing and
+ * default stripping, `stripSchemaDefaults`) and the shared filler-strip rule
+ * both applied to `arguments` — not the arguments alone, or
+ * a divergence in any other field would be reported as a
  * strip-rule gap the code never examined. When that makes them equal, the only
  * thing standing between the head and its own echo is filler the shared rule
  * removes, which is the shape #84 had. When they still differ, the difference
@@ -554,6 +794,7 @@ export function resetReasoningGapWarningsForTests(): void {
 function toolArgumentNormalizationGap(
   expected: unknown,
   actual: unknown,
+  defaults: ToolSchemaDefaults,
   requiredProps: () => Map<string, Set<string>>,
 ): Record<string, unknown> | undefined {
   if (conversationItemKind(expected) !== 'function_call') return undefined;
@@ -565,7 +806,8 @@ function toolArgumentNormalizationGap(
   if (typeof left.name !== 'string' || left.name !== right.name) return undefined;
   // Same call, same tool, different bytes. Compare NORMALIZED arguments so the
   // canonical-JSON reconciliation this file already applies is not re-reported.
-  if (canonicalJson(normalizeToolCallJson(left)) === canonicalJson(normalizeToolCallJson(right))) {
+  if (canonicalJson(normalizeToolCallJson(left, defaults))
+    === canonicalJson(normalizeToolCallJson(right, defaults))) {
     return undefined;
   }
   const required = requiredProps().get(left.name);
@@ -578,8 +820,8 @@ function toolArgumentNormalizationGap(
       // Carry the rest of the item along, so a difference somewhere other than
       // `arguments` cannot be reported as the filler-strip rule having forked.
       return canonicalJson({
-        ...(normalizeToolCallJson(item) as JsonObject),
-        arguments: canonicalJson(sanitizeToolInput(parsed, required)),
+        ...(normalizeToolCallJson(item, defaults) as JsonObject),
+        arguments: canonicalJson(stripSchemaDefaults(item.name, sanitizeToolInput(parsed, required), defaults)),
       });
     } catch { return undefined; }
   };
@@ -641,26 +883,40 @@ export function resetToolArgumentGapWarningsForTests(): void {
 function continuationMismatchDetails(
   entry: ConnectionEntry,
   payload: JsonObject,
+  defaults: ToolSchemaDefaults,
   log?: (message: string) => void,
   // Only the head clodex actually gave up on should reach stderr. Every candidate
   // head is described in the diagnostic, and a gap on a head that lost to a better
   // match costs nothing, so warning on those would overstate the damage.
   warnOnGap = false,
+  /**
+   * Collects the stderr warnings as thunks instead of raising them, for a caller
+   * that may still overturn the mismatch being described — today, a request that
+   * goes on to continue a head freed during a pacing wait. Deferring the whole
+   * warning rather than emitting and retracting it is what keeps a dropped
+   * warning from spending the per-signature budget the next genuine occurrence
+   * needs.
+   */
+  deferWarnings?: Array<() => void>,
 ): Record<string, unknown> {
+  const raise = (warn: () => void): void => {
+    if (deferWarnings) deferWarnings.push(warn);
+    else warn();
+  };
   const full = inputArray(payload);
   const prefix = [...(entry.requestInput ?? []), ...(entry.expectedAssistant ?? [])];
   const comparable = Math.min(full.length, prefix.length);
   let mismatch = comparable;
   for (let index = 0; index < comparable; index += 1) {
-    if (!arraysEqual([full[index]], [prefix[index]])) {
+    if (!arraysEqual([full[index]], [prefix[index]], defaults)) {
       mismatch = index;
       break;
     }
   }
   const expected = mismatch < prefix.length ? prefix[mismatch] : undefined;
   const actual = mismatch < full.length ? full[mismatch] : undefined;
-  const reasoningGap = reasoningNormalizationGap(expected, actual);
-  if (reasoningGap && warnOnGap) warnReasoningNormalizationGap(reasoningGap, log);
+  const reasoningGap = reasoningNormalizationGap(expected, actual, defaults);
+  if (reasoningGap && warnOnGap) raise(() => warnReasoningNormalizationGap(reasoningGap, log));
   // Claude may legitimately omit stored reasoning items (continuationMatch's
   // omitted_reasoning mode), which shifts the exact-prefix divergence onto a
   // reasoning-vs-call pair and would hide a forked strip rule sitting on the
@@ -683,6 +939,7 @@ function continuationMismatchDetails(
     toolArgumentGap = toolArgumentNormalizationGap(
       gapExpected,
       actual,
+      defaults,
       // The head's own schema when it has one; the current turn's tools are only a
       // fallback for a head that predates the snapshot (see headRequiredToolProps).
       () => entry.headRequiredToolProps ?? requiredToolProps(payload),
@@ -695,7 +952,8 @@ function continuationMismatchDetails(
   // shared with Claude Code's UI. Those are still recorded on the diagnostic, and
   // traced here so --trace alone shows a counted-but-not-warned gap.
   if (toolArgumentGap?.equalAfterStrip === true) {
-    if (warnOnGap) warnToolArgumentNormalizationGap(toolArgumentGap, log);
+    const gap = toolArgumentGap;
+    if (warnOnGap) raise(() => warnToolArgumentNormalizationGap(gap, log));
   } else if (toolArgumentGap && warnOnGap) {
     // Same gating as the warner: only the head clodex gave up on is described,
     // so the per-candidate loop cannot turn one mismatch into a trace stream.
@@ -707,8 +965,8 @@ function continuationMismatchDetails(
     firstMismatch: mismatch,
     expectedKind: expected === undefined ? 'none' : conversationItemKind(expected),
     actualKind: actual === undefined ? 'none' : conversationItemKind(actual),
-    ...(expected !== undefined ? { expectedHash: conversationItemHash(expected) } : {}),
-    ...(actual !== undefined ? { actualHash: conversationItemHash(actual) } : {}),
+    ...(expected !== undefined ? { expectedHash: conversationItemHash(expected, defaults) } : {}),
+    ...(actual !== undefined ? { actualHash: conversationItemHash(actual, defaults) } : {}),
     ...(reasoningGap
       ? {
           reasoningNormalizationGap: reasoningGap,
@@ -724,11 +982,12 @@ function continuationMismatchDetails(
 function continuationMismatchSummary(
   entry: ConnectionEntry,
   payload: JsonObject,
+  defaults: ToolSchemaDefaults,
   log?: (message: string) => void,
   mismatchDump = false,
   precomputedDetails?: Record<string, unknown>,
 ): string {
-  const details = precomputedDetails ?? continuationMismatchDetails(entry, payload, log, true);
+  const details = precomputedDetails ?? continuationMismatchDetails(entry, payload, defaults, log, true);
   let summary = `full_items=${details.fullItems} expected_prefix_items=${details.expectedPrefixItems} `
     + `first_mismatch=${details.firstMismatch} expected=${details.expectedKind} actual=${details.actualKind}`;
   // The hashes make same-kind mismatches diagnosable from the log alone. With
@@ -743,8 +1002,8 @@ function continuationMismatchSummary(
       const full = inputArray(payload);
       const prefix = [...(entry.requestInput ?? []), ...(entry.expectedAssistant ?? [])];
       const index = details.firstMismatch as number;
-      log(`mismatch dump expected[${index}]: ${mismatchDumpLine(prefix, index)}`);
-      log(`mismatch dump actual[${index}]: ${mismatchDumpLine(full, index)}`);
+      log(`mismatch dump expected[${index}]: ${mismatchDumpLine(prefix, index, defaults)}`);
+      log(`mismatch dump actual[${index}]: ${mismatchDumpLine(full, index, defaults)}`);
     }
   }
   return summary;
@@ -752,9 +1011,9 @@ function continuationMismatchSummary(
 
 /** One side of a mismatch dump: canonical item bytes, capped, or `(absent)`
  * when the divergence is one history simply ending before the other. */
-function mismatchDumpLine(items: unknown[], index: number): string {
+function mismatchDumpLine(items: unknown[], index: number, defaults: ToolSchemaDefaults): string {
   if (index >= items.length) return '(absent)';
-  const line = canonicalJson(normalizeToolCallJson(items[index]));
+  const line = canonicalJson(normalizeToolCallJson(items[index], defaults));
   const max = 2_000;
   const marker = ' [truncated]';
   return line.length <= max ? line : line.slice(0, max - marker.length) + marker;
@@ -769,29 +1028,49 @@ function mismatchDumpLine(items: unknown[], index: number): string {
  * meaning to comparing whole arrays, but it lets both sides be computed once
  * instead of re-serializing an entire conversation for every candidate head.
  */
-function canonicalItemStrings(items: unknown[]): string[] {
-  return items.map(item => canonicalJson(normalizeToolCallJson([item])));
+function canonicalItemStrings(items: unknown[], defaults: ToolSchemaDefaults): string[] {
+  return items.map(item => canonicalJson(normalizeToolCallJson([item], defaults)));
 }
 
-/** True when `head` is a strict prefix of `client`. Exits at the first difference. */
-function isStrictPrefix(head: string[], client: string[]): boolean {
-  if (client.length <= head.length) return false;
+/**
+ * True when `head` is a prefix of `client`, counting the two being identical.
+ * Exits at the first difference.
+ */
+function isPrefixOrEqual(head: string[], client: string[]): boolean {
+  if (client.length < head.length) return false;
   for (let index = 0; index < head.length; index += 1) {
     if (head[index] !== client[index]) return false;
   }
   return true;
 }
 
+/** True when `head` is a strict prefix of `client` — equal histories do not count. */
+function isStrictPrefix(head: string[], client: string[]): boolean {
+  return client.length > head.length && isPrefixOrEqual(head, client);
+}
+
 function continuationMatch(
   entry: ConnectionEntry,
   payload: JsonObject,
   clientItems: string[],
+  defaults: ToolSchemaDefaults,
+  defaultsId: string,
 ): ContinuationMatch | undefined {
   if (!entry.responseId || !entry.requestInput || !entry.expectedAssistant) return undefined;
   const full = inputArray(payload);
+  // Both sides of every comparison have to be canonicalized under the SAME
+  // defaults map. The memo is keyed on that map's fingerprint, so a head cached
+  // under one client's schemas is recomputed rather than compared across.
+  if (entry.canonicalToolDefaultsId !== defaultsId) {
+    entry.canonicalPrefix = undefined;
+    entry.canonicalEchoablePrefix = undefined;
+    entry.canonicalToolDefaultsId = defaultsId;
+  }
   // The stored prefix only changes when a response completes, so canonicalize it
   // once per head rather than once per lookup.
-  entry.canonicalPrefix ??= canonicalItemStrings([...entry.requestInput, ...entry.expectedAssistant]);
+  entry.canonicalPrefix ??= canonicalItemStrings(
+    [...entry.requestInput, ...entry.expectedAssistant], defaults,
+  );
   if (isStrictPrefix(entry.canonicalPrefix, clientItems)) {
     return { delta: full.slice(entry.canonicalPrefix.length), mode: 'exact' };
   }
@@ -803,7 +1082,7 @@ function continuationMatch(
   // remaining response items still match exactly.
   const echoedAssistant = entry.expectedAssistant.filter(item => conversationItemKind(item) !== 'reasoning');
   if (echoedAssistant.length === entry.expectedAssistant.length) return undefined;
-  entry.canonicalEchoablePrefix ??= canonicalItemStrings([...entry.requestInput, ...echoedAssistant]);
+  entry.canonicalEchoablePrefix ??= canonicalItemStrings([...entry.requestInput, ...echoedAssistant], defaults);
   if (!isStrictPrefix(entry.canonicalEchoablePrefix, clientItems)) return undefined;
   return { delta: full.slice(entry.canonicalEchoablePrefix.length), mode: 'omitted_reasoning' };
 }
@@ -1316,12 +1595,23 @@ function failContext(
   message: string,
   diagnosticDetails: Record<string, unknown>,
   statusCode?: number,
-  retryAfterSeconds?: number,
+  retryAfter?: RetryAfterHint,
 ): void {
   if (ctx.closed || entry.current !== ctx) return;
+  const retryAfterSeconds = retryAfter === undefined
+    ? undefined
+    : clampRetryAfterSeconds(retryAfter.seconds);
   entry.debug(`fail: ${message}`);
   emitResponseErrorDiagnostic(entry, ctx, {
     ...diagnosticDetails,
+    ...(retryAfter !== undefined
+      ? {
+          retryAfterSource: retryAfter.source,
+          ...('rawSeconds' in retryAfter
+            ? { rawRetryAfterSeconds: retryAfter.rawSeconds }
+            : {}),
+        }
+      : {}),
     ...diagnosticTextFingerprint('errorMessage', message),
   });
   flushPending(ctx);
@@ -1332,7 +1622,9 @@ function failContext(
       type: statusCode === undefined ? 'transport_error' : anthropicErrorType(statusCode),
       code: statusCode === undefined ? 'websocket_transport_error' : String(statusCode),
       message,
-      param: null,
+      param: retryAfter === undefined
+        ? null
+        : retryAfterProvenanceParam(retryAfter),
       ...(retryAfterSeconds !== undefined ? { retry_after_seconds: retryAfterSeconds } : {}),
     },
   });
@@ -1444,16 +1736,155 @@ function evictOldestIdleGeneration(
   while (connectionCountByGeneration(generation) >= maxConnections && idle.length) {
     const oldest = idle.shift();
     if (oldest) {
+      // Idle age is a MARGIN indicator, not a cost: a victim idle for seconds was
+      // plausibly about to be reused, one idle for minutes was not, and neither
+      // says what the eviction actually cost. Log it as well as recording it,
+      // because the diagnostic ledger needs `--ws-diagnostics` and this does not.
+      const idleMs = Math.max(0, oldest.options.now() - oldest.lastUsedAt);
+      oldest.debug(
+        `evicting the oldest idle ${generation} connection to stay within its cap: `
+        + `connection=${oldest.debugId} idle_ms=${idleMs} cap=${maxConnections} reason=${reason}`,
+      );
       evictions.push({
         connectionId: oldest.debugId,
         partitionKey: oldest.key,
         generation: oldest.generation,
         reason,
+        idleMs,
       });
       deleteEntry(oldest);
     }
   }
   return evictions;
+}
+
+/**
+ * The process ran out of file descriptors while opening a socket. `EMFILE` is
+ * the per-process limit, `ENFILE` the system-wide file table. A numeric-address
+ * dial reports either as the socket's `error` code — but the shipped route is a
+ * HOSTNAME, and a full descriptor table fails inside `getaddrinfo` first, which
+ * Node reports as `ENOTFOUND` with no cause. So the error code alone is not the
+ * detector: on any other socket-open error, `descriptorExhaustionCode` probes
+ * the process directly by opening one descriptor. Reproduced on macOS and
+ * Linux under a hard `ulimit -n 40`: `dns.lookup('chatgpt.com')` -> ENOTFOUND,
+ * `net.connect(port, '127.0.0.1')` -> EMFILE, and freeing one descriptor makes
+ * the same lookup succeed.
+ */
+const DESCRIPTOR_EXHAUSTION_CODES = new Set(['EMFILE', 'ENFILE']);
+
+function isDescriptorExhaustion(code: unknown): code is string {
+  return typeof code === 'string' && DESCRIPTOR_EXHAUSTION_CODES.has(code);
+}
+
+/**
+ * The exhaustion code behind a socket-open failure, or undefined when the
+ * process can still open a descriptor. The probe costs one open/close of the
+ * null device and runs only on the failure path.
+ */
+function descriptorExhaustionCode(error: Error): string | undefined {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (isDescriptorExhaustion(code)) return code;
+  try {
+    closeSync(openSync(devNull, 'r'));
+    return undefined;
+  } catch (probe) {
+    const probeCode = (probe as NodeJS.ErrnoException).code;
+    return isDescriptorExhaustion(probeCode) ? probeCode : undefined;
+  }
+}
+
+let descriptorExhaustionNoticed = false;
+
+export function resetDescriptorExhaustionNoticeForTests(): void {
+  descriptorExhaustionNoticed = false;
+}
+
+/**
+ * Descriptor exhaustion, handled as load-shedding rather than as a failure.
+ *
+ * With no numeric pool cap, the descriptor limit is where the pool stops
+ * growing — so hitting it is exactly the condition a cap eviction used to
+ * stand in for, now signalled by the machine instead of guessed. Every idle
+ * pooled head is closed, oldest first, so the transport retry that follows
+ * (`retryTransportFailure`, one attempt with the full context) opens its
+ * replacement against freed descriptors. Busy heads and isolated sockets are
+ * untouched: they carry a response somebody is waiting on, and closing them
+ * trades one failure for another. When nothing is idle there is nothing to
+ * shed, the retry reports the same exhaustion, and the request fails with a
+ * message that names the limit — bounded by the single retry, never a loop.
+ *
+ * Victims are TERMINATED, not closed. `close()` starts the WebSocket closing
+ * handshake and the descriptor stays open until the peer answers (or ws's
+ * 30-second close timeout fires); `terminate()` destroys the underlying socket,
+ * and Node closes the descriptor synchronously inside `uv_close`, so the
+ * replacement dialled in the same tick can take it.
+ *
+ * The user is told ONCE per process, on the parent-notice channel — the muted
+ * stderr under `clodex claude` would swallow it (see src/parent-notice.ts) —
+ * in terms they can act on: which limit, how many pooled connections were
+ * registered, and the knob. Later occurrences go to the debug log and the
+ * diagnostic ledger.
+ */
+function shedIdleConnectionsForDescriptors(
+  failing: ConnectionEntry,
+  ctx: RequestContext,
+  code: string,
+  socketErrorCode: string | undefined,
+): void {
+  // Pooled entries other than the one whose dial just failed. Isolated sockets
+  // are never registered, so they are neither counted nor shed.
+  const registered = connectionEntries().filter(entry => entry !== failing);
+  const idle = registered
+    .filter(entry => !entry.inFlight && entry.generation !== 'isolated')
+    .sort((left, right) => left.lastUsedAt - right.lastUsedAt);
+  for (const victim of idle) {
+    const idleMs = Math.max(0, victim.options.now() - victim.lastUsedAt);
+    victim.debug(
+      `shedding idle ${victim.generation} connection after ${code}: `
+      + `connection=${victim.debugId} idle_ms=${idleMs} reason=descriptor_exhaustion`,
+    );
+    victim.inFlight = false;
+    victim.current = undefined;
+    unregisterEntry(victim);
+    try { victim.socket.terminate(); } catch { /* ignore */ }
+  }
+  failing.debug(
+    `${code} opening connection=${failing.debugId}: registered=${registered.length} shed=${idle.length}`
+    + (socketErrorCode && socketErrorCode !== code ? ` reported_as=${socketErrorCode}` : ''),
+  );
+  emitContextDiagnostic(failing, ctx, {
+    event: 'ws_descriptor_exhaustion',
+    code,
+    detectedBy: socketErrorCode === code ? 'error_code' : 'descriptor_probe',
+    socketErrorCode: boundedDiagnosticIdentifier(socketErrorCode),
+    heldConnections: registered.length,
+    shedConnections: idle.length,
+  });
+  if (descriptorExhaustionNoticed) return;
+  descriptorExhaustionNoticed = true;
+  emitParentNotice(
+    `clodex: warning: ${descriptorLimitName(code)} was reached (${code}) while opening a ChatGPT connection. `
+    + `clodex had ${registered.length} pooled connection(s) registered and closed ${idle.length} idle one(s) to recover; `
+    + `each parallel conversation keeps one open. ${descriptorLimitRemedy(code)} `
+    + 'Further open-file warnings suppressed.',
+  );
+}
+
+function descriptorLimitName(code: string): string {
+  return code === 'ENFILE' ? "the system-wide open-file limit" : "this process's open-file limit";
+}
+
+// ENFILE is the kernel's file table, which no per-process knob raises.
+function descriptorLimitRemedy(code: string): string {
+  return code === 'ENFILE'
+    ? 'Close other programs holding many files, or raise the system-wide file limit, if this recurs.'
+    : 'Raise it with `ulimit -n` in the shell that starts clodex (or the service limit for a '
+      + 'launchd/systemd-managed server) if this recurs.';
+}
+
+function descriptorExhaustionMessage(code: string, registered: number): string {
+  return `${descriptorLimitName(code)} was reached (${code}) while opening a ChatGPT connection `
+    + `with ${registered} pooled connection(s) registered; ${descriptorLimitRemedy(code)}`;
 }
 
 function isModelDataEvent(type: string | undefined): boolean {
@@ -1539,7 +1970,11 @@ function transportReplaySafe(ctx: RequestContext): boolean {
 
 function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
   const ctx = entry.current;
-  if (!ctx || ctx.closed) return;
+  if (!ctx || ctx.closed) {
+    // A usage-limit frame between or after responses is only read when diagnostics are on.
+    if (entry.connectionDiagnostic) observeIdleFrame(entry, data);
+    return;
+  }
   const text = Array.isArray(data) ? Buffer.concat(data).toString('utf8') : data.toString('utf8');
   ctx.frameCount += 1;
   if (ctx.transportRetryPending) {
@@ -1563,6 +1998,10 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
   if (ctx.normalizeEvent) event = ctx.normalizeEvent(event);
 
   const type = eventType(event);
+  // Emitted through the request's own sink so the frame carries THIS request's ids.
+  // The connection sink would not: socket callbacks run in the async context of
+  // whichever request created the socket, which on a reused head is an older one.
+  if (isQuotaEvent(type)) observeQuotaEvent(entry, event, 'during_response', ctx.emitDiagnostic);
   trackReasoningProtocol(entry, ctx, event, type);
   captureOutput(ctx, event);
   if (type === 'response.completed') {
@@ -1585,7 +2024,8 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
   const previousMissing = errorCode === 'previous_response_not_found';
   const willRetry = previousMissing && ctx.continued && !ctx.retried && !ctx.emittedModelData;
   if (errorCode === 'websocket_connection_limit_reached' && !ctx.emittedModelData) {
-    const retryAfterSeconds = clampRetryAfterSeconds(responseRetryAfterSeconds(event));
+    const rawRetryAfterSeconds = responseRetryAfterSeconds(event);
+    const retryAfterSeconds = clampRetryAfterSeconds(rawRetryAfterSeconds);
     failContext(
       entry,
       ctx,
@@ -1597,7 +2037,9 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
         retryAfterSeconds,
       },
       429,
-      retryAfterSeconds,
+      rawRetryAfterSeconds === undefined
+        ? { seconds: retryAfterSeconds, source: 'default' }
+        : { seconds: retryAfterSeconds, source: 'upstream', rawSeconds: rawRetryAfterSeconds },
     );
     return;
   }
@@ -1657,10 +2099,11 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
   }
 
   if (errorStatus !== undefined) {
-    // The AI SDK strips unknown frame fields, so a backoff hint survives only
-    // baked into the message text — same reason the connection-limit branch
-    // above spells it out. Clamped, so a hostile hint cannot park a client past
-    // the 120s no-event stream abort.
+    // The closed SDK schema strips `retry_after_seconds`, while its declared
+    // string `param` survives; Response headers were already snapshotted before
+    // this event arrived. Keep the existing bounded message suffix for
+    // downstream recovery and carry authoritative source/raw data in `param` so
+    // the retry boundary can restore a safe captured header.
     // Only when upstream actually gave one. `clampRetryAfterSeconds` supplies a
     // 5s DEFAULT for a missing hint, so clamping unconditionally would have
     // every 429 assert a backoff upstream never stated — and that value becomes
@@ -1668,9 +2111,14 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
     // where the reason says hours: a prose-only "retry after 1800s" would get
     // "; retry after 5s" appended, and the client reads the first match.
     const statedRetryAfter = errorStatus === 429 ? responseRetryAfterSeconds(event) : undefined;
-    const retryAfterSeconds = statedRetryAfter === undefined
+    const retryAfter: RetryAfterHint | undefined = statedRetryAfter === undefined
       ? undefined
-      : clampRetryAfterSeconds(statedRetryAfter);
+      : {
+          seconds: clampRetryAfterSeconds(statedRetryAfter),
+          source: 'upstream',
+          rawSeconds: statedRetryAfter,
+        };
+    const retryAfterSeconds = retryAfter?.seconds;
     const reason = responseErrorMessage(event) ?? `OpenAI rejected the request (HTTP ${errorStatus})`;
     failContext(
       entry,
@@ -1690,7 +2138,7 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
         ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
       },
       errorStatus,
-      retryAfterSeconds,
+      retryAfter,
     );
     return;
   }
@@ -1744,13 +2192,20 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
       ? classified
       : settledReason ? 400 : 502;
     const usageLimited = statusCode === 429;
-    // Only when upstream stated one, and only baked into the TEXT: the AI SDK's
-    // chunk schema is a closed zod object that strips `retry_after_seconds`, so
-    // a hint carried only in the frame field never reaches the client. This is
-    // the same reason the status-carrying branch above spells it out.
-    const retryAfterSeconds = usageLimited && responseRetryAfterSeconds(event) !== undefined
-      ? clampRetryAfterSeconds(responseRetryAfterSeconds(event))
-      : undefined;
+    // Only when upstream stated one. The closed SDK schema strips
+    // `retry_after_seconds` but keeps the declared string `param`; Response
+    // headers were already snapshotted. The marker drives safe restoration,
+    // while this bounded summary remains the downstream fallback when a long
+    // upstream value is deliberately not restored.
+    const rawRetryAfterSeconds = usageLimited ? responseRetryAfterSeconds(event) : undefined;
+    const retryAfter: RetryAfterHint | undefined = rawRetryAfterSeconds === undefined
+      ? undefined
+      : {
+          seconds: clampRetryAfterSeconds(rawRetryAfterSeconds),
+          source: 'upstream',
+          rawSeconds: rawRetryAfterSeconds,
+        };
+    const retryAfterSeconds = retryAfter?.seconds;
     // The BOUNDED summary is the message, upstream's prose is not used at all.
     // A `response.failed` body can echo request content or backend detail, and
     // it does not stay in one place: the synthetic error is rethrown by the SDK
@@ -1778,7 +2233,7 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
         ...diagnosticTextFingerprint('upstreamMessage', responseErrorMessage(event)),
       },
       statusCode,
-      retryAfterSeconds,
+      retryAfter,
     );
     return;
   }
@@ -1815,11 +2270,146 @@ function handleSocketMessage(entry: ConnectionEntry, data: RawData): void {
   }
 }
 
+/**
+ * What the pacer hands back instead of opening a connection it cannot afford.
+ *
+ * Shaped like the frame `failContext` writes for an upgrade 403, but built
+ * standalone: a refusal happens before any connection or request context
+ * exists, so there is no stream to write into, nothing registered to delete and
+ * no context to close. `code` is the stringified status `frameStatusCode` reads
+ * preferentially. The `Retry-After` header is what the SDK's own backoff and
+ * downstream classifier read; the prose keeps a user-facing explanation if
+ * the header is unavailable. The SDK schema strips `retry_after_seconds`.
+ */
+function pacedRefusalResponse(retryAfterSeconds: number): Response {
+  const frame = {
+    type: 'error',
+    sequence_number: 0,
+    error: {
+      type: anthropicErrorType(429),
+      code: '429',
+      message: 'clodex is limiting how fast it opens new OpenAI connections to reduce the chance '
+        + `of an upstream rate limit; retry after ${retryAfterSeconds}s`,
+      param: null,
+      retry_after_seconds: retryAfterSeconds,
+    },
+  };
+  return new Response(`data: ${JSON.stringify(frame)}\n\n`, {
+    status: 200,
+    headers: {
+      'content-type': 'text/event-stream; charset=utf-8',
+      // A real header, not just the prose: `getRetryDelayInMs` reads headers and
+      // ignores the body, so without one the SDK falls back to its fixed 2s/4s
+      // ladder. This does NOT de-correlate the group — refusals debit nothing,
+      // so everyone refused at the same instant sees the same deficit and gets
+      // the same hint — it defers the whole group by long enough for the bucket
+      // to refill, which is what turns a retry storm into a successful retry.
+      'retry-after': String(retryAfterSeconds),
+    },
+  });
+}
+
 function numericRetryAfterHeader(value: string | string[] | undefined): number | undefined {
   const single = Array.isArray(value) ? value[0] : value;
   return typeof single === 'string' && /^\d+$/.test(single.trim())
     ? Number(single.trim())
     : undefined;
+}
+
+/** The upstream event that carries account-meter state rather than response data. */
+function isQuotaEvent(type: string | undefined): boolean {
+  return type === 'codex.rate_limits';
+}
+
+/** Largest serialized ledger (UTF-8 bytes) recorded verbatim; bigger ones keep only their size. */
+const QUOTA_LEDGER_MAX_BYTES = 8000;
+/** Bound on how many top-level field names one event may list. */
+const QUOTA_FIELDS_MAX_COUNT = 24;
+
+function boundedLedger(value: unknown): { value?: unknown; bytes?: number } {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    return {};
+  }
+  if (serialized === undefined) return {};
+  const bytes = Buffer.byteLength(serialized);
+  return bytes <= QUOTA_LEDGER_MAX_BYTES ? { value, bytes } : { bytes };
+}
+
+/**
+ * Record what an upstream frame says about the ACCOUNT's allowance, verbatim.
+ *
+ * Native Codex parses `codex.rate_limits` off this same socket
+ * (`codex-rs/codex-api/src/endpoint/responses_websocket.rs` → `parse_rate_limit_event`
+ * at `rust-v0.154.0`), so the protocol carries the signal even though clodex has
+ * never looked at it. Nothing here changes inference: it observes and returns.
+ *
+ * Two rules the measurement depends on:
+ *  - values are passed through uncoerced — no `?? 0`, no Number() coercion — so a
+ *    fractional percent survives and a missing field stays distinguishable from a
+ *    measured zero (`fieldsPresent` says which keys actually existed);
+ *  - `phase` records whether the frame arrived inside a response or between them.
+ *    `idle` only says no request was in flight when the frame arrived; the last
+ *    response may well have caused it (`response.completed` clears `current`
+ *    before a trailing meter frame lands), but clodex cannot safely attribute it.
+ *
+ * `emit` decides the correlation: the in-flight request's sink during a response,
+ * the uncorrelated connection sink while idle.
+ */
+function observeQuotaEvent(
+  entry: ConnectionEntry,
+  event: unknown,
+  phase: 'during_response' | 'idle',
+  emit: ConnectionEntry['connectionDiagnostic'],
+): void {
+  if (!emit) return;
+  const record = event as Record<string, unknown>;
+  // The sibling ledgers ride the same frame: `additional_rate_limits` holds the
+  // separately metered allowances, `code_review_rate_limits` the code-review one,
+  // and `credits` and `promo` the account's credit and promotion state. Capturing
+  // only `rate_limits` would leave "did a separate allowance move" unanswerable.
+  const rate = boundedLedger(record.rate_limits);
+  const additional = boundedLedger(record.additional_rate_limits);
+  const codeReview = boundedLedger(record.code_review_rate_limits);
+  const credits = boundedLedger(record.credits);
+  const promo = boundedLedger(record.promo);
+  emit({
+    event: 'ws_rate_limits',
+    connectionId: entry.debugId,
+    generation: entry.generation,
+    phase,
+    upstreamEventType: 'codex.rate_limits',
+    fieldCount: Object.keys(record).length,
+    fieldsPresent: Object.keys(record)
+      .slice(0, QUOTA_FIELDS_MAX_COUNT)
+      .map(boundedDiagnosticIdentifier)
+      .filter((name): name is string => name !== undefined),
+    rateLimits: rate.value,
+    rateLimitsBytes: rate.bytes,
+    additionalRateLimits: additional.value,
+    additionalRateLimitsBytes: additional.bytes,
+    codeReviewRateLimits: codeReview.value,
+    codeReviewRateLimitsBytes: codeReview.bytes,
+    credits: credits.value,
+    creditsBytes: credits.bytes,
+    promo: promo.value,
+    promoBytes: promo.bytes,
+    planType: boundedDiagnosticIdentifier(record.plan_type),
+  });
+}
+
+/** Parse a frame that arrived with no request in flight, purely to observe quota. */
+function observeIdleFrame(entry: ConnectionEntry, data: RawData): void {
+  let event: unknown;
+  try {
+    event = JSON.parse(Array.isArray(data) ? Buffer.concat(data).toString('utf8') : data.toString('utf8'));
+  } catch {
+    return;
+  }
+  if (!isQuotaEvent(eventType(event))) return;
+  observeQuotaEvent(entry, event, 'idle', entry.connectionDiagnostic);
 }
 
 function createConnection(
@@ -1832,6 +2422,7 @@ function createConnection(
   debug: ConnectionEntry['debug'],
   /** Optional HTTP(S)_PROXY CONNECT-tunnel agent (see src/outbound-proxy.ts). */
   agent?: import('node:http').Agent,
+  connectionDiagnostic?: ConnectionEntry['connectionDiagnostic'],
 ): ConnectionEntry {
   const now = options.now();
   const socket = new WebSocket(wsUrl, agent ? { headers, agent } : { headers });
@@ -1848,6 +2439,7 @@ function createConnection(
     inFlight: false,
     options,
     debug,
+    connectionDiagnostic,
   };
   if (persistent && key) registerEntry(entry);
   debug(
@@ -1882,18 +2474,21 @@ function createConnection(
       // to a retryable Anthropic 429 synchronously; failContext closes the
       // context here, so the socket error/close transport-retry path sees a
       // finished request and cannot double-handle this failure.
-      const retryAfterSeconds = clampRetryAfterSeconds(
-        numericRetryAfterHeader(response.headers['retry-after']),
-      );
-      // "retry after Ns" is load-bearing: the AI SDK strips unknown frame
-      // fields, so sdkUpstreamErrorDetails recovers the hint from this text.
+      const rawRetryAfterSeconds = numericRetryAfterHeader(response.headers['retry-after']);
+      const retryAfterSeconds = clampRetryAfterSeconds(rawRetryAfterSeconds);
+      // The closed SDK schema strips `retry_after_seconds` but keeps its
+      // declared string `param`, and the Response headers were captured before
+      // this rejection. The marker drives retry restoration; the message keeps
+      // the existing downstream fallback when no header is restored.
       failContext(entry, ctx, 'OpenAI edge throttled the Responses WebSocket upgrade '
         + `(HTTP 403); retry after ${retryAfterSeconds}s`, {
         source: 'unexpected_response',
         httpStatusCode: statusCode,
         mappedStatusCode: 429,
         retryAfterSeconds,
-      }, 429, retryAfterSeconds);
+      }, 429, rawRetryAfterSeconds === undefined
+        ? { seconds: retryAfterSeconds, source: 'default' }
+        : { seconds: retryAfterSeconds, source: 'upstream', rawSeconds: rawRetryAfterSeconds });
       return;
     }
     failContext(entry, ctx, `WebSocket upgrade failed (HTTP ${statusCode})`, {
@@ -1905,13 +2500,26 @@ function createConnection(
   socket.on('error', (error: Error) => {
     const ctx = entry.current;
     if (ctx) {
+      const socketErrorCode = (error as NodeJS.ErrnoException).code;
       const details = {
         source: 'socket_error',
         socketErrorName: boundedDiagnosticIdentifier(error.name),
-        socketErrorCode: boundedDiagnosticIdentifier((error as NodeJS.ErrnoException).code),
+        socketErrorCode: boundedDiagnosticIdentifier(socketErrorCode),
         ...diagnosticTextFingerprint('errorMessage', error.message),
       };
-      handleTransportFailure(entry, ctx, error.message, details);
+      // Shed BEFORE the transport retry below, so the replacement it dials
+      // finds descriptors free. The retry itself is the ordinary one-shot path.
+      // Only a dial can be starved of a descriptor: a socket that is already
+      // open holds its own, and an error there is not descriptor pressure this
+      // request can recover from by shedding (no replay after output either).
+      let message = error.message;
+      const exhaustion = entry.open ? undefined : descriptorExhaustionCode(error);
+      if (exhaustion) {
+        const registered = connectionEntries().filter(other => other !== entry).length;
+        message = descriptorExhaustionMessage(exhaustion, registered);
+        shedIdleConnectionsForDescriptors(entry, ctx, exhaustion, socketErrorCode);
+      }
+      handleTransportFailure(entry, ctx, message, details);
     } else deleteEntry(entry);
   });
   socket.on('close', (code: number, reason: Buffer) => {
@@ -1933,29 +2541,34 @@ function createConnection(
   return entry;
 }
 
+function diagnosticCap(cap: number): number | null {
+  return Number.isFinite(cap) ? cap : null;
+}
+
 /**
- * Build a fetch transport backed by persistent, session-aware Responses sockets.
- * Each returned Response still represents exactly one AI SDK request.
- */
-/**
- * Reads a connection-pool cap from the environment.
+ * Reads a connection-pool cap from the environment — an optional cap on the
+ * idle pool, now that the shipped default is unbounded.
  *
- * Both pools are process-wide, so a workload that fans out into many concurrent
- * subagent conversations can evict heads before their next turn arrives. An
- * explicit option still wins, so tests are never perturbed by a stray variable.
- * A malformed value is reported and ignored rather than silently reinterpreted.
+ * Both pools are process-wide, so a bound set here evicts heads across every
+ * conversation the process serves. An explicit option still wins, so tests are
+ * never perturbed by a stray variable. A malformed value is reported and
+ * ignored rather than silently reinterpreted.
  */
 function envConnectionCap(name: string, log?: (message: string) => void): number | undefined {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === '') return undefined;
   const value = Number(raw.trim());
-  if (!Number.isInteger(value) || value < 1 || value > 1024) {
-    try { log?.(`ws: ignoring ${name}=${raw} (expected an integer between 1 and 1024)`); } catch { /* ignore */ }
+  if (!Number.isInteger(value) || value < 1) {
+    try { log?.(`ws: ignoring ${name}=${raw} (expected a positive integer)`); } catch { /* ignore */ }
     return undefined;
   }
   return value;
 }
 
+/**
+ * Build a fetch transport backed by persistent, session-aware Responses sockets.
+ * Each returned Response still represents exactly one AI SDK request.
+ */
 export function createResponsesWebSocketFetch(
   wsUrl: string,
   log?: (message: string) => void,
@@ -1996,39 +2609,117 @@ export function createResponsesWebSocketFetch(
     if (hasResponsesLiteHeader(headers)) payload = applyResponsesLiteShape(payload);
 
     const authorizationFingerprint = authorizationHeaderFingerprint(headers);
+    const diagnosticCorrelation = diagnosticContext.getStore();
+    const claudeAgentId = diagnosticCorrelation?.claudeAgentId ?? '';
     const partitionKey = responsesWebSocketPartitionKey(
       wsUrl,
       payload,
       options,
       authorizationFingerprint,
+      claudeAgentId,
     );
+    // Per-request, never shared: see toolSchemaDefaults' comment for what a
+    // process-global map does to a server with more than one client.
+    const requestToolDefaults = toolSchemaDefaults(payload);
+    const requestToolDefaultsId = toolSchemaDefaultsFingerprint(requestToolDefaults);
     const promptFingerprint = responsesWebSocketPromptFingerprint(payload);
     const promptFieldHashes = responsesWebSocketPromptFieldHashes(payload);
     const instructionsSnapshot = instructionsFromPayload(payload);
-    const diagnosticCorrelation = diagnosticContext.getStore();
-    const now = resolvedOptions.now();
+    // Re-read after a pacing wait, so head ages stay comparable with the pool
+    // counts reported alongside them.
+    let now = resolvedOptions.now();
     const evictions = cleanupExpiredConnections(now);
 
-    const candidates = partitionKey ? connectionEntries(partitionKey) : [];
-    const idleCandidates = candidates.filter(entry => !entry.inFlight);
-    // Canonicalize the incoming conversation ONCE, not once per candidate head.
-    const clientItems = idleCandidates.length ? canonicalItemStrings(inputArray(payload)) : [];
-    const matches = idleCandidates
-      .map(entry => ({ entry, match: continuationMatch(entry, payload, clientItems) }))
-      .filter((candidate): candidate is { entry: ConnectionEntry; match: ContinuationMatch } => candidate.match !== undefined)
-      // Prefer the longest matching history, which produces the smallest delta.
-      .sort((left, right) => left.match.delta.length - right.match.delta.length
-        || (left.match.mode === right.match.mode ? 0 : left.match.mode === 'exact' ? -1 : 1));
+    // Canonicalize the incoming conversation at most ONCE per request. Both head
+    // scans and the in-flight lineage test below need it, and none of them needs
+    // it when the partition holds nothing to compare against.
+    let canonicalClientItems: string[] | undefined;
+    const clientItems = (): string[] => (
+      canonicalClientItems ??= canonicalItemStrings(inputArray(payload), requestToolDefaults)
+    );
+
+    // Hoisted verbatim so the SAME scan can run a second time after a pacing
+    // wait: same expressions, same ordering, same tie-breaks. Nothing here is
+    // re-tuned — a difference between the two scans could only come from the
+    // partition having changed, which is the point.
+    const scanForHeads = (): {
+      candidates: ConnectionEntry[];
+      idleCandidates: ConnectionEntry[];
+      matches: Array<{ entry: ConnectionEntry; match: ContinuationMatch }>;
+    } => {
+      const scanned = partitionKey ? connectionEntries(partitionKey) : [];
+      const idle = scanned.filter(entry => !entry.inFlight);
+      const canonical = idle.length ? clientItems() : [];
+      return {
+        candidates: scanned,
+        idleCandidates: idle,
+        matches: idle
+          .map(entry => ({
+            entry,
+            match: continuationMatch(entry, payload, canonical, requestToolDefaults, requestToolDefaultsId),
+          }))
+          .filter((candidate): candidate is { entry: ConnectionEntry; match: ContinuationMatch } => candidate.match !== undefined)
+          // Prefer the longest matching history, which produces the smallest delta.
+          .sort((left, right) => left.match.delta.length - right.match.delta.length
+            || (left.match.mode === right.match.mode ? 0 : left.match.mode === 'exact' ? -1 : 1)),
+      };
+    };
+    /**
+     * Could this request still turn out to be a later turn of what `entry` is
+     * generating right now? Only a head that could is allowed to push the request
+     * onto an isolated socket. Every Claude Code subagent inherits its parent's
+     * session id, so one partition holds many unrelated conversations at once —
+     * and a head busy on one of them says nothing about where another belongs.
+     *
+     * A head that has committed nothing yet — its very first response is still
+     * streaming — has no stored history to diverge from, but it is not unknowable:
+     * `current` holds the conversation it is generating for right now, and this
+     * request can only be a later turn of that response if it carries those items
+     * as a prefix. Comparing against them is what keeps a fan-out of subagents
+     * that all start at once from isolating every sibling's opening turn.
+     *
+     * Conservative only where there is genuinely nothing to compare.
+     */
+    const couldPrecedeThisRequest = (entry: ConnectionEntry): boolean => {
+      if (entry.responseId && entry.requestInput && entry.expectedAssistant) {
+        return continuationMatch(
+          entry, payload, clientItems(), requestToolDefaults, requestToolDefaultsId,
+        ) !== undefined;
+      }
+      const streaming = entry.current;
+      // `inFlight` and `current` are set together, so a candidate this predicate is
+      // asked about always has one. Block rather than guess if that ever changes.
+      if (!streaming) return true;
+      // Equality counts, hence `isPrefixOrEqual` rather than the strict form the
+      // continuation check uses: a client that re-sent the same turn is a duplicate
+      // of the response in flight, not a branch off it, and must not be stitched
+      // onto a turn whose output it has never seen.
+      // Same snapshot rule as the head caches below: bytes canonicalized under a
+      // different defaults map cannot be compared against this request's client side.
+      if (streaming.canonicalInputToolDefaultsId !== requestToolDefaultsId) {
+        streaming.canonicalInput = undefined;
+        streaming.canonicalInputToolDefaultsId = requestToolDefaultsId;
+      }
+      streaming.canonicalInput ??= canonicalItemStrings(
+        inputArray(streaming.originalPayload), requestToolDefaults,
+      );
+      return isPrefixOrEqual(streaming.canonicalInput, clientItems());
+    };
+    /** The in-flight head that forced isolation, for the diagnostic. */
+    const blockingHead = (entries: ConnectionEntry[]): ConnectionEntry | undefined =>
+      entries.find(entry => entry.inFlight && couldPrecedeThisRequest(entry));
+
+    let { candidates, idleCandidates, matches } = scanForHeads();
     let selected: ConnectionEntry | undefined = matches[0]?.entry;
-    const selectedMatch = matches[0]?.match;
-    const selectedDelta = selectedMatch?.delta;
+    let selectedMatch = matches[0]?.match;
+    let selectedDelta = selectedMatch?.delta;
     const diagnosticEntry = selected
       ?? [...idleCandidates].sort((left, right) => right.lastUsedAt - left.lastUsedAt)[0]
       ?? candidates[0];
     debug(
       `lookup key=${debugKey(partitionKey)} prompt=${debugKey(promptFingerprint)} hit=${candidates.length > 0} heads=${candidates.length} active_connections=${connectionCount()}`,
     );
-    const promptChanges = changedPromptFields(diagnosticEntry?.promptFieldHashes, promptFieldHashes);
+    let promptChanges = changedPromptFields(diagnosticEntry?.promptFieldHashes, promptFieldHashes);
     if (promptChanges.length) debug(`prompt fields changed: ${promptChanges.join(',')}`);
     if (promptChanges.includes('instructions')) {
       const summary = instructionChangeSummary(diagnosticEntry?.instructionsSnapshot, instructionsSnapshot);
@@ -2040,27 +2731,57 @@ export function createResponsesWebSocketFetch(
     let promotedConnectionId: number | undefined;
     let decision: 'continuation' | 'parallel_isolated' | 'history_mismatch_new_head' | 'new_partition_head' | 'unpartitioned_socket';
     let candidateMismatchDetails: Map<ConnectionEntry, Record<string, unknown>> | undefined;
+    // Held until this request's outcome is final. Classification runs against
+    // the partition as it stood on ARRIVAL, so a warning it raises can still be
+    // overturned by a head that frees up during a pacing wait — and telling a
+    // user their caching is degraded on a turn that ends up perfectly cached is
+    // how the one warning whose value depends on being believed gets ignored.
+    const deferredMismatchWarnings: Array<() => void> = [];
+    const flushMismatchWarnings = (): void => {
+      for (const warn of deferredMismatchWarnings) warn();
+      deferredMismatchWarnings.length = 0;
+    };
 
-    if (selected && selectedDelta) {
-      sendPayload = { ...payload, input: selectedDelta, previous_response_id: selected.responseId };
+    // Hoisted alongside the scan, and for the same reason: adopting a head found
+    // by the second scan has to leave exactly the state an arrival-time match
+    // would have left. Returns the decision so the chain below still assigns
+    // `decision` on every path.
+    const continueOnHead = (entry: ConnectionEntry, match: ContinuationMatch): 'continuation' => {
+      sendPayload = { ...payload, input: match.delta, previous_response_id: entry.responseId };
       continued = true;
-      if (selected.generation === 'nursery') {
+      if (entry.generation === 'nursery') {
         evictions.push(...evictOldestIdleGeneration(
           'established',
           resolvedOptions.maxConnections,
           'established_lru_cap',
         ));
-        selected.generation = 'established';
-        promotedConnectionId = selected.debugId;
+        entry.generation = 'established';
+        promotedConnectionId = entry.debugId;
       }
-      decision = 'continuation';
       debug(
-        `continuing chain with ${selectedDelta.length} incremental input item(s)`
-        + (selectedMatch.mode === 'omitted_reasoning' ? ' after accepting omitted reasoning' : ''),
+        `continuing chain with ${match.delta.length} incremental input item(s)`
+        + (match.mode === 'omitted_reasoning' ? ' after accepting omitted reasoning' : ''),
       );
-    } else if (candidates.some(entry => entry.inFlight)) {
+      return 'continuation';
+    };
+
+    let arrivalBlockingHead = selected ? undefined : blockingHead(candidates);
+    if (selected && selectedDelta) {
+      decision = continueOnHead(selected, selectedMatch);
+    } else if (arrivalBlockingHead) {
       // Claude auxiliary requests can share a session id. Never multiplex or
       // queue a request whose lineage cannot yet include the active response.
+      //
+      // Only a head that could still BE this request's parent counts. Gating on
+      // "any head in the partition is busy" instead cost most of the caching on
+      // every parallel fan-out: subagents share their parent's session id, so one
+      // busy subagent sent every other subagent's turn down this branch, and
+      // `persistent = false` meant none of them left a head behind — so the next
+      // turn resent the whole conversation too, for as long as anything was in
+      // flight. Multiple heads per partition are already routine (see the
+      // mismatch branch below) and an idle one is already continued while a
+      // sibling streams, so an unrelated busy head is no reason to give up a
+      // chain.
       selected = undefined;
       persistent = false;
       decision = 'parallel_isolated';
@@ -2068,7 +2789,9 @@ export function createResponsesWebSocketFetch(
     } else if (diagnosticEntry) {
       // A rewind, branch, or hidden auxiliary inference gets its own full-context
       // head. Existing heads remain eligible for later exact-prefix matches.
-      const diagnosticMismatch = continuationMismatchDetails(diagnosticEntry, payload, debug, true);
+      const diagnosticMismatch = continuationMismatchDetails(
+        diagnosticEntry, payload, requestToolDefaults, debug, true, deferredMismatchWarnings,
+      );
       candidateMismatchDetails = new Map([[diagnosticEntry, diagnosticMismatch]]);
       // Every abandoned non-diagnostic head warns independently of diagnostics.
       // Cache each mismatch so the diagnostic payload does not evaluate it again.
@@ -2076,7 +2799,9 @@ export function createResponsesWebSocketFetch(
         if (candidate === diagnosticEntry) continue;
         candidateMismatchDetails.set(
           candidate,
-          continuationMismatchDetails(candidate, payload, debug, true),
+          continuationMismatchDetails(
+            candidate, payload, requestToolDefaults, debug, true, deferredMismatchWarnings,
+          ),
         );
       }
       debug(
@@ -2084,6 +2809,7 @@ export function createResponsesWebSocketFetch(
         + `(${continuationMismatchSummary(
           diagnosticEntry,
           payload,
+          requestToolDefaults,
           debug,
           mismatchDump,
           diagnosticMismatch,
@@ -2094,6 +2820,156 @@ export function createResponsesWebSocketFetch(
       decision = 'new_partition_head';
     } else {
       decision = 'unpartitioned_socket';
+    }
+
+    // Pace only the path that opens a NEW connection. Reusing a head — nursery
+    // or established — sends on a socket that already exists, costs the account
+    // no upgrade, and must never wait behind the bucket. The wait sits ahead of
+    // the nursery eviction below so a queued request does not retire a head it
+    // may still be seconds away from needing.
+    let pacingWaitedMs: number | undefined;
+    /** What the post-wait re-evaluation concluded; absent when nothing queued. */
+    let pacingRescanOutcome: 'continuation' | 'parallel_isolated' | 'no_change' | undefined;
+    if (!selected) {
+      const pacer = options.pacer ?? sharedWsUpgradePacer();
+      const pacingStartedAt = resolvedOptions.now();
+      let admission: UpgradeAdmission;
+      try {
+        admission = await pacer.admit(init?.signal ?? undefined);
+      } catch (error) {
+        // Cancelled while queued: never open the connection it was waiting for.
+        emitDiagnostic(options, {
+          event: 'ws_new_connection_paced',
+          outcome: 'aborted',
+          decision,
+          waitedMs: Math.max(0, resolvedOptions.now() - pacingStartedAt),
+        }, diagnosticCorrelation);
+        // Nothing will overturn the classification now, so it stands.
+        flushMismatchWarnings();
+        throw error;
+      }
+      if (admission.kind === 'refused') {
+        debug(
+          `refused a new connection to hold the pacing rate; retry after ${admission.retryAfterSeconds}s`,
+        );
+        emitDiagnostic(options, {
+          event: 'ws_new_connection_paced',
+          outcome: 'refused',
+          decision,
+          requiredWaitMs: admission.requiredWaitMs,
+          retryAfterSeconds: admission.retryAfterSeconds,
+        }, diagnosticCorrelation);
+        flushMismatchWarnings();
+        return pacedRefusalResponse(admission.retryAfterSeconds);
+      }
+      if (admission.waitedMs > 0) {
+        pacingWaitedMs = admission.waitedMs;
+        debug(`paced new connection by ${admission.waitedMs}ms`);
+        emitDiagnostic(options, {
+          event: 'ws_new_connection_paced',
+          outcome: 'admitted',
+          decision,
+          waitedMs: admission.waitedMs,
+        }, diagnosticCorrelation);
+      }
+      // Re-read the clock and reap what expired meanwhile, so head ages are
+      // measured from now rather than from arrival.
+      now = resolvedOptions.now();
+      evictions.push(...cleanupExpiredConnections(now));
+      // A sibling may also have FINISHED while this request was queued, leaving
+      // an idle head it could continue. It was classified against the partition
+      // as it stood on arrival, so without a second scan it opens a duplicate
+      // persistent head for a chain that is sitting right there — which fills
+      // the nursery, evicts other conversations' heads and forces the
+      // full-context resends that open still more connections.
+      //
+      // Only when it was actually QUEUED. A request admitted on arrival resumes
+      // in the same microtask turn, and a head can only be freed by an upstream
+      // completion, which arrives on a socket event — a macrotask. So there the
+      // second scan could not see anything the first did not, and is skipped.
+      //
+      // Read from the pacer's own queued flag rather than from `waitedMs`,
+      // which is a difference of two clock reads: a clock stepped backwards
+      // during the wait reports 0 for a request that really did queue, and
+      // gating on the number would skip the re-scan exactly there. A pacer that
+      // reports no flag (an injected one) still falls back to the elapsed time.
+      //
+      // Nothing between this scan and `dispatchContext` below awaits, so the
+      // selection and the `inFlight` claim on the head happen in one
+      // synchronous run: two queued requests resuming from the pacer cannot
+      // both adopt the same freed head.
+      if (admission.queued ?? admission.waitedMs > 0) {
+        const rescan = scanForHeads();
+        const rematched = rescan.matches[0];
+        if (rematched) {
+          ({ candidates, idleCandidates, matches } = rescan);
+          selected = rematched.entry;
+          selectedMatch = rematched.match;
+          selectedDelta = rematched.match.delta;
+          // Restore what the in-flight demotion below (or on arrival) may have
+          // taken away: an adopted head must leave the same state an
+          // arrival-time match would have, including the persistence a
+          // transport-retry replacement inherits.
+          persistent = Boolean(partitionKey);
+          // Report the prompt drift against the head actually being continued,
+          // not against whichever idle branch the arrival scan happened to pick
+          // as its diagnostic stand-in.
+          promptChanges = changedPromptFields(rematched.entry.promptFieldHashes, promptFieldHashes);
+          decision = continueOnHead(rematched.entry, rematched.match);
+          pacingRescanOutcome = 'continuation';
+          debug('continuing a chain head that freed up during the pacing wait');
+          if (promptChanges.length) debug(`prompt fields changed: ${promptChanges.join(',')}`);
+          // This request opens no connection after all, so the token it was
+          // charged goes back instead of pacing the next request against an
+          // upgrade that never happened — the same rule a cancellation follows.
+          admission.release?.();
+        } else {
+          pacingRescanOutcome = 'no_change';
+        }
+      }
+      // A same-partition request may have gone in flight across the yield. It
+      // was classified when no head existed, so without this both would open a
+      // persistent nursery head for one key — and a fan-out would fill the
+      // nursery with duplicates, evicting other conversations' heads and
+      // forcing the full-context resends that open still more connections. An
+      // overlap like this takes an isolated socket today; keep that.
+      //
+      // Same lineage test as on arrival, and for the same reason: the duplicate
+      // this guards against is a second head for ONE conversation, which is what
+      // a head that could still be this request's parent describes. A head busy
+      // on a different conversation is not a duplicate of anything.
+      //
+      // Unconditional, NOT gated on having waited: `admit` is async, so even an
+      // immediate admission resumes a microtask later, and two same-partition
+      // requests arriving in one tick both resume having waited zero. The head
+      // scan above ran before that yield either way. It yields to a head this
+      // request can continue, exactly as the arrival-time chain does.
+      if (!selected && persistent && partitionKey) {
+        const blocked = blockingHead(connectionEntries(partitionKey));
+        if (blocked) {
+          arrivalBlockingHead = blocked;
+          persistent = false;
+          decision = 'parallel_isolated';
+          debug('parallel request using an isolated socket after pacing');
+          if (pacingRescanOutcome === 'no_change') pacingRescanOutcome = 'parallel_isolated';
+        }
+      }
+    }
+
+    // The classification is final here. A request that rematched after its wait
+    // was not degraded after all, so its arrival warnings are dropped rather
+    // than raised; the count stays in the ledger and the trace so the drop is
+    // never invisible.
+    let suppressedMismatchWarnings: number | undefined;
+    if (selected && deferredMismatchWarnings.length) {
+      suppressedMismatchWarnings = deferredMismatchWarnings.length;
+      debug(
+        `suppressed ${suppressedMismatchWarnings} arrival mismatch warning(s) after continuing a `
+        + 'head that freed up during the pacing wait',
+      );
+      deferredMismatchWarnings.length = 0;
+    } else {
+      flushMismatchWarnings();
     }
 
     if (!selected && persistent) {
@@ -2120,6 +2996,8 @@ export function createResponsesWebSocketFetch(
           ? String((payload.reasoning as JsonObject).effort).trim().toLowerCase()
           : '',
         promptCacheKey: typeof payload.prompt_cache_key === 'string' ? payload.prompt_cache_key : undefined,
+        claudeAgentId: claudeAgentId || undefined,
+        claudeParentAgentId: diagnosticCorrelation?.claudeParentAgentId,
       },
       promptFingerprint,
       promptFieldHashes,
@@ -2127,7 +3005,7 @@ export function createResponsesWebSocketFetch(
       input: {
         count: requestInput.length,
         kinds: requestInput.map(conversationItemKind),
-        hashes: requestInput.map(conversationItemHash),
+        hashes: requestInput.map(item => conversationItemHash(item, requestToolDefaults)),
       },
       candidateCount: candidates.length,
       idleCandidateCount: idleCandidates.length,
@@ -2135,13 +3013,24 @@ export function createResponsesWebSocketFetch(
       activeConnectionCount: connectionCount(),
       nurseryConnectionCount: connectionCountByGeneration('nursery'),
       establishedConnectionCount: connectionCountByGeneration('established'),
-      maxConnections: resolvedOptions.maxConnections,
-      maxNurseryConnections: resolvedOptions.maxNurseryConnections,
+      // `null` is unbounded, the shipped default. A number is a finite cap on
+      // the idle pool from an env or programmatic override.
+      maxConnections: diagnosticCap(resolvedOptions.maxConnections),
+      maxNurseryConnections: diagnosticCap(resolvedOptions.maxNurseryConnections),
       selectedConnectionId: selected?.debugId,
       selectedGeneration: selected?.generation,
       continuationMatchMode: selectedMatch?.mode,
       promotedConnectionId,
       createdConnectionId: selected ? undefined : nextConnectionDebugId,
+      ...(pacingWaitedMs !== undefined ? { pacingWaitedMs } : {}),
+      ...(pacingRescanOutcome !== undefined ? { pacingRescanOutcome } : {}),
+      // Which busy head this request could not be told apart from. Without it an
+      // isolated turn reads as unexplained, and isolation is the single largest
+      // source of uncached prompt tokens on this transport.
+      ...(decision === 'parallel_isolated' && arrivalBlockingHead
+        ? { isolatedByConnectionId: arrivalBlockingHead.debugId }
+        : {}),
+      ...(suppressedMismatchWarnings !== undefined ? { suppressedMismatchWarnings } : {}),
       createdGeneration: selected ? undefined : persistent ? 'nursery' : 'isolated',
       incrementalInputItems: selectedDelta?.length,
       heads: candidates.map(entry => ({
@@ -2154,10 +3043,19 @@ export function createResponsesWebSocketFetch(
         idleMs: Math.max(0, now - entry.lastUsedAt),
         promptChanges: changedPromptFields(entry.promptFieldHashes, promptFieldHashes),
         mismatch: candidateMismatchDetails?.get(entry)
-          ?? continuationMismatchDetails(entry, payload, debug),
+          ?? continuationMismatchDetails(entry, payload, requestToolDefaults, debug),
       })),
       evictions,
     }, diagnosticCorrelation);
+
+    // Connection-scoped sink, deliberately uncorrelated. Its caller is a socket
+    // callback, and those run in the async context of the request that CREATED the
+    // socket, so the default (`diagnosticContext.getStore()`) would stamp an idle frame
+    // with that first request's ids. The explicit empty
+    // correlation keeps them unattributed; in-response frames use `ctx.emitDiagnostic`.
+    const connectionDiagnostic: ConnectionEntry['connectionDiagnostic'] = options.onDiagnostic
+      ? event => emitDiagnostic(options, event, {})
+      : undefined;
 
     let activeContext: RequestContext | undefined;
     const stream = new ReadableStream<Uint8Array>({
@@ -2195,6 +3093,7 @@ export function createResponsesWebSocketFetch(
             resolvedOptions,
             debug,
             proxyAgent,
+            connectionDiagnostic,
           ),
         };
         activeContext = ctx;
@@ -2208,6 +3107,7 @@ export function createResponsesWebSocketFetch(
           resolvedOptions,
           debug,
           proxyAgent,
+          connectionDiagnostic,
         );
         dispatchContext(entry, ctx);
 

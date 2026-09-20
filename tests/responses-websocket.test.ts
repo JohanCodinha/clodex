@@ -11,6 +11,7 @@ class FakeWebSocket extends EventEmitter {
   options: { headers?: Record<string, string> };
   send = vi.fn();
   close = vi.fn();
+  terminate = vi.fn();
   constructor(url: string, options: { headers?: Record<string, string> }) {
     super();
     this.url = url;
@@ -21,9 +22,26 @@ class FakeWebSocket extends EventEmitter {
 
 vi.mock('ws', () => ({ WebSocket: FakeWebSocket, default: FakeWebSocket }));
 
+// The descriptor probe opens the null device; tests make that throw to stand in
+// for a full descriptor table without lowering the test runner's own limit.
+const descriptorProbe = vi.hoisted(() => ({ failWith: undefined as string | undefined }));
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    openSync: ((...args: Parameters<typeof actual.openSync>) => {
+      if (descriptorProbe.failWith) {
+        throw Object.assign(new Error(`${descriptorProbe.failWith}: too many open files`), { code: descriptorProbe.failWith });
+      }
+      return actual.openSync(...args);
+    }) as typeof actual.openSync,
+  };
+});
+
 import { installParentNoticeSink } from '../src/parent-notice.js';
 import {
   createResponsesWebSocketFetch,
+  resetDescriptorExhaustionNoticeForTests,
   resetReasoningGapWarningsForTests,
   resetToolArgumentGapWarningsForTests,
   resetResponsesWebSocketConnectionsForTests,
@@ -34,6 +52,8 @@ import {
 } from '../src/oauth/responses-websocket.js';
 import { sdkUpstreamErrorDetails } from '../src/upstream-error.js';
 import { createCopilotResponsesEventNormalizer } from '../src/github-copilot.js';
+import { trackUpstreamAttempts } from '../src/upstream-attempts.js';
+import type { UpgradeAdmission } from '../src/oauth/ws-upgrade-pacer.js';
 
 const WS_URL = 'wss://chatgpt.com/backend-api/codex/responses';
 
@@ -51,6 +71,11 @@ async function readAll(res: Response): Promise<string> {
 
 function lastSocket(): FakeWebSocket {
   return fakeSockets[fakeSockets.length - 1]!;
+}
+
+/** How many sockets have been created — for asserting that a turn reused one. */
+function socketCount(): number {
+  return fakeSockets.length;
 }
 
 const sessionPayload = (input: unknown[], extra: Record<string, unknown> = {}) => ({
@@ -148,7 +173,7 @@ describe('createResponsesWebSocketFetch', () => {
         Authorization: 'Bearer tok',
         'ChatGPT-Account-Id': 'acct-123',
         originator: 'clodex',
-        version: '0.144.1',
+        version: 'test-client-version',
         'x-openai-internal-codex-responses-lite': 'true',
       },
       body: JSON.stringify({ model: 'gpt-5.6-luna', input: [] }),
@@ -158,7 +183,7 @@ describe('createResponsesWebSocketFetch', () => {
     expect(lastSocket().url).toBe(WS_URL);
     expect(headers['Authorization']).toBe('Bearer tok');
     expect(headers['ChatGPT-Account-Id']).toBe('acct-123');
-    expect(headers['version']).toBe('0.144.1');
+    expect(headers['version']).toBe('test-client-version');
     expect(headers['x-openai-internal-codex-responses-lite']).toBe('true');
     expect(headers['OpenAI-Beta']).toContain('responses_websockets');
   });
@@ -596,7 +621,7 @@ describe('createResponsesWebSocketFetch', () => {
     await readAll(continued);
   });
 
-  it('keeps a retried parallel auxiliary request isolated from reusable heads', async () => {
+  it('leaves a reusable head behind when a parallel request had to be retried', async () => {
     const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
     const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
       accountId: 'acct-parallel-transport',
@@ -643,17 +668,22 @@ describe('createResponsesWebSocketFetch', () => {
       headers: {},
       body: JSON.stringify(sessionPayload(nextAuxiliaryInput)),
     });
-    expect(fakeSockets).toHaveLength(4);
-    const nextAuxiliarySocket = lastSocket();
-    expect(nextAuxiliarySocket).not.toBe(auxiliaryReplacement);
-    nextAuxiliarySocket.emit('open');
-    emitTextResponse(nextAuxiliarySocket, 'resp_auxiliary_next', 'done');
+    // No fourth socket. The parallel request ran beside a head that was serving a
+    // different conversation, so it kept a head of its own and this turn continues
+    // it — the cost the old blanket isolation imposed was exactly here, on every
+    // later turn of a conversation that once started beside a busy sibling.
+    expect(fakeSockets).toHaveLength(3);
+    expect(lastSocket()).toBe(auxiliaryReplacement);
+    const continued = JSON.parse(auxiliaryReplacement.send.mock.calls[1]![0] as string);
+    expect(continued.previous_response_id).toBe('resp_auxiliary');
+    expect(continued.input).toEqual([nextAuxiliaryInput[2]]);
+    emitTextResponse(auxiliaryReplacement, 'resp_auxiliary_next', 'done');
     await readAll(nextAuxiliary);
 
     expect(diagnostics).toContainEqual(expect.objectContaining({
       event: 'ws_transport_retry',
       outcome: 'recovered',
-      generation: 'isolated',
+      generation: 'nursery',
     }));
   });
 
@@ -757,6 +787,7 @@ describe('createResponsesWebSocketFetch', () => {
     expect(frame.error.code).toBe('429');
     expect(frame.error.retry_after_seconds).toBe(5);
     expect(frame.error.message).toMatch(/retry after 5s/i);
+    expect(frame.error.param).toBe('clodex_retry_after:default');
     expect(resume).toHaveBeenCalledOnce();
 
     // Through the real AI SDK the failure surfaces as a retryable 429 with the
@@ -777,11 +808,15 @@ describe('createResponsesWebSocketFetch', () => {
       httpStatusCode: 403,
       mappedStatusCode: 429,
       retryAfterSeconds: 5,
+      retryAfterSource: 'default',
     }));
   });
 
   it('honors an upstream retry-after header on a 403 rejection', async () => {
-    const wsFetch = createResponsesWebSocketFetch(WS_URL);
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
     const res = await wsFetch('https://x', {
       method: 'POST',
       headers: { Authorization: 'Bearer tok' },
@@ -792,6 +827,12 @@ describe('createResponsesWebSocketFetch', () => {
     const frame = await readErrorFrame(res);
     expect(frame.error.type).toBe('rate_limit_error');
     expect(frame.error.retry_after_seconds).toBe(12);
+    expect(frame.error.param).toBe('clodex_retry_after:upstream:12');
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: 'ws_response_error',
+      retryAfterSource: 'upstream',
+      rawRetryAfterSeconds: 12,
+    }));
   });
 
   it('clamps an oversized retry-after header and defaults a malformed one', async () => {
@@ -805,8 +846,9 @@ describe('createResponsesWebSocketFetch', () => {
     rejectUpgrade(lastSocket(), 403, { headers: { 'retry-after': '3600' } });
     const oversizedFrame = await readErrorFrame(oversized);
     expect(oversizedFrame.error.retry_after_seconds).toBe(60);
-    // The message text is the only channel that survives the AI SDK's chunk
-    // schema stripping, so the CLAMPED value must appear there too.
+    expect(oversizedFrame.error.param).toBe('clodex_retry_after:upstream:3600');
+    // The client-facing message uses the clamped value while provenance keeps
+    // the raw upstream value available to the retry boundary.
     expect(oversizedFrame.error.message).toMatch(/retry after 60s\b/i);
 
     const malformed = await wsFetch('https://x', {
@@ -848,41 +890,77 @@ describe('createResponsesWebSocketFetch', () => {
     }));
   });
 
-  it('lets the AI SDK transparently retry a 403-throttled upgrade and recover', async () => {
-    // The design premise of the 403->429 mapping: because the synthetic error
-    // frame arrives BEFORE any output chunk, @ai-sdk/openai's
-    // throwIfOpenAIStreamErrorBeforeOutput rejects doStream with a retryable
-    // 429 APICallError, so the AI SDK's own retry loop re-attempts the whole
-    // request — including a fresh WebSocket upgrade. This drives that loop for
-    // real: attempt 1 gets a 403 upgrade rejection, attempt 2 succeeds.
-    const wsFetch = createResponsesWebSocketFetch(WS_URL);
-    const provider = createOpenAI({ apiKey: 'test-only', fetch: wsFetch });
-    const streamed = streamText({
-      model: provider.responses('gpt-5.6-sol'),
-      prompt: 'retry me',
-      maxRetries: 1,
-      onError: () => {},
-    });
-    const collected = (async () => {
-      let out = '';
-      for await (const chunk of streamed.textStream) out += chunk;
-      return out;
-    })();
+  it.each([
+    // OpenAI did not state a delay: keep the SDK's roughly 2s fallback rather
+    // than promoting clodex's client-facing 5s default into the retry loop.
+    { label: 'defaulted', retryAfterSeconds: undefined, minimumDelayMs: 1_600, timeoutMs: 4_500 },
+    { label: 'upstream 0s', retryAfterSeconds: 0, minimumDelayMs: 0, timeoutMs: 1_000 },
+    { label: 'upstream 3s', retryAfterSeconds: 3, minimumDelayMs: 2_600, timeoutMs: 4_500 },
+    // Above clodex's accepted ceiling: retain the SDK's roughly 2s fallback
+    // rather than promoting the client-facing 60s clamp into a 59s wait.
+    { label: 'upstream 3600s', retryAfterSeconds: 3_600, minimumDelayMs: 1_600, timeoutMs: 4_500 },
+  ])(
+    'handles a $label 403 throttle in the real SDK retry loop',
+    async ({ retryAfterSeconds, minimumDelayMs, timeoutMs }) => {
+      // Because this synthetic frame arrives before output, @ai-sdk/openai
+      // rejects doStream with a retryable 429. Production's attempt-tracking
+      // middleware restores an upstream-stated late hint before the SDK
+      // schedules the next whole-request attempt; a local default is ignored.
+      const wsFetch = createResponsesWebSocketFetch(WS_URL);
+      const provider = createOpenAI({ apiKey: 'test-only', fetch: wsFetch });
+      const model = trackUpstreamAttempts(provider.responses('gpt-5.6-sol')).model;
+      const abortController = new AbortController();
+      const streamed = streamText({
+        model,
+        prompt: 'retry me',
+        maxRetries: 1,
+        abortSignal: abortController.signal,
+        onError: () => {},
+      });
+      const collected = (async () => {
+        let out = '';
+        for await (const chunk of streamed.textStream) out += chunk;
+        return out;
+      })();
+      // Attach a rejection handler immediately. If a mutation makes an assertion
+      // fail while the SDK is sleeping, `finally` aborts and settles this attempt
+      // before the next table case resets the shared fake-socket list.
+      const outcome = collected.then(
+        value => ({ value }),
+        error => ({ error }),
+      );
 
-    await vi.waitFor(() => expect(fakeSockets).toHaveLength(1));
-    rejectUpgrade(lastSocket(), 403);
+      try {
+        await vi.waitFor(() => expect(fakeSockets).toHaveLength(1));
+        const rejectedAt = performance.now();
+        if (retryAfterSeconds === undefined) rejectUpgrade(lastSocket(), 403);
+        else {
+          rejectUpgrade(lastSocket(), 403, {
+            headers: { 'retry-after': String(retryAfterSeconds) },
+          });
+        }
 
-    // The SDK backs off (no retry-after header on the synthetic SSE response,
-    // so its default ~2s exponential delay) and opens a SECOND upgrade.
-    await vi.waitFor(() => expect(fakeSockets).toHaveLength(2), { timeout: 10_000 });
-    const replacement = lastSocket();
-    replacement.emit('open');
-    emitTextResponse(replacement, 'resp_retry_recovered', 'recovered');
+        await vi.waitFor(
+          () => expect(fakeSockets).toHaveLength(2),
+          { timeout: timeoutMs },
+        );
+        const elapsedMs = performance.now() - rejectedAt;
+        expect(elapsedMs).toBeGreaterThanOrEqual(minimumDelayMs);
 
-    // Transparent recovery: the caller sees only the successful text.
-    await expect(collected).resolves.toBe('recovered');
-    expect(fakeSockets).toHaveLength(2);
-  }, 20_000);
+        const replacement = lastSocket();
+        replacement.emit('open');
+        emitTextResponse(replacement, 'resp_retry_recovered', 'recovered');
+
+        // Transparent recovery: the caller sees only the successful text.
+        await expect(outcome).resolves.toEqual({ value: 'recovered' });
+        expect(fakeSockets).toHaveLength(2);
+      } finally {
+        abortController.abort();
+        await outcome;
+      }
+    },
+    20_000,
+  );
 
   it('maps an in-band WebSocket connection limit error to a retryable 429', async () => {
     const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
@@ -916,7 +994,7 @@ describe('createResponsesWebSocketFetch', () => {
         type: 'rate_limit_error',
         code: '429',
         message: 'OpenAI reported the Responses WebSocket connection limit was reached; retry after 12s',
-        param: null,
+        param: 'clodex_retry_after:upstream:12',
         retry_after_seconds: 12,
       },
     });
@@ -933,6 +1011,8 @@ describe('createResponsesWebSocketFetch', () => {
       errorCode: 'websocket_connection_limit_reached',
       mappedStatusCode: 429,
       retryAfterSeconds: 12,
+      retryAfterSource: 'upstream',
+      rawRetryAfterSeconds: 12,
       emittedModelData: false,
     }));
   });
@@ -1019,7 +1099,7 @@ describe('createResponsesWebSocketFetch', () => {
     expect(record?.errorCode).toBeUndefined();
   });
 
-  it('carries an in-band 429 backoff hint through as message text', async () => {
+  it('carries an in-band 429 backoff hint through the synthetic error', async () => {
     const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
     const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
       onDiagnostic: event => diagnostics.push(event),
@@ -1036,9 +1116,10 @@ describe('createResponsesWebSocketFetch', () => {
     })));
 
     const body = await readAll(res);
-    // The AI SDK strips unknown frame fields, so the hint only survives baked
-    // into the message — which is how the consumer recovers it.
+    // The closed SDK schema strips `retry_after_seconds` but preserves its
+    // declared string `param`; the message remains the downstream fallback.
     expect(body).toContain('retry after 45s');
+    expect(body).toContain('clodex_retry_after:upstream:45');
     expect(await classifyThroughSdk(body)).toMatchObject({
       statusCode: 429,
       isRetryable: true,
@@ -1050,6 +1131,8 @@ describe('createResponsesWebSocketFetch', () => {
       // The record that survives dedup must still name the failure.
       errorType: 'rate_limit_error',
       retryAfterSeconds: 45,
+      retryAfterSource: 'upstream',
+      rawRetryAfterSeconds: 45,
     }));
   });
 
@@ -1066,7 +1149,7 @@ describe('createResponsesWebSocketFetch', () => {
       status: 429,
     })));
 
-    // Bounded so a hostile hint cannot park a client past the 120s stream abort.
+    // Bound a hostile day-long hint to the documented 60-second cap.
     expect(await readAll(res)).toContain('retry after 60s');
   });
 
@@ -1086,8 +1169,7 @@ describe('createResponsesWebSocketFetch', () => {
 
     const body = await readAll(res);
     expect(body).toContain('Resets in 4 hours.');
-    // Inventing a hint here would become a real `retry-after: 5` header and
-    // send the client back long before the limit resets.
+    // Inventing a hint here would send the client back long before the limit resets.
     expect(body).not.toContain('retry after');
     expect(await classifyThroughSdk(body)).toMatchObject({ statusCode: 429 });
   });
@@ -1281,10 +1363,9 @@ describe('createResponsesWebSocketFetch', () => {
     }
   });
 
-  it('carries an output-less usage-limit backoff in the message text', async () => {
-    // The AI SDK's chunk schema is a closed zod object that strips
-    // `retry_after_seconds`, so a hint carried only in the frame field never
-    // reaches the client — it has to be baked into the prose.
+  it('carries an output-less usage-limit backoff in the synthetic error', async () => {
+    // The AI SDK's chunk schema strips `retry_after_seconds`, so the clamped
+    // hint is baked into the prose and its raw provenance into the string param.
     const body = await failWith({
       type: 'response.failed',
       response: {
@@ -1293,9 +1374,8 @@ describe('createResponsesWebSocketFetch', () => {
         error: { type: 'usage_limit_reached', message: 'weekly limit reached', retry_after_seconds: 1800 },
       },
     });
-    // Clamped to MAX_RETRY_AFTER_SECONDS: a hint of hours must not park the
-    // client past the 120s no-event stream abort.
     expect(body).toContain('retry after 60s');
+    expect(body).toContain('clodex_retry_after:upstream:1800');
     expect(await classifyThroughSdk(body)).toMatchObject({ statusCode: 429, retryAfterSeconds: 60 });
   });
 
@@ -1969,6 +2049,978 @@ describe('createResponsesWebSocketFetch', () => {
     await readAll(second);
   });
 
+  it('continues when the client echoed a schema default the model never sent', async () => {
+    // Claude Code fills a tool call's zod defaults when the assistant message
+    // arrives, before storing it: an Edit the model emitted without `replace_all`
+    // returns as `replace_all: false` (captured on 2.1.267, 2.1.270 and 2.1.273,
+    // in bypass mode and under `--allowedTools` alike). The schema in the
+    // request declares that default, so the property is dropped from both sides.
+    const tools = [{
+      type: 'function', name: 'Edit',
+      parameters: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string' },
+          old_string: { type: 'string' },
+          new_string: { type: 'string' },
+          replace_all: { type: 'boolean', default: false },
+        },
+        required: ['file_path', 'old_string', 'new_string'],
+      },
+    }];
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'fix it' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-schema-default' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools })),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_edit' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: {
+        type: 'function_call', call_id: 'call_e', name: 'Edit',
+        arguments: '{"file_path":"a.py","old_string":"x","new_string":"y"}',
+      },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_edit' } })));
+    await readAll(first);
+
+    const echoedCall = {
+      type: 'function_call', call_id: 'call_e', name: 'Edit',
+      arguments: '{"file_path":"a.py","old_string":"x","new_string":"y","replace_all":false}',
+    };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_e', output: 'edited' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput], { tools })),
+    });
+    expect(lastSocket()).toBe(socket);
+    const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_edit');
+    expect(sent.input).toEqual([toolOutput]);
+    emitTextResponse(socket, 'resp_edit_done', 'done');
+    await readAll(second);
+  });
+
+  it('finds a schema default inside a namespaced tool group', async () => {
+    // The `tools` array can nest function declarations inside a namespace entry,
+    // and the walk recurses into those. This is the case that recursion is for.
+    const tools = [{
+      type: 'namespace',
+      name: 'file_ops',
+      tools: [{
+        type: 'function', name: 'Edit',
+        parameters: {
+          type: 'object',
+          properties: {
+            file_path: { type: 'string' },
+            replace_all: { type: 'boolean', default: false },
+          },
+          required: ['file_path'],
+        },
+      }],
+    }];
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'fix it' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-schema-namespace' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools })),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_ns' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_ns', name: 'Edit', arguments: '{"file_path":"a.py"}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_ns' } })));
+    await readAll(first);
+
+    const echoedCall = {
+      type: 'function_call', call_id: 'call_ns', name: 'Edit',
+      arguments: '{"file_path":"a.py","replace_all":false}',
+    };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_ns', output: 'edited' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput], { tools })),
+    });
+    expect(lastSocket()).toBe(socket);
+    const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_ns');
+    expect(sent.input).toEqual([toolOutput]);
+    emitTextResponse(socket, 'resp_ns_done', 'done');
+    await readAll(second);
+  });
+
+  it('does not let one client\'s tool schema decide another client\'s continuation', async () => {
+    // Defaults are per request so client B's schema cannot affect client A. The
+    // prefix memo is also keyed because A's own requests can change tool lists.
+    // Four requests, one process, NO reset between them (the reset in beforeEach
+    // is what hid the process-global map):
+    //   1. client A establishes a head whose call carries replace_all EXPLICITLY,
+    //      under a schema declaring default false — so both sides strip it;
+    //   2. client B runs a turn declaring the same tool with default TRUE;
+    //   3. a main-agent auxiliary request in A's partition omits Edit and scans
+    //      A's idle head, caching its prefix under the empty defaults map;
+    //   4. A's next real turn restores Edit, so keyed invalidation must rebuild
+    //      the head under the same map that strips its client-side echo.
+    const toolsWithDefault = (value: boolean) => [{
+      type: 'function', name: 'Edit',
+      parameters: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string' },
+          replace_all: { type: 'boolean', default: value },
+        },
+        required: ['file_path'],
+      },
+    }];
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'fix it' }] }];
+    const explicitArgs = '{"file_path":"a.py","replace_all":false}';
+
+    // 1. Client A's head.
+    const clientA = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-two-client-a' });
+    const firstA = await clientA('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools: toolsWithDefault(false) })),
+    });
+    const socketA = lastSocket();
+    socketA.emit('open');
+    socketA.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_a' } })));
+    socketA.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_a', name: 'Edit', arguments: explicitArgs },
+    })));
+    socketA.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_a' } })));
+    await readAll(firstA);
+
+    // 2. Client B, same tool name, opposite default.
+    const clientB = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-two-client-b' });
+    const firstB = await clientB('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools: toolsWithDefault(true) })),
+    });
+    const socketB = lastSocket();
+    expect(socketB).not.toBe(socketA);
+    socketB.emit('open');
+    emitTextResponse(socketB, 'resp_b', 'b done');
+    await readAll(firstB);
+
+    // 3. A request in A's partition that declares no Edit tool at all, so it
+    //    re-records nothing and its scan is what populates A's prefix cache.
+    const sideA = await clientA('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload(
+        [{ role: 'user', content: [{ type: 'input_text', text: 'name this chat' }] }],
+        { tools: [{ type: 'function', name: 'Read', parameters: { type: 'object' } }] },
+      )),
+    });
+    const sideSocket = lastSocket();
+    if (sideSocket !== socketA) sideSocket.emit('open');
+    emitTextResponse(sideSocket, 'resp_a_side', 'title');
+    await readAll(sideA);
+
+    // 4. A's next real turn must still continue on its own head.
+    const echoedCall = {
+      type: 'function_call', call_id: 'call_a', name: 'Edit', arguments: explicitArgs,
+    };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_a', output: 'edited' };
+    const socketsBefore = socketCount();
+    const secondA = await clientA('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput], { tools: toolsWithDefault(false) })),
+    });
+    // Reusing A's socket means no new one is created, so this asserts the count
+    // rather than which socket is last.
+    expect(socketCount()).toBe(socketsBefore);
+    const sentA = socketA.send.mock.calls.map(call => JSON.parse(call[0] as string));
+    const continuation = sentA.find(sent => sent.previous_response_id === 'resp_a');
+    expect(continuation, `A did not continue on its own head: ${JSON.stringify(sentA.map(s => s.previous_response_id))}`)
+      .toBeDefined();
+    expect(continuation.input).toEqual([toolOutput]);
+    emitTextResponse(socketA, 'resp_a_done', 'done');
+    await readAll(secondA);
+  });
+
+  it('recomputes an omitted-reasoning prefix memo when tool defaults change', async () => {
+    const toolsWithDefault = [{
+      type: 'function', name: 'MemoTool',
+      parameters: {
+        type: 'object',
+        properties: { a: { type: 'number', default: 1 } },
+      },
+    }];
+    const toolsWithoutDefault = [{
+      type: 'function', name: 'MemoTool',
+      parameters: {
+        type: 'object',
+        properties: { a: { type: 'number' } },
+      },
+    }];
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'run it' }] }];
+    const echoedCall = {
+      type: 'function_call', call_id: 'call_memo', name: 'MemoTool', arguments: '{"a":1}',
+    };
+    const output = { type: 'function_call_output', call_id: 'call_memo', output: 'done' };
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-echoable-memo',
+      onDiagnostic: event => diagnostics.push(event),
+    });
+
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools: toolsWithDefault })),
+    });
+    const headSocket = lastSocket();
+    headSocket.emit('open');
+    headSocket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.created', response: { id: 'resp_memo_head' },
+    })));
+    headSocket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'reasoning', id: 'rs_memo', encrypted_content: 'enc_memo', summary: [] },
+    })));
+    headSocket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 1,
+      item: {
+        type: 'function_call', id: 'fc_memo', call_id: 'call_memo', name: 'MemoTool',
+        arguments: '{"a":1}', status: 'completed',
+      },
+    })));
+    headSocket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.completed', response: { id: 'resp_memo_head' },
+    })));
+    await readAll(first);
+
+    // Populate both prefix memos while `a: 1` is a declared default.
+    const side = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload(
+        [{ role: 'user', content: [{ type: 'input_text', text: 'unrelated side turn' }] }],
+        { tools: toolsWithDefault },
+      )),
+    });
+    const sideSocket = lastSocket();
+    if (sideSocket !== headSocket) sideSocket.emit('open');
+    emitTextResponse(sideSocket, 'resp_memo_side', 'done');
+    await readAll(side);
+
+    // Claude omits reasoning but echoes the call. Under the current schema `a: 1`
+    // is not filler, so the echoable prefix must be rebuilt with it retained.
+    const socketsBefore = socketCount();
+    const continuation = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload(
+        [...input, echoedCall, output],
+        { tools: toolsWithoutDefault },
+      )),
+    });
+    expect(socketCount()).toBe(socketsBefore);
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)).toMatchObject({
+      decision: 'continuation',
+      continuationMatchMode: 'omitted_reasoning',
+    });
+    const sent = headSocket.send.mock.calls.map(call => JSON.parse(call[0] as string))
+      .find(message => message.previous_response_id === 'resp_memo_head');
+    expect(sent?.input).toEqual([output]);
+    emitTextResponse(headSocket, 'resp_memo_done', 'done');
+    await readAll(continuation);
+  });
+
+  it('recomputes an in-flight input memo when an arriving request changes tool defaults', async () => {
+    const toolsWithDefault = [{
+      type: 'function', name: 'InFlightTool',
+      parameters: {
+        type: 'object',
+        properties: { a: { type: 'number', default: 1 } },
+      },
+    }];
+    const toolsWithoutDefault = [{
+      type: 'function', name: 'InFlightTool',
+      parameters: {
+        type: 'object',
+        properties: { a: { type: 'number' } },
+      },
+    }];
+    const user = { role: 'user', content: [{ type: 'input_text', text: 'run it' }] };
+    const originalCall = {
+      type: 'function_call', call_id: 'call_inflight', name: 'InFlightTool', arguments: '{"a":1}',
+    };
+    const rewrittenCall = {
+      type: 'function_call', call_id: 'call_inflight', name: 'InFlightTool', arguments: '{}',
+    };
+    const output = { type: 'function_call_output', call_id: 'call_inflight', output: 'done' };
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-inflight-memo',
+      onDiagnostic: event => diagnostics.push(event),
+    });
+
+    // Keep the first turn in flight. Its RequestContext owns the canonical-input memo.
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([user, originalCall], { tools: toolsWithDefault })),
+    });
+    const originalSocket = lastSocket();
+    originalSocket.emit('open');
+
+    // Build the in-flight memo under default a=1; both call arguments normalize to {}.
+    const firstArrival = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload(
+        [user, rewrittenCall, output],
+        { tools: toolsWithDefault },
+      )),
+    });
+    const isolatedSocket = lastSocket();
+    isolatedSocket.emit('open');
+    emitTextResponse(isolatedSocket, 'resp_inflight_isolated', 'done');
+    await readAll(firstArrival);
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)?.decision)
+      .toBe('parallel_isolated');
+
+    // With no declared default, a=1 and {} differ. The in-flight turn is unrelated,
+    // so this request must retain a new head instead of isolating.
+    const secondArrival = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload(
+        [user, rewrittenCall, output],
+        { tools: toolsWithoutDefault },
+      )),
+    });
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)?.decision)
+      .toBe('history_mismatch_new_head');
+    const retainedSocket = lastSocket();
+    retainedSocket.emit('open');
+    emitTextResponse(retainedSocket, 'resp_inflight_retained', 'done');
+    await readAll(secondArrival);
+
+    emitTextResponse(originalSocket, 'resp_inflight_original', 'done');
+    await readAll(first);
+  });
+
+  it('distinguishes default maps whose old delimiter-joined fingerprints collided', async () => {
+    const toolsA = [{
+      type: 'function', name: 'CollisionTool',
+      parameters: {
+        type: 'object',
+        properties: {
+          a: { type: 'number', default: 1 },
+          b: { type: 'number', default: 2 },
+        },
+      },
+    }];
+    // The old fingerprint joined properties as `prop=value` with commas, so this
+    // distinct map and toolsA both serialized as `a=1,b=2` before hashing.
+    const toolsB = [{
+      type: 'function', name: 'CollisionTool',
+      parameters: {
+        type: 'object',
+        properties: { 'a=1,b': { type: 'number', default: 2 } },
+      },
+    }];
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'run it' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-default-fingerprint-collision',
+    });
+
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools: toolsA })),
+    });
+    const headSocket = lastSocket();
+    headSocket.emit('open');
+    headSocket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.created', response: { id: 'resp_collision_head' },
+    })));
+    headSocket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: {
+        type: 'function_call', call_id: 'call_collision', name: 'CollisionTool',
+        arguments: '{"a":1,"b":2}',
+      },
+    })));
+    headSocket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.completed', response: { id: 'resp_collision_head' },
+    })));
+    await readAll(first);
+
+    // Cache the head under toolsA, where both arguments strip to {}.
+    const side = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload(
+        [{ role: 'user', content: [{ type: 'input_text', text: 'unrelated side turn' }] }],
+        { tools: toolsA },
+      )),
+    });
+    const sideSocket = lastSocket();
+    if (sideSocket !== headSocket) sideSocket.emit('open');
+    emitTextResponse(sideSocket, 'resp_collision_side', 'done');
+    await readAll(side);
+
+    // Under toolsB, a and b are not defaults. A distinct fingerprint must rebuild
+    // the cached head so the unchanged call still matches the unchanged echo.
+    const echoedCall = {
+      type: 'function_call', call_id: 'call_collision', name: 'CollisionTool',
+      arguments: '{"a":1,"b":2}',
+    };
+    const output = { type: 'function_call_output', call_id: 'call_collision', output: 'done' };
+    const socketsBefore = socketCount();
+    const continuation = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([...input, echoedCall, output], { tools: toolsB })),
+    });
+    expect(socketCount()).toBe(socketsBefore);
+    const sent = headSocket.send.mock.calls.map(call => JSON.parse(call[0] as string))
+      .find(message => message.previous_response_id === 'resp_collision_head');
+    expect(sent?.input).toEqual([output]);
+    emitTextResponse(headSocket, 'resp_collision_done', 'done');
+    await readAll(continuation);
+  });
+
+  it('still starts a new chain when the echoed value differs from the schema default', async () => {
+    // Only a value EQUAL to the declared default is filler. `replace_all: true`
+    // is a real argument the model never sent, so this history diverged.
+    const tools = [{
+      type: 'function', name: 'Edit',
+      parameters: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string' },
+          replace_all: { type: 'boolean', default: false },
+        },
+        required: ['file_path'],
+      },
+    }];
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'fix it' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-schema-nondefault' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools })),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_edit_t' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_t', name: 'Edit', arguments: '{"file_path":"a.py"}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_edit_t' } })));
+    await readAll(first);
+
+    const divergedCall = {
+      type: 'function_call', call_id: 'call_t', name: 'Edit',
+      arguments: '{"file_path":"a.py","replace_all":true}',
+    };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_t', output: 'edited' };
+    const fullInput = [...input, divergedCall, toolOutput];
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(fullInput, { tools })),
+    });
+    const isolated = lastSocket();
+    expect(isolated).not.toBe(socket);
+    isolated.emit('open');
+    const sent = JSON.parse(isolated.send.mock.calls[0]![0] as string);
+    expect(sent.previous_response_id).toBeUndefined();
+    expect(sent.input).toEqual(fullInput);
+    emitTextResponse(isolated, 'resp_edit_t_new', 'done');
+    await readAll(second);
+  });
+
+  it('does not strip a property the tool schema declares no default for', async () => {
+    // Without a declared default there is nothing to identify filler, so an
+    // added property is a divergent history — today's behaviour, unchanged.
+    const tools = [{
+      type: 'function', name: 'Edit',
+      parameters: {
+        type: 'object',
+        properties: { file_path: { type: 'string' }, replace_all: { type: 'boolean' } },
+        required: ['file_path'],
+      },
+    }];
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'fix it' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-schema-nodefault' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools })),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_edit_n' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_u', name: 'Edit', arguments: '{"file_path":"a.py"}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_edit_n' } })));
+    await readAll(first);
+
+    const echoedCall = {
+      type: 'function_call', call_id: 'call_u', name: 'Edit',
+      arguments: '{"file_path":"a.py","replace_all":false}',
+    };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_u', output: 'edited' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput], { tools })),
+    });
+    const isolated = lastSocket();
+    expect(isolated).not.toBe(socket);
+    isolated.emit('open');
+    const sent = JSON.parse(isolated.send.mock.calls[0]![0] as string);
+    expect(sent.previous_response_id).toBeUndefined();
+    emitTextResponse(isolated, 'resp_edit_n_new', 'done');
+    await readAll(second);
+  });
+
+  // Issue #225. Claude Code re-types a tool call's arguments against the tool's
+  // schema when the assistant message arrives (every permission mode, verified on
+  // 2.1.267/2.1.270/2.1.273 against a synthetic server): for Bash, `"5000"` is
+  // echoed as `5000` and `"false"` as `false`. Both sides are normalized under
+  // the request's own schema, so the head survives whichever shape comes back.
+  const BASH_TOOLS = [{
+    type: 'function', name: 'Bash',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string' },
+        timeout: { type: 'number' },
+        description: { type: 'string' },
+        run_in_background: { type: 'boolean' },
+        dangerouslyDisableSandbox: { type: 'boolean' },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  }];
+
+  async function establishBashHead(
+    accountId: string, responseId: string, callId: string, args: string, tools = BASH_TOOLS,
+  ) {
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'list files' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools })),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: responseId } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: callId, name: 'Bash', arguments: args },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: responseId } })));
+    await readAll(first);
+    return { input, wsFetch, socket };
+  }
+
+  it('continues when the client echoed a string scalar re-typed to the schema number or boolean', async () => {
+    const { input, wsFetch, socket } = await establishBashHead(
+      'acct-scalar-coerce', 'resp_bash_coerce', 'call_bc',
+      '{"command":"ls","timeout":"5000","run_in_background":"false"}',
+    );
+    const echoedCall = {
+      type: 'function_call', call_id: 'call_bc', name: 'Bash',
+      arguments: '{"command":"ls","timeout":5000,"run_in_background":false}',
+    };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_bc', output: 'a.txt' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput], { tools: BASH_TOOLS })),
+    });
+    expect(lastSocket()).toBe(socket);
+    const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_bash_coerce');
+    expect(sent.input).toEqual([toolOutput]);
+    emitTextResponse(socket, 'resp_bash_coerce_done', 'done');
+    await readAll(second);
+  });
+
+  it('still continues when the client echoed the string scalars unchanged', async () => {
+    // The client sends the raw wire arguments instead when its
+    // CLAUDE_CODE_HUMBLE_HAMMOCK / tengu_humble_hammock flag is on, and skips
+    // Bash's re-typing entirely when any one value fails to parse. Normalizing
+    // both sides keeps the chain in either case; a snapshot rewritten to the
+    // coerced shape would lose it.
+    const { input, wsFetch, socket } = await establishBashHead(
+      'acct-scalar-raw', 'resp_bash_raw', 'call_br',
+      '{"command":"ls","timeout":"5000","run_in_background":"false"}',
+    );
+    const echoedCall = {
+      type: 'function_call', call_id: 'call_br', name: 'Bash',
+      arguments: '{"command":"ls","timeout":"5000","run_in_background":"false"}',
+    };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_br', output: 'a.txt' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput], { tools: BASH_TOOLS })),
+    });
+    expect(lastSocket()).toBe(socket);
+    const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_bash_raw');
+    expect(sent.input).toEqual([toolOutput]);
+    emitTextResponse(socket, 'resp_bash_raw_done', 'done');
+    await readAll(second);
+  });
+
+  it('starts a new chain when a re-typed scalar also changed value', async () => {
+    // Type-only reconciliation: `"5000"` and `5000` are the same call, `"5000"`
+    // and `6000` are not, and neither are `"false"` and `true`.
+    for (const [label, echoedArgs] of [
+      ['timeout', '{"command":"ls","timeout":6000,"run_in_background":false}'],
+      ['run_in_background', '{"command":"ls","timeout":5000,"run_in_background":true}'],
+    ] as const) {
+      const { input, wsFetch, socket } = await establishBashHead(
+        `acct-scalar-changed-${label}`, `resp_bash_changed_${label}`, `call_bx_${label}`,
+        '{"command":"ls","timeout":"5000","run_in_background":"false"}',
+      );
+      const divergedCall = {
+        type: 'function_call', call_id: `call_bx_${label}`, name: 'Bash', arguments: echoedArgs,
+      };
+      const toolOutput = { type: 'function_call_output', call_id: `call_bx_${label}`, output: 'a.txt' };
+      const fullInput = [...input, divergedCall, toolOutput];
+      const second = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(fullInput, { tools: BASH_TOOLS })),
+      });
+      const isolated = lastSocket();
+      expect(isolated, label).not.toBe(socket);
+      isolated.emit('open');
+      const sent = JSON.parse(isolated.send.mock.calls[0]![0] as string);
+      expect(sent.previous_response_id, label).toBeUndefined();
+      expect(sent.input, label).toEqual(fullInput);
+      emitTextResponse(isolated, `resp_bash_changed_${label}_new`, 'done');
+      await readAll(second);
+    }
+  });
+
+  // A generic helper for one-call tables: establish a head whose call carries
+  // `modelArgs` under `tools`, replay `echoedArgs`, and assert continuation or a
+  // new chain. `name` is the tool name in both items.
+  async function expectEchoOutcome(
+    label: string, tools: unknown[], name: string, modelArgs: string, echoedArgs: string, continues: boolean,
+  ): Promise<void> {
+    const id = label.replace(/\W+/g, '_');
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'do it' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: `acct-echo-${id}` });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools })),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: `resp_echo_${id}` } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: `call_echo_${id}`, name, arguments: modelArgs },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: `resp_echo_${id}` } })));
+    await readAll(first);
+
+    const echoedCall = { type: 'function_call', call_id: `call_echo_${id}`, name, arguments: echoedArgs };
+    const toolOutput = { type: 'function_call_output', call_id: `call_echo_${id}`, output: 'ok' };
+    const fullInput = [...input, echoedCall, toolOutput];
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(fullInput, { tools })),
+    });
+    if (continues) {
+      expect(lastSocket(), label).toBe(socket);
+      const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+      expect(sent.previous_response_id, label).toBe(`resp_echo_${id}`);
+      expect(sent.input, label).toEqual([toolOutput]);
+      emitTextResponse(socket, `resp_echo_${id}_done`, 'done');
+    } else {
+      const isolated = lastSocket();
+      expect(isolated, label).not.toBe(socket);
+      isolated.emit('open');
+      const sent = JSON.parse(isolated.send.mock.calls[0]![0] as string);
+      expect(sent.previous_response_id, label).toBeUndefined();
+      expect(sent.input, label).toEqual(fullInput);
+      emitTextResponse(isolated, `resp_echo_${id}_new`, 'done');
+    }
+    await readAll(second);
+  }
+
+  it('continues for every number spelling the Bash coercer re-types', async () => {
+    // Bash `timeout` goes through the client's `UF`: trim, decimal literal, Number().
+    // Captured on 2.1.273: "5000.0", " 5000 ", "05", "+5" all echo as the number.
+    for (const [modelValue, echoedValue] of [
+      ['"5000.0"', '5000'], ['" 5000 "', '5000'], ['" 5000"', '5000'], ['"05"', '5'], ['"+5"', '5'],
+      ['"-0"', '0'], ['"999999999999999"', '999999999999999'],
+    ] as const) {
+      await expectEchoOutcome(
+        `bash uf ${modelValue}`, BASH_TOOLS, 'Bash',
+        `{"command":"ls","timeout":${modelValue}}`, `{"command":"ls","timeout":${echoedValue}}`, true,
+      );
+    }
+  });
+
+  it('starts a new chain rather than re-type a literal longer than 15 significant digits', async () => {
+    // The client does re-type "9007199254740993" (to 9007199254740992, lossily),
+    // so this echo is real; but re-typing it here would also make two DIFFERENT
+    // raw values compare equal (2^53 and 2^53+1 share a double). Losing this
+    // rare chain is the safe direction, so the literal is left a string and the
+    // typed echo diverges.
+    await expectEchoOutcome('bash 2^53+1 re-typed', BASH_TOOLS, 'Bash',
+      '{"command":"ls","timeout":"9007199254740993"}', '{"command":"ls","timeout":9007199254740992}', false);
+    // Two different raw values under one call_id must stay a mismatch.
+    await expectEchoOutcome('bash 2^53 vs 2^53+1', BASH_TOOLS, 'Bash',
+      '{"command":"ls","timeout":"9007199254740992"}', '{"command":"ls","timeout":"9007199254740993"}', false);
+    // ...and so must an explicit long literal against an omitted default that
+    // would round to the same double.
+    const tools = [{
+      type: 'function', name: 'Bash',
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string' }, timeout: { type: 'number', default: 9007199254740992 } },
+        required: ['command'],
+      },
+    }];
+    await expectEchoOutcome('bash long literal vs omitted default', tools, 'Bash',
+      '{"command":"ls","timeout":"9007199254740993"}', '{"command":"ls"}', false);
+  });
+
+  it('continues for the generic-repair spellings on a plain number or boolean property', async () => {
+    // Agent-style tools have no preprocess pipe, so the client's generic repair
+    // JSON-parses the string: a canonical exponent prints back identically, and a
+    // boolean is kept without a print-back check.
+    const tools = [{
+      type: 'function', name: 'Agent',
+      parameters: {
+        type: 'object',
+        properties: { prompt: { type: 'string' }, budget: { type: 'number' }, run_in_background: { type: 'boolean' } },
+        required: ['prompt'],
+      },
+    }];
+    await expectEchoOutcome('generic exponent', tools, 'Agent',
+      '{"prompt":"go","budget":"1e+21"}', '{"prompt":"go","budget":1e+21}', true);
+    await expectEchoOutcome('generic padded boolean', tools, 'Agent',
+      '{"prompt":"go","run_in_background":" true "}', '{"prompt":"go","run_in_background":true}', true);
+  });
+
+  it('continues for an MCP nullable scalar declared through anyOf or $ref', async () => {
+    const tools = [{
+      type: 'function', name: 'mcp__srv__count',
+      parameters: {
+        type: 'object',
+        $defs: { Limit: { type: 'number' } },
+        properties: {
+          n: { anyOf: [{ type: 'integer' }, { type: 'null' }] },
+          limit: { $ref: '#/$defs/Limit' },
+          mode: { anyOf: [{ type: 'number' }, { type: 'string' }] },
+        },
+      },
+    }];
+    await expectEchoOutcome('mcp anyOf nullable integer', tools, 'mcp__srv__count', '{"n":"5"}', '{"n":5}', true);
+    await expectEchoOutcome('mcp $ref number', tools, 'mcp__srv__count', '{"limit":"10"}', '{"limit":10}', true);
+    // A union with string is left alone by the client, so a typed echo is a real change.
+    await expectEchoOutcome('mcp number|string union', tools, 'mcp__srv__count', '{"mode":"5"}', '{"mode":5}', false);
+  });
+
+  it('starts a new chain for a spelling neither client rule re-types', async () => {
+    // `"False"`, `"0"` and `"1e3"` stay strings on the client, so an echo carrying
+    // the typed value is a divergent history, not a coercion.
+    for (const [label, modelArgs, echoedArgs] of [
+      ['capitalised boolean', '{"command":"ls","run_in_background":"False"}', '{"command":"ls","run_in_background":false}'],
+      ['numeric boolean', '{"command":"ls","run_in_background":"0"}', '{"command":"ls","run_in_background":false}'],
+      ['bare exponent', '{"command":"ls","timeout":"1e3"}', '{"command":"ls","timeout":1000}'],
+      ['hex', '{"command":"ls","timeout":"0x10"}', '{"command":"ls","timeout":16}'],
+    ] as const) {
+      await expectEchoOutcome(label, BASH_TOOLS, 'Bash', modelArgs, echoedArgs, false);
+    }
+  });
+
+  it('does not re-type a property the tool schema declares as a string', async () => {
+    // Without a declared number/boolean type there is no client coercion to
+    // mirror, so a typed echo is a divergent history — today's behaviour.
+    const tools = [{
+      type: 'function', name: 'Bash',
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string' }, timeout: { type: 'string' } },
+        required: ['command'],
+      },
+    }];
+    const { input, wsFetch, socket } = await establishBashHead(
+      'acct-scalar-string-schema', 'resp_bash_string_schema', 'call_bss',
+      '{"command":"ls","timeout":"5000"}', tools,
+    );
+    const echoedCall = {
+      type: 'function_call', call_id: 'call_bss', name: 'Bash', arguments: '{"command":"ls","timeout":5000}',
+    };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_bss', output: 'a.txt' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput], { tools })),
+    });
+    const isolated = lastSocket();
+    expect(isolated).not.toBe(socket);
+    isolated.emit('open');
+    const sent = JSON.parse(isolated.send.mock.calls[0]![0] as string);
+    expect(sent.previous_response_id).toBeUndefined();
+    emitTextResponse(isolated, 'resp_bass_new', 'done');
+    await readAll(second);
+  });
+
+  it('re-types a Read offset the way the client does and leaves limit as the client leaves it', async () => {
+    // Read's `offset` goes through the client's `UF` at ingest; `limit` is a
+    // preprocess pipe with no per-tool case, so the client leaves it a string
+    // (captured on 2.1.267/2.1.270/2.1.273: {offset:"5",limit:"10"} echoes as
+    // {offset:5,limit:"10"}). `offset` is `integer` on the wire and "5.5" is
+    // still echoed as 5.5, so there is no integrality check.
+    const tools = [{
+      type: 'function', name: 'Read',
+      parameters: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string' },
+          offset: { type: 'integer', minimum: 0 },
+          limit: { type: 'integer', exclusiveMinimum: 0 },
+        },
+        required: ['file_path'],
+      },
+    }];
+    await expectEchoOutcome('read integral offset', tools, 'Read',
+      '{"file_path":"a.py","offset":"5","limit":"10"}', '{"file_path":"a.py","offset":5,"limit":"10"}', true);
+    await expectEchoOutcome('read fractional offset', tools, 'Read',
+      '{"file_path":"a.py","offset":"5.5"}', '{"file_path":"a.py","offset":5.5}', true);
+    await expectEchoOutcome('read changed offset', tools, 'Read',
+      '{"file_path":"a.py","offset":"5"}', '{"file_path":"a.py","offset":6}', false);
+  });
+
+  it('re-types a string before judging it against the declared default', async () => {
+    // The client re-types first and fills defaults second, so `"false"` emitted
+    // for Edit's `default: false` boolean is echoed as `replace_all: false`
+    // (captured on 2.1.273). Both sides must re-type before the default strip:
+    // the echo's `false` is filler, and the head's `"false"` must become the
+    // same filler rather than a string that survives the strip.
+    const tools = [{
+      type: 'function', name: 'Edit',
+      parameters: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string' },
+          replace_all: { type: 'boolean', default: false },
+        },
+        required: ['file_path'],
+      },
+    }];
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'fix it' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-scalar-then-default' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools })),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_std' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_std', name: 'Edit', arguments: '{"file_path":"a.py","replace_all":"false"}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_std' } })));
+    await readAll(first);
+
+    const echoedCall = {
+      type: 'function_call', call_id: 'call_std', name: 'Edit', arguments: '{"file_path":"a.py","replace_all":false}',
+    };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_std', output: 'edited' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput], { tools })),
+    });
+    expect(lastSocket()).toBe(socket);
+    const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_std');
+    expect(sent.input).toEqual([toolOutput]);
+    emitTextResponse(socket, 'resp_std_done', 'done');
+    await readAll(second);
+  });
+
+  it('recomputes a prefix memo cached under a schema with the same default but no scalar type', async () => {
+    // The memo fingerprint must cover the scalar kind, not only the default:
+    // a side request in A's partition declares `timeout` as a STRING with the
+    // same default, scans A's idle head, and caches its canonical prefix with
+    // `"5000"` left as a string. A's real turn declares it a number and echoes
+    // `5000`; a fingerprint blind to the kind would reuse the stale prefix.
+    const bashWith = (type: string) => [{
+      type: 'function', name: 'Bash',
+      parameters: {
+        type: 'object',
+        properties: { command: { type: 'string' }, timeout: { type, default: 30000 } },
+        required: ['command'],
+      },
+    }];
+    const { input, wsFetch, socket } = await establishBashHead(
+      'acct-scalar-memo', 'resp_scalar_memo', 'call_sm', '{"command":"ls","timeout":"5000"}', bashWith('number'),
+    );
+
+    const side = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload(
+        [{ role: 'user', content: [{ type: 'input_text', text: 'name this chat' }] }],
+        { tools: bashWith('string') },
+      )),
+    });
+    const sideSocket = lastSocket();
+    if (sideSocket !== socket) sideSocket.emit('open');
+    emitTextResponse(sideSocket, 'resp_scalar_memo_side', 'title');
+    await readAll(side);
+
+    const echoedCall = { type: 'function_call', call_id: 'call_sm', name: 'Bash', arguments: '{"command":"ls","timeout":5000}' };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_sm', output: 'a.txt' };
+    const socketsBefore = socketCount();
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput], { tools: bashWith('number') })),
+    });
+    expect(socketCount()).toBe(socketsBefore);
+    const sentA = socket.send.mock.calls.map(call => JSON.parse(call[0] as string));
+    const continuation = sentA.find(sent => sent.previous_response_id === 'resp_scalar_memo');
+    expect(continuation, `did not continue on the head: ${JSON.stringify(sentA.map(s => s.previous_response_id))}`)
+      .toBeDefined();
+    expect(continuation.input).toEqual([toolOutput]);
+    emitTextResponse(socket, 'resp_scalar_memo_done', 'done');
+    await readAll(second);
+  });
+
+
+  it('continues a TaskOutput call whose required-on-the-wire defaults the client filled at ingest', async () => {
+    // Bundle 2.1.273 L10789: block is sw(I().default(!0)), timeout is v()...default(30000);
+    // zod v4 toJSONSchema (output mode, as the bundle's ege() uses) lists BOTH in `required`
+    // and carries their defaults. rW's TaskOutput case (L11539) fills block??true, timeout??30000
+    // at ingest, so the client echoes them even though the model omitted them. A rule that
+    // exempted required properties from default stripping would lose this chain — guard it.
+    const tools = [{
+      type: 'function', name: 'TaskOutput',
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'string' },
+          block: { type: 'boolean', default: true },
+          timeout: { type: 'number', default: 30000 },
+        },
+        required: ['task_id', 'block', 'timeout'], additionalProperties: false,
+      },
+    }];
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'check the task' }] }];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-r1-taskoutput' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input, { tools })),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_r1_to' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_r1_to', name: 'TaskOutput', arguments: '{"task_id":"t1"}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_r1_to' } })));
+    await readAll(first);
+
+    const echoedCall = {
+      type: 'function_call', call_id: 'call_r1_to', name: 'TaskOutput',
+      arguments: '{"task_id":"t1","block":true,"timeout":30000}',
+    };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_r1_to', output: 'done' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput], { tools })),
+    });
+    expect(lastSocket()).toBe(socket);
+    const sent = JSON.parse(socket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_r1_to');
+    expect(sent.input).toEqual([toolOutput]);
+    emitTextResponse(socket, 'resp_r1_to_done', 'done');
+    await readAll(second);
+  });
+
   it('starts a new chain when the echoed call differs in a meaningful argument value', async () => {
     const input = [{ role: 'user', content: [{ type: 'input_text', text: 'read it back' }] }];
     const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-real-diff' });
@@ -2548,8 +3600,9 @@ describe('createResponsesWebSocketFetch', () => {
     return (decision.heads as { mismatch: Record<string, unknown> }[])[0]!.mismatch;
   }
 
-  // Drives one mismatch between a stored function_call and the call Claude echoes
-  // back.
+  // Drives one comparison between a stored function_call and the call Claude
+  // echoes back. Most callers exercise a mismatch; the schema-default diagnostic
+  // case exercises the normalized match.
   //
   // The stored call is emitted BY UPSTREAM, so it reaches the head through
   // `response.output_item.done` → `expectedAssistantItems` → `sanitizedCallArguments`
@@ -2644,6 +3697,163 @@ describe('createResponsesWebSocketFetch', () => {
     },
   };
 
+  it('records the full matched prefix after a schema-default continuation', async () => {
+    const tools = [{
+      type: 'function', name: 'Edit',
+      parameters: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string' },
+          old_string: { type: 'string' },
+          new_string: { type: 'string' },
+          replace_all: { type: 'boolean', default: false },
+        },
+        required: ['file_path', 'old_string', 'new_string'],
+      },
+    }];
+    const { diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-schema-default-diagnostic',
+      responseId: 'resp_schema_default_diagnostic',
+      tools,
+      upstreamCall: {
+        type: 'function_call', call_id: 'call_edit_diagnostic', name: 'Edit',
+        arguments: '{"file_path":"a.py","old_string":"x","new_string":"y"}',
+      },
+      echoedCall: {
+        type: 'function_call', call_id: 'call_edit_diagnostic', name: 'Edit',
+        arguments: '{"file_path":"a.py","old_string":"x","new_string":"y","replace_all":false}',
+      },
+    });
+
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
+    expect(decision).toMatchObject({
+      decision: 'continuation',
+      continuationMatchMode: 'exact',
+    });
+    const mismatch = firstHeadMismatch(diagnostics);
+    expect(mismatch).toMatchObject({
+      fullItems: 3,
+      expectedPrefixItems: 2,
+      firstMismatch: 2,
+      expectedKind: 'none',
+      actualKind: 'function_call_output',
+      actualHash: expect.stringMatching(/^[0-9a-f]{16}$/),
+    });
+    expect(mismatch).not.toHaveProperty('expectedHash');
+    expect(mismatch).not.toHaveProperty('toolArgumentNormalizationGap');
+  });
+
+  it('records the full matched prefix after a re-typed scalar continuation', async () => {
+    // Issue #225: the diagnostic path normalizes under the same per-request
+    // schema map as the matcher, so a `"5000"` → `5000` echo is not reported as a
+    // normalization gap on the head it continued on.
+    const tools = [{
+      type: 'function', name: 'Bash',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string' },
+          timeout: { type: 'number' },
+          run_in_background: { type: 'boolean' },
+        },
+        required: ['command'],
+      },
+    }];
+    const { diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-scalar-diagnostic',
+      responseId: 'resp_scalar_diagnostic',
+      tools,
+      upstreamCall: {
+        type: 'function_call', call_id: 'call_bash_diagnostic', name: 'Bash',
+        arguments: '{"command":"ls","timeout":"5000","run_in_background":"false"}',
+      },
+      echoedCall: {
+        type: 'function_call', call_id: 'call_bash_diagnostic', name: 'Bash',
+        arguments: '{"command":"ls","timeout":5000,"run_in_background":false}',
+      },
+    });
+
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!;
+    expect(decision).toMatchObject({ decision: 'continuation', continuationMatchMode: 'exact' });
+    const mismatch = firstHeadMismatch(diagnostics);
+    expect(mismatch).toMatchObject({
+      fullItems: 3, expectedPrefixItems: 2, firstMismatch: 2, expectedKind: 'none', actualKind: 'function_call_output',
+    });
+    expect(mismatch).not.toHaveProperty('toolArgumentNormalizationGap');
+  });
+
+  it('warns when a filler-strip gap accompanies a re-typed scalar echo', async () => {
+    // `equalAfterStrip` applies the scalar re-typing alongside the default
+    // strip, so the only remaining difference is the `null` filler and the
+    // canary still fires for the shape #84 had.
+    const tools = [{
+      type: 'function', name: 'Bash',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string' },
+          timeout: { type: 'number' },
+          description: { type: 'string' },
+        },
+        required: ['command'],
+      },
+    }];
+    const { stderr, diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-tool-gap-scalar',
+      responseId: 'resp_tool_gap_scalar',
+      tools,
+      upstreamCall: {
+        type: 'function_call', id: 'fc_2', call_id: 'call_bash_gap', name: 'Bash',
+        arguments: '{"command":"ls","timeout":"5000"}',
+        status: 'completed',
+      },
+      echoedCall: {
+        type: 'function_call', call_id: 'call_bash_gap', name: 'Bash',
+        arguments: '{"command":"ls","timeout":5000,"description":null}',
+      },
+    });
+
+    expect(stderr.join('')).toContain('filler-strip rule is applied');
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+      .toMatchObject({ decision: 'history_mismatch_new_head' });
+    expect(firstHeadMismatch(diagnostics)).toMatchObject({
+      toolArgumentNormalizationGap: { tool: 'Bash', equalAfterStrip: true },
+    });
+  });
+
+  it('preserves an undefaulted false argument beside a declared default', async () => {
+    const tools = [{
+      type: 'function', name: 'Edit',
+      parameters: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string' },
+          replace_all: { type: 'boolean', default: false },
+          dry_run: { type: 'boolean' },
+        },
+        required: ['file_path'],
+      },
+    }];
+    const { diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-schema-undefaulted-false',
+      responseId: 'resp_schema_undefaulted_false',
+      tools,
+      upstreamCall: {
+        type: 'function_call', call_id: 'call_edit_false', name: 'Edit',
+        arguments: '{"file_path":"a.py"}',
+      },
+      echoedCall: {
+        type: 'function_call', call_id: 'call_edit_false', name: 'Edit',
+        arguments: '{"file_path":"a.py","dry_run":false}',
+      },
+    });
+
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)).toMatchObject({
+      decision: 'history_mismatch_new_head',
+      matchingCandidateCount: 0,
+    });
+  });
+
   it('warns on stderr when the filler-strip rule has forked', async () => {
     const { stderr, diagnostics } = await runToolArgumentMismatch({
       accountId: 'acct-tool-gap-forked',
@@ -2661,6 +3871,44 @@ describe('createResponsesWebSocketFetch', () => {
     expect(decision.decision).toBe('history_mismatch_new_head');
     expect(firstHeadMismatch(diagnostics))
       .toMatchObject({ toolArgumentNormalizationGap: { tool: 'Grep', equalAfterStrip: true } });
+  });
+
+  it('warns when a filler-strip gap accompanies a schema-default echo', async () => {
+    const tools = [{
+      type: 'function', name: 'Edit',
+      parameters: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string' },
+          old_string: { type: 'string' },
+          new_string: { type: 'string' },
+          glob: { type: 'string' },
+          replace_all: { type: 'boolean', default: false },
+        },
+        required: ['file_path', 'old_string', 'new_string'],
+      },
+    }];
+    const { stderr, diagnostics } = await runToolArgumentMismatch({
+      accountId: 'acct-tool-gap-default',
+      responseId: 'resp_tool_gap_default',
+      tools,
+      upstreamCall: {
+        type: 'function_call', id: 'fc_1', call_id: 'call_edit', name: 'Edit',
+        arguments: '{"file_path":"a.py","old_string":"x","new_string":"y"}',
+        status: 'completed',
+      },
+      echoedCall: {
+        type: 'function_call', call_id: 'call_edit', name: 'Edit',
+        arguments: '{"file_path":"a.py","old_string":"x","new_string":"y","glob":null,"replace_all":false}',
+      },
+    });
+
+    expect(stderr.join('')).toContain('filler-strip rule is applied');
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+      .toMatchObject({ decision: 'history_mismatch_new_head' });
+    expect(firstHeadMismatch(diagnostics)).toMatchObject({
+      toolArgumentNormalizationGap: { tool: 'Edit', equalAfterStrip: true },
+    });
   });
 
   it('routes the tool-argument canary through the channel launchClaude leaves open', async () => {
@@ -3321,6 +4569,663 @@ describe('createResponsesWebSocketFetch', () => {
     await readAll(next);
   });
 
+  it('keeps a parallel conversation on its own chain while an unrelated head streams', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-subagent-fanout',
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const send = (input: unknown[]): Promise<Response> => wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const decisions = (): ResponsesWebSocketDiagnosticEvent[] =>
+      diagnostics.filter(event => event.event === 'ws_head_decision');
+
+    // Conversation A earns a committed head by completing a turn, so its stored
+    // history is something a later request can be compared against.
+    const aFirstUser = { role: 'user', content: [{ type: 'input_text', text: 'conversation A' }] };
+    const aTurnOne = await send([aFirstUser]);
+    const aSocket = lastSocket();
+    aSocket.emit('open');
+    emitTextResponse(aSocket, 'resp_a1', 'A answer');
+    await readAll(aTurnOne);
+
+    // ...and is mid-response on its NEXT turn when the sibling arrives, which is
+    // what a real tool loop looks like. The head is in flight with a committed
+    // prefix — the shape no other test covers.
+    const aTurnTwo = await send([
+      aFirstUser,
+      { role: 'assistant', content: [{ type: 'output_text', text: 'A answer' }] },
+      { role: 'user', content: [{ type: 'input_text', text: 'A again' }] },
+    ]);
+    expect(lastSocket()).toBe(aSocket);
+    expect(decisions().at(-1)).toMatchObject({ decision: 'continuation' });
+
+    // Conversation B is a different Claude Code subagent. It inherits the parent's
+    // session id, so it lands in A's partition, but its history diverges from A's
+    // at the very first item: A can never become B's parent.
+    const bFirstUser = { role: 'user', content: [{ type: 'input_text', text: 'conversation B' }] };
+    const bTurnOne = await send([bFirstUser]);
+    const bSocket = lastSocket();
+    expect(bSocket).not.toBe(aSocket);
+    expect(decisions().at(-1)).toMatchObject({ decision: 'history_mismatch_new_head' });
+    bSocket.emit('open');
+    emitTextResponse(bSocket, 'resp_b1', 'B answer');
+    await readAll(bTurnOne);
+
+    emitTextResponse(aSocket, 'resp_a2', 'A answer again');
+    await readAll(aTurnTwo);
+
+    // The payoff: B's second turn continues B's chain instead of resending the
+    // whole conversation on yet another throwaway socket.
+    const bNextUser = { role: 'user', content: [{ type: 'input_text', text: 'B again' }] };
+    const bTurnTwo = await send([
+      bFirstUser,
+      { role: 'assistant', content: [{ type: 'output_text', text: 'B answer' }] },
+      bNextUser,
+    ]);
+    expect(lastSocket()).toBe(bSocket);
+    const sent = JSON.parse(bSocket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_b1');
+    expect(sent.input).toEqual([bNextUser]);
+    emitTextResponse(bSocket, 'resp_b2', 'B answer again');
+    await readAll(bTurnTwo);
+
+    // A's own chain is untouched by any of it.
+    expect(aSocket.close).not.toHaveBeenCalled();
+    expect(decisions().map(event => event.decision)).toEqual([
+      'new_partition_head', 'continuation', 'history_mismatch_new_head', 'continuation',
+    ]);
+  });
+
+  it('keeps a simultaneous sibling on its own chain while a first-ever response streams', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const debug: string[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, message => debug.push(message), {
+      accountId: 'acct-simultaneous-fanout',
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const send = (input: unknown[]): Promise<Response> => wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const decisions = (): ResponsesWebSocketDiagnosticEvent[] =>
+      diagnostics.filter(event => event.event === 'ws_head_decision');
+
+    // A swarm of subagents starting at the same moment: conversation A's very
+    // FIRST response is still streaming, so its head has committed nothing — no
+    // response id, no stored history, nothing a prefix check can run against.
+    const aFirstUser = { role: 'user', content: [{ type: 'input_text', text: 'conversation A' }] };
+    const aTurnOne = await send([aFirstUser]);
+    const aSocket = lastSocket();
+    aSocket.emit('open');
+    expect(decisions().at(-1)).toMatchObject({ decision: 'new_partition_head' });
+
+    // There is still something to compare against: the items A is generating FOR.
+    // B diverges from them at the first item, so A can never become B's parent.
+    const bFirstUser = { role: 'user', content: [{ type: 'input_text', text: 'conversation B' }] };
+    const bTurnOne = await send([bFirstUser]);
+    const bSocket = lastSocket();
+    expect(bSocket).not.toBe(aSocket);
+    expect(decisions().at(-1)).toMatchObject({
+      decision: 'history_mismatch_new_head',
+      createdGeneration: 'nursery',
+    });
+    expect(decisions().at(-1)).not.toHaveProperty('isolatedByConnectionId');
+    expect(debug).not.toContain('ws: parallel request using an isolated socket');
+    bSocket.emit('open');
+    emitTextResponse(bSocket, 'resp_b1', 'B answer');
+    await readAll(bTurnOne);
+    emitTextResponse(aSocket, 'resp_a1', 'A answer');
+    await readAll(aTurnOne);
+
+    // The payoff: B's head survived, so B's second turn sends one item instead of
+    // resending its whole history on yet another throwaway socket.
+    const bNextUser = { role: 'user', content: [{ type: 'input_text', text: 'B again' }] };
+    const bTurnTwo = await send([
+      bFirstUser,
+      { role: 'assistant', content: [{ type: 'output_text', text: 'B answer' }] },
+      bNextUser,
+    ]);
+    expect(fakeSockets).toHaveLength(2);
+    expect(lastSocket()).toBe(bSocket);
+    const sent = JSON.parse(bSocket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_b1');
+    expect(sent.input).toEqual([bNextUser]);
+    emitTextResponse(bSocket, 'resp_b2', 'B answer again');
+    await readAll(bTurnTwo);
+  });
+
+  it('does not continue a committed head on a request that adds no new turn', async () => {
+    // Equality is not a continuation: the delta would be empty, so the head would
+    // be asked to produce a second response for a turn it has already answered.
+    // `isStrictPrefix` rejects it, and this is the only test that says so.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-no-new-turn',
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const firstUser = { role: 'user', content: [{ type: 'input_text', text: 'opening turn' }] };
+    const send = (input: unknown[]): Promise<Response> => wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+
+    const first = await send([firstUser]);
+    const headSocket = lastSocket();
+    headSocket.emit('open');
+    emitTextResponse(headSocket, 'resp_committed', 'the answer');
+    await readAll(first);
+
+    // Exactly the stored prefix — the client's own turn plus the answer it got —
+    // and nothing after it.
+    const echoed = await send([
+      firstUser,
+      { role: 'assistant', content: [{ type: 'output_text', text: 'the answer' }] },
+    ]);
+    expect(fakeSockets).toHaveLength(2);
+    const ownSocket = lastSocket();
+    expect(ownSocket).not.toBe(headSocket);
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+      .toMatchObject({ decision: 'history_mismatch_new_head', matchingCandidateCount: 0 });
+    ownSocket.emit('open');
+    expect(JSON.parse(ownSocket.send.mock.calls[0]![0] as string).previous_response_id)
+      .toBeUndefined();
+    emitTextResponse(ownSocket, 'resp_no_new_turn', 'again');
+    await readAll(echoed);
+  });
+
+  it('isolates a request that repeats the turn a head is generating right now', async () => {
+    // The retry case. A second copy of the same turn is not a branch off the
+    // response in flight, it IS that response — asking the head to continue it
+    // would ask it to extend a turn it has not finished. The uncommitted head has
+    // no stored history, so equality against what it is generating is the only
+    // signal there is, and it has to count as "could be this request".
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const debug: string[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, message => debug.push(message), {
+      accountId: 'acct-duplicate-inflight',
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const turn = [{ role: 'user', content: [{ type: 'input_text', text: 'one turn' }] }];
+    const send = (): Promise<Response> => wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(turn)),
+    });
+
+    const first = await send();
+    const firstSocket = lastSocket();
+    firstSocket.emit('open');
+
+    const duplicate = await send();
+    expect(fakeSockets).toHaveLength(2);
+    const duplicateSocket = lastSocket();
+    expect(duplicateSocket).not.toBe(firstSocket);
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+      .toMatchObject({
+        decision: 'parallel_isolated',
+        createdGeneration: 'isolated',
+        isolatedByConnectionId: 1,
+      });
+    expect(debug).toContain('ws: parallel request using an isolated socket');
+
+    duplicateSocket.emit('open');
+    expect(JSON.parse(duplicateSocket.send.mock.calls[0]![0] as string).previous_response_id)
+      .toBeUndefined();
+    emitTextResponse(duplicateSocket, 'resp_duplicate', 'answer');
+    await readAll(duplicate);
+    emitTextResponse(firstSocket, 'resp_first', 'answer');
+    await readAll(first);
+  });
+
+  it('keeps its own head when its history is shorter than the turn in flight', async () => {
+    // A rewind or an abandoned branch: fewer items than the response being
+    // generated. A LATER turn of that response is necessarily longer, so a shorter
+    // history can never be its child and there is nothing to be confused with —
+    // which is why `isPrefixOrEqual` is asked whether the IN-FLIGHT items are the
+    // prefix, not the other way round.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const debug: string[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, message => debug.push(message), {
+      accountId: 'acct-shorter-than-inflight',
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const history = Array.from({ length: 5 }, (_, index) => (
+      index % 2 === 0
+        ? { role: 'user', content: [{ type: 'input_text', text: `turn ${index}` }] }
+        : { role: 'assistant', content: [{ type: 'output_text', text: `answer ${index}` }] }
+    ));
+    const send = (input: unknown[]): Promise<Response> => wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+
+    const streaming = await send(history);
+    const streamingSocket = lastSocket();
+    streamingSocket.emit('open');
+
+    const rewound = history.slice(0, 3);
+    const branch = await send(rewound);
+    expect(fakeSockets).toHaveLength(2);
+    const branchSocket = lastSocket();
+    expect(branchSocket).not.toBe(streamingSocket);
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1);
+    // Persistent, so the rewound conversation's NEXT turn can continue this head.
+    expect(decision).toMatchObject({
+      decision: 'history_mismatch_new_head',
+      createdGeneration: 'nursery',
+    });
+    expect(decision).not.toHaveProperty('isolatedByConnectionId');
+    expect(debug).not.toContain('ws: parallel request using an isolated socket');
+
+    branchSocket.emit('open');
+    const sent = JSON.parse(branchSocket.send.mock.calls[0]![0] as string);
+    expect(sent.previous_response_id).toBeUndefined();
+    expect(sent.input).toEqual(rewound);
+    emitTextResponse(branchSocket, 'resp_branch', 'branch answer');
+    await readAll(branch);
+    emitTextResponse(streamingSocket, 'resp_streaming_long', 'long answer');
+    await readAll(streaming);
+  });
+
+  it('isolates a request that extends the turn a head is generating right now', async () => {
+    // Indistinguishable from the next turn of that very response arriving before
+    // it finished: the items in flight are a prefix of this request. Until the
+    // head commits there is no way to tell a branch from a lineage, so this
+    // request gets its own socket rather than risk being stitched onto a turn
+    // whose output it has not seen.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-extends-inflight',
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const firstUser = { role: 'user', content: [{ type: 'input_text', text: 'opening turn' }] };
+    const send = (input: unknown[]): Promise<Response> => wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+
+    const streaming = await send([firstUser]);
+    const streamingSocket = lastSocket();
+    streamingSocket.emit('open');
+
+    const extension = [
+      firstUser,
+      { role: 'assistant', content: [{ type: 'output_text', text: 'guessed answer' }] },
+      { role: 'user', content: [{ type: 'input_text', text: 'follow-up' }] },
+    ];
+    const extended = await send(extension);
+    expect(fakeSockets).toHaveLength(2);
+    const extendedSocket = lastSocket();
+    expect(extendedSocket).not.toBe(streamingSocket);
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+      .toMatchObject({
+        decision: 'parallel_isolated',
+        createdGeneration: 'isolated',
+        isolatedByConnectionId: 1,
+      });
+
+    extendedSocket.emit('open');
+    const sent = JSON.parse(extendedSocket.send.mock.calls[0]![0] as string);
+    expect(sent.previous_response_id).toBeUndefined();
+    expect(sent.input).toEqual(extension);
+    emitTextResponse(extendedSocket, 'resp_extended', 'answer');
+    await readAll(extended);
+    emitTextResponse(streamingSocket, 'resp_streaming', 'answer');
+    await readAll(streaming);
+  });
+
+  it('gives concurrent subagents their own heads when the request carries a Claude agent id', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-fanout',
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const sendAs = (agent: string, input: unknown[]): Promise<Response> =>
+      withResponsesWebSocketDiagnosticContext(
+        { requestId: `req-${agent}`, claudeSessionId: 'shared-session', claudeAgentId: agent, claudeParentAgentId: 'main' },
+        () => wsFetch('https://x', { method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)) }),
+      );
+    const decisions = (): ResponsesWebSocketDiagnosticEvent[] =>
+      diagnostics.filter(event => event.event === 'ws_head_decision');
+
+    // Both siblings share the parent's session (and so its prompt_cache_key) and
+    // start at the same moment: A's first response is still streaming when B's
+    // first request arrives. In one partition B would be isolated by A's
+    // uncommitted head; per-agent partitions let each keep a chain.
+    const aUser = { role: 'user', content: [{ type: 'input_text', text: 'sibling A brief' }] };
+    const bUser = { role: 'user', content: [{ type: 'input_text', text: 'sibling B brief' }] };
+    const aTurnOne = await sendAs('agent-a', [aUser]);
+    const aSocket = lastSocket();
+    aSocket.emit('open');
+    const bTurnOne = await sendAs('agent-b', [bUser]);
+    const bSocket = lastSocket();
+    expect(bSocket).not.toBe(aSocket);
+    bSocket.emit('open');
+    expect(decisions().map(event => event.decision)).toEqual(['new_partition_head', 'new_partition_head']);
+    expect(decisions()[1]).toMatchObject({
+      createdGeneration: 'nursery',
+      keyTuple: expect.objectContaining({
+        promptCacheKey: 'relay-session-abc',
+        claudeAgentId: 'agent-b',
+        claudeParentAgentId: 'main',
+      }),
+    });
+    expect(decisions()[0]!.partitionKey).not.toBe(decisions()[1]!.partitionKey);
+
+    emitTextResponse(bSocket, 'resp_b1', 'B answer');
+    await readAll(bTurnOne);
+    emitTextResponse(aSocket, 'resp_a1', 'A answer');
+    await readAll(aTurnOne);
+
+    // Each sibling's second turn continues its own head with only the delta.
+    const bTurnTwo = await sendAs('agent-b', [
+      bUser,
+      { role: 'assistant', content: [{ type: 'output_text', text: 'B answer' }] },
+      { role: 'user', content: [{ type: 'input_text', text: 'B next' }] },
+    ]);
+    expect(lastSocket()).toBe(bSocket);
+    const bSent = JSON.parse(bSocket.send.mock.calls.at(-1)![0] as string) as { previous_response_id?: string; input: unknown[] };
+    expect(bSent.previous_response_id).toBe('resp_b1');
+    expect(bSent.input).toHaveLength(1);
+    emitTextResponse(bSocket, 'resp_b2', 'B again');
+    await readAll(bTurnTwo);
+
+    const socketsBeforeATurnTwo = fakeSockets.length;
+    const aTurnTwo = await sendAs('agent-a', [
+      aUser,
+      { role: 'assistant', content: [{ type: 'output_text', text: 'A answer' }] },
+      { role: 'user', content: [{ type: 'input_text', text: 'A next' }] },
+    ]);
+    expect(fakeSockets.length).toBe(socketsBeforeATurnTwo);
+    const aSent = JSON.parse(aSocket.send.mock.calls.at(-1)![0] as string) as { previous_response_id?: string };
+    expect(aSent.previous_response_id).toBe('resp_a1');
+    emitTextResponse(aSocket, 'resp_a2', 'A again');
+    await readAll(aTurnTwo);
+
+    expect(decisions().map(event => event.decision)).toEqual([
+      'new_partition_head', 'new_partition_head', 'continuation', 'continuation',
+    ]);
+  });
+
+  it('still isolates a parallel request when the busy head could still be its parent', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-ambiguous-parent',
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const send = (input: unknown[]): Promise<Response> => wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const lastDecision = (): ResponsesWebSocketDiagnosticEvent | undefined =>
+      diagnostics.filter(event => event.event === 'ws_head_decision').at(-1);
+
+    const firstUser = { role: 'user', content: [{ type: 'input_text', text: 'shared root' }] };
+    const turnOne = await send([firstUser]);
+    const socket = lastSocket();
+    socket.emit('open');
+    emitTextResponse(socket, 'resp_1', 'answer');
+    await readAll(turnOne);
+
+    const turnTwo = await send([
+      firstUser,
+      { role: 'assistant', content: [{ type: 'output_text', text: 'answer' }] },
+      { role: 'user', content: [{ type: 'input_text', text: 'second' }] },
+    ]);
+    expect(lastSocket()).toBe(socket);
+
+    // A request that EXTENDS the busy head's committed history could still be a
+    // later turn of the response it is generating, so it must not fork a head.
+    const overlapping = await send([
+      firstUser,
+      { role: 'assistant', content: [{ type: 'output_text', text: 'answer' }] },
+      { role: 'user', content: [{ type: 'input_text', text: 'a different second' }] },
+    ]);
+    const isolatedSocket = lastSocket();
+    expect(isolatedSocket).not.toBe(socket);
+    expect(lastDecision()).toMatchObject({
+      decision: 'parallel_isolated',
+      createdGeneration: 'isolated',
+      isolatedByConnectionId: 1,
+    });
+    isolatedSocket.emit('open');
+    emitTextResponse(isolatedSocket, 'resp_isolated', 'isolated answer');
+    await readAll(overlapping);
+    expect(isolatedSocket.close).toHaveBeenCalled();
+
+    emitTextResponse(socket, 'resp_2', 'second answer');
+    await readAll(turnTwo);
+  });
+
+  it('does not continue a head whose history differs only at the root item', async () => {
+    // The length guard returns early whenever the client history is SHORTER than
+    // the stored prefix, so a divergence test that relies on a short history never
+    // compares item 0 at all. This one is long enough to reach the comparison: B
+    // matches A's stored prefix everywhere EXCEPT the root. Continuing A here
+    // would hand B someone else's `previous_response_id` and drop B's own root
+    // from the delta entirely.
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-root-only-divergence' });
+    const send = (input: unknown[]): Promise<Response> => wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const sharedReply = { role: 'assistant', content: [{ type: 'output_text', text: 'same answer' }] };
+
+    const aTurnOne = await send([{ role: 'user', content: [{ type: 'input_text', text: 'root A' }] }]);
+    const aSocket = lastSocket();
+    aSocket.emit('open');
+    emitTextResponse(aSocket, 'resp_a1', 'same answer');
+    await readAll(aTurnOne);
+
+    // Stored prefix is [root A, assistant]; this is [root B, assistant, user] —
+    // longer, and identical from item 1 onward.
+    const bTurnOne = await send([
+      { role: 'user', content: [{ type: 'input_text', text: 'root B' }] },
+      sharedReply,
+      { role: 'user', content: [{ type: 'input_text', text: 'B continues' }] },
+    ]);
+    expect(fakeSockets).toHaveLength(2);
+    const bSocket = lastSocket();
+    expect(bSocket).not.toBe(aSocket);
+    // A's head was not touched: no second send, so no chain was hijacked.
+    expect(aSocket.send).toHaveBeenCalledTimes(1);
+    bSocket.emit('open');
+    const sent = JSON.parse(bSocket.send.mock.calls[0]![0] as string);
+    expect(sent.previous_response_id).toBeUndefined();
+    expect(sent.input).toHaveLength(3);
+    emitTextResponse(bSocket, 'resp_b1', 'B answer');
+    await readAll(bTurnOne);
+  });
+
+  it('keeps a chain that shares a parent preamble but diverges inside assistant history', async () => {
+    // Subagents fanned out from one Claude session open with the SAME inherited
+    // preamble, so a lineage test that only compares the first item — or that
+    // compares only the head's own request input and ignores the output it
+    // produced — cannot tell these two conversations apart.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-shared-preamble',
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const send = (input: unknown[]): Promise<Response> => wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const preamble = { role: 'user', content: [{ type: 'input_text', text: 'shared parent preamble' }] };
+
+    const aTurnOne = await send([preamble]);
+    const aSocket = lastSocket();
+    aSocket.emit('open');
+    emitTextResponse(aSocket, 'resp_a1', 'A answer');
+    await readAll(aTurnOne);
+
+    // A is mid-response on its next turn, holding a committed prefix of
+    // [preamble] + [assistant "A answer"].
+    const aTurnTwo = await send([
+      preamble,
+      { role: 'assistant', content: [{ type: 'output_text', text: 'A answer' }] },
+      { role: 'user', content: [{ type: 'input_text', text: 'A again' }] },
+    ]);
+    expect(lastSocket()).toBe(aSocket);
+
+    // B shares item 0 with A and first differs at the ASSISTANT item, which sits
+    // in the region A produced rather than the region A was sent.
+    const bPrefix = [
+      preamble,
+      { role: 'assistant', content: [{ type: 'output_text', text: 'B answer' }] },
+    ];
+    const bTurnOne = await send([...bPrefix, { role: 'user', content: [{ type: 'input_text', text: 'B follows' }] }]);
+    const bSocket = lastSocket();
+    expect(bSocket).not.toBe(aSocket);
+    bSocket.emit('open');
+    emitTextResponse(bSocket, 'resp_b1', 'B second answer');
+    await readAll(bTurnOne);
+    emitTextResponse(aSocket, 'resp_a2', 'A answer again');
+    await readAll(aTurnTwo);
+
+    // B kept a head, so its next turn continues instead of resending.
+    const bNextUser = { role: 'user', content: [{ type: 'input_text', text: 'B again' }] };
+    const bTurnTwo = await send([
+      ...bPrefix,
+      { role: 'user', content: [{ type: 'input_text', text: 'B follows' }] },
+      { role: 'assistant', content: [{ type: 'output_text', text: 'B second answer' }] },
+      bNextUser,
+    ]);
+    expect(fakeSockets).toHaveLength(2); // no third socket was constructed
+    const sent = JSON.parse(bSocket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_b1');
+    expect(sent.input).toEqual([bNextUser]);
+    expect(bSocket.close).not.toHaveBeenCalled();
+    emitTextResponse(bSocket, 'resp_b2', 'B third answer');
+    await readAll(bTurnTwo);
+  });
+
+  it('isolates a parallel request whose only possible parent matches by omitted reasoning', async () => {
+    // Claude does not always echo a stored reasoning item back. Such a request is
+    // still a descendant of the busy head, so the lineage test has to accept
+    // `continuationMatch`'s omitted-reasoning mode, not exact prefixes only.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-omitted-reasoning-parent',
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const send = (input: unknown[]): Promise<Response> => wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const lastDecision = (): ResponsesWebSocketDiagnosticEvent | undefined =>
+      diagnostics.filter(event => event.event === 'ws_head_decision').at(-1);
+    const firstUser = { role: 'user', content: [{ type: 'input_text', text: 'inspect the file' }] };
+
+    const turnOne = await send([firstUser]);
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_1' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.added', output_index: 0,
+      item: { type: 'reasoning', id: 'rs_1' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'reasoning', id: 'rs_1', encrypted_content: 'enc_1', summary: [] },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 1,
+      item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'Read', arguments: '{}', status: 'completed' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_1' } })));
+    await readAll(turnOne);
+
+    // The tool result comes back WITHOUT the reasoning item, so this continues
+    // through the omitted-reasoning mode and leaves the head in flight.
+    const echoed = [
+      firstUser,
+      { type: 'function_call', call_id: 'call_1', name: 'Read', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'call_1', output: 'contents' },
+    ];
+    const turnTwo = await send(echoed);
+    expect(lastSocket()).toBe(socket);
+    expect(lastDecision()).toMatchObject({ continuationMatchMode: 'omitted_reasoning' });
+
+    // Another request extending that same reasoning-omitting history could be a
+    // later turn of the response still streaming, so it must not fork a head.
+    const overlapping = await send([...echoed, { role: 'user', content: [{ type: 'input_text', text: 'and again' }] }]);
+    const isolatedSocket = lastSocket();
+    expect(isolatedSocket).not.toBe(socket);
+    expect(lastDecision()).toMatchObject({
+      decision: 'parallel_isolated',
+      createdGeneration: 'isolated',
+      isolatedByConnectionId: 1,
+    });
+    isolatedSocket.emit('open');
+    emitTextResponse(isolatedSocket, 'resp_isolated', 'isolated answer');
+    await readAll(overlapping);
+    expect(isolatedSocket.close).toHaveBeenCalled();
+
+    emitTextResponse(socket, 'resp_2', 'second answer');
+    await readAll(turnTwo);
+  });
+
+  it('finds the possible parent among several busy heads and names it', async () => {
+    // The partition holds an unrelated busy head FIRST and the possible parent
+    // second, so stopping at the first busy candidate reaches the wrong verdict
+    // and the reported connection id is the only thing that proves which head
+    // actually decided the isolation.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-two-busy-heads',
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const send = (input: unknown[]): Promise<Response> => wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const lastDecision = (): ResponsesWebSocketDiagnosticEvent | undefined =>
+      diagnostics.filter(event => event.event === 'ws_head_decision').at(-1);
+    const turn = (text: string) => ({ role: 'user', content: [{ type: 'input_text', text }] });
+    const reply = (text: string) => ({ role: 'assistant', content: [{ type: 'output_text', text }] });
+
+    // Head 1: unrelated conversation, committed.
+    const aRoot = turn('conversation A root');
+    const aOne = await send([aRoot]);
+    const aSocket = lastSocket();
+    aSocket.emit('open');
+    emitTextResponse(aSocket, 'resp_a1', 'A answer');
+    await readAll(aOne);
+
+    // Head 2: a different conversation, committed. Registered after head 1, so it
+    // is the second candidate the scan walks.
+    const bRoot = turn('conversation B root');
+    const bOne = await send([bRoot]);
+    const bSocket = lastSocket();
+    expect(bSocket).not.toBe(aSocket);
+    bSocket.emit('open');
+    emitTextResponse(bSocket, 'resp_b1', 'B answer');
+    await readAll(bOne);
+
+    // Both heads go in flight, A first. Each continues on its own socket, so no
+    // new socket is constructed for either.
+    const aTwo = await send([aRoot, reply('A answer'), turn('A again')]);
+    expect(fakeSockets).toHaveLength(2);
+    expect(aSocket.send).toHaveBeenCalledTimes(2);
+    const bPrefix = [bRoot, reply('B answer')];
+    const bTwo = await send([...bPrefix, turn('B again')]);
+    expect(fakeSockets).toHaveLength(2);
+    expect(bSocket.send).toHaveBeenCalledTimes(2);
+
+    // A request that extends B — and nothing about A — must isolate, and must say
+    // it was B that blocked it.
+    const overlapping = await send([...bPrefix, turn('B a different way')]);
+    const isolatedSocket = lastSocket();
+    expect(isolatedSocket).not.toBe(aSocket);
+    expect(isolatedSocket).not.toBe(bSocket);
+    expect(lastDecision()).toMatchObject({
+      decision: 'parallel_isolated',
+      createdGeneration: 'isolated',
+      isolatedByConnectionId: 2,
+    });
+    isolatedSocket.emit('open');
+    emitTextResponse(isolatedSocket, 'resp_isolated', 'isolated answer');
+    await readAll(overlapping);
+    expect(isolatedSocket.close).toHaveBeenCalled();
+
+    emitTextResponse(aSocket, 'resp_a2', 'A answer again');
+    emitTextResponse(bSocket, 'resp_b2', 'B answer again');
+    await readAll(aTwo);
+    await readAll(bTwo);
+  });
+
   it('retains the main head when a completed auxiliary request starts another branch', async () => {
     const input = [{ role: 'user', content: [{ type: 'input_text', text: 'main' }] }];
     const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-hidden-branch' });
@@ -3775,6 +5680,131 @@ describe('createResponsesWebSocketFetch', () => {
     (diagnostics.filter(event => event.event === 'ws_head_decision').at(-1)!.evictions ?? []) as
       Record<string, unknown>[];
 
+  it('reports the shipped pools as unbounded when nothing overrides them', async () => {
+    // The defaults are the deliverable of the sizing change, and they reach behaviour
+    // only through option resolution — so read them back off a decision made by a
+    // fetch constructed the way production constructs one, not off the constants.
+    // `null` is the unbounded default: the descriptor limit is the ceiling.
+    // The env overrides must be cleared: a developer who exports them for their own
+    // server would otherwise have this test confirm THEIR caps as the shipped ones.
+    const saved = [
+      process.env.CLODEX_WS_MAX_CONNECTIONS,
+      process.env.CLODEX_WS_MAX_NURSERY_CONNECTIONS,
+    ];
+    delete process.env.CLODEX_WS_MAX_CONNECTIONS;
+    delete process.env.CLODEX_WS_MAX_NURSERY_CONNECTIONS;
+    try {
+      const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-default-caps',
+        onDiagnostic: event => diagnostics.push(event),
+      });
+      const response = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload([
+          { role: 'user', content: [{ type: 'input_text', text: 'default caps' }] },
+        ])),
+      });
+      lastSocket().emit('open');
+      emitTextResponse(lastSocket(), 'resp_default_caps', 'ok');
+      await readAll(response);
+      expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+        .toMatchObject({ maxConnections: null, maxNurseryConnections: null });
+    } finally {
+      if (saved[0] !== undefined) process.env.CLODEX_WS_MAX_CONNECTIONS = saved[0];
+      if (saved[1] !== undefined) process.env.CLODEX_WS_MAX_NURSERY_CONNECTIONS = saved[1];
+    }
+  });
+
+  it('says how long an evicted head had been idle, in the log and the ledger', async () => {
+    // Whether a cap is costing anything turns entirely on the victim's idle age. A cap
+    // eviction used to log nothing that NAMED it as one — the socket close left a line,
+    // but nothing said a cap had displaced a reusable head, unlike the TTL path beside
+    // it — so the only record of the cause needed --ws-diagnostics and a JSONL trawl.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const debug: string[] = [];
+    let clock = 1_000;
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, message => debug.push(message), {
+      accountId: 'acct-eviction-idle-age',
+      maxNurseryConnections: 1,
+      now: () => clock,
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const send = (text: string): Promise<Response> => wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([{ role: 'user', content: [{ type: 'input_text', text }] }])),
+    });
+
+    const first = await send('first conversation');
+    const firstSocket = lastSocket();
+    firstSocket.emit('open');
+    // Spend time BEFORE the head goes idle, so that an idle age computed from
+    // `createdAt` instead of `lastUsedAt` would read 9,000ms rather than 7,000.
+    clock += 2_000;
+    emitTextResponse(firstSocket, 'resp_evicted', 'ok');
+    await readAll(first);
+
+    // The head goes idle here, and sits idle for a measurable stretch.
+    clock += 7_000;
+    const second = await send('second conversation');
+    expect(firstSocket.close).toHaveBeenCalled();
+
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+      .toMatchObject({ evictions: [{ reason: 'nursery_lru_cap', idleMs: 7_000 }] });
+    expect(debug).toContain(
+      'ws: evicting the oldest idle nursery connection to stay within its cap: '
+      + 'connection=1 idle_ms=7000 cap=1 reason=nursery_lru_cap',
+    );
+
+    lastSocket().emit('open');
+    emitTextResponse(lastSocket(), 'resp_second', 'ok');
+    await readAll(second);
+  });
+
+  it('evicts the least recently used idle head, not merely any idle one', async () => {
+    // The whole sizing argument rests on the victim being the LEAST recently used: that
+    // is what makes an evicted head one whose conversation has plausibly finished. With
+    // a cap of 1 and a single idle head, order cannot be observed, so nothing pinned it
+    // and reversing the sort passed the entire file.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    let clock = 1_000;
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-lru-order',
+      maxNurseryConnections: 2,
+      now: () => clock,
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const turn = (text: string): Promise<Response> => wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([{ role: 'user', content: [{ type: 'input_text', text }] }])),
+    });
+
+    // Two heads go idle at known, different times: connection 1 first, then 2.
+    for (const [index, text] of ['older conversation', 'newer conversation'].entries()) {
+      const response = await turn(text);
+      const socket = lastSocket();
+      socket.emit('open');
+      clock += 1_000 * (index + 1);
+      emitTextResponse(socket, `resp_lru_${index}`, 'ok');
+      await readAll(response);
+    }
+    const [olderSocket, newerSocket] = fakeSockets;
+
+    clock += 5_000;
+    const third = await turn('third conversation');
+
+    // Connection 1 went idle at 2,000 and connection 2 at 4,000; it is now 9,000, so
+    // connection 1 has been idle 7,000ms against connection 2's 5,000ms and must go.
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+      .toMatchObject({ evictions: [{ connectionId: 1, reason: 'nursery_lru_cap', idleMs: 7_000 }] });
+    expect(olderSocket!.close).toHaveBeenCalled();
+    expect(newerSocket!.close).not.toHaveBeenCalled();
+
+    lastSocket().emit('open');
+    emitTextResponse(lastSocket(), 'resp_lru_third', 'ok');
+    await readAll(third);
+  });
+
   it('honors CLODEX_WS_MAX_NURSERY_CONNECTIONS', async () => {
     process.env.CLODEX_WS_MAX_NURSERY_CONNECTIONS = '1';
     try {
@@ -3788,7 +5818,7 @@ describe('createResponsesWebSocketFetch', () => {
   it('ignores a malformed connection cap rather than reinterpreting it', async () => {
     process.env.CLODEX_WS_MAX_NURSERY_CONNECTIONS = 'lots';
     try {
-      // Falls back to the default of 8, so two heads coexist without eviction.
+      // Falls back to the shipped nursery default, so two heads coexist without eviction.
       expect(lastEvictions(await fillTwoNurseryHeads('acct-env-nursery-bad'))).toEqual([]);
     } finally {
       delete process.env.CLODEX_WS_MAX_NURSERY_CONNECTIONS;
@@ -3867,8 +5897,2258 @@ describe('createResponsesWebSocketFetch', () => {
     }, options, 'credential-a'));
   });
 
+  it('partitions in-process subagents by Claude agent id while keeping the prompt cache key', () => {
+    const payload = sessionPayload([]);
+    const options = { providerId: 'openai', accountId: 'a' };
+    const main = responsesWebSocketPartitionKey(WS_URL, payload, options, 'credential-a');
+    const agentA = responsesWebSocketPartitionKey(WS_URL, payload, options, 'credential-a', 'agent-a');
+    const agentB = responsesWebSocketPartitionKey(WS_URL, payload, options, 'credential-a', 'agent-b');
+    expect(agentA).not.toBe(main);
+    expect(agentB).not.toBe(main);
+    expect(agentA).not.toBe(agentB);
+    // No agent id is the main agent, whatever form the absence takes.
+    expect(responsesWebSocketPartitionKey(WS_URL, payload, options, 'credential-a', '')).toBe(main);
+    expect(responsesWebSocketPartitionKey(WS_URL, payload, options, 'credential-a', 'agent-a')).toBe(agentA);
+  });
+
   it('canonicalizes object key ordering in prompt fingerprints', () => {
     expect(responsesWebSocketPromptFingerprint({ model: 'm', tools: [{ name: 'x', parameters: { b: 2, a: 1 } }], input: ['a'] }))
       .toBe(responsesWebSocketPromptFingerprint({ tools: [{ parameters: { a: 1, b: 2 }, name: 'x' }], model: 'm', input: ['different'] }));
+  });
+
+  it('starts a new chain when an opaque JSON-looking function output changes bytes', async () => {
+    // `function_call_output.output` is compared byte-exact: it is opaque text,
+    // not JSON, so a key-order change is a different history. Pins the boundary
+    // the tool-argument normalization must not cross.
+    const tools = [{ type: 'function', name: 'JsonTool', parameters: { type: 'object' } }];
+    const firstUser = { role: 'user', content: [{ type: 'input_text', text: 'run it' }] };
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, { accountId: 'acct-output-json-exact' });
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([firstUser], { tools })),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_output_call' } })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: { type: 'function_call', call_id: 'call_output_json', name: 'JsonTool', arguments: '{}' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed', response: { id: 'resp_output_call' } })));
+    await readAll(first);
+
+    const echoedCall = { type: 'function_call', call_id: 'call_output_json', name: 'JsonTool', arguments: '{}' };
+    const originalOutput = { type: 'function_call_output', call_id: 'call_output_json', output: '{"a":1,"b":2}' };
+    const secondInput = [firstUser, echoedCall, originalOutput];
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(secondInput, { tools })),
+    });
+    expect(lastSocket()).toBe(socket);
+    emitTextResponse(socket, 'resp_output_done', 'done');
+    await readAll(second);
+
+    const changedOutput = { ...originalOutput, output: '{"b":2,"a":1}' };
+    const assistant = { role: 'assistant', content: [{ type: 'output_text', text: 'done' }] };
+    const nextUser = { role: 'user', content: [{ type: 'input_text', text: 'again' }] };
+    const fullInput = [firstUser, echoedCall, changedOutput, assistant, nextUser];
+    const third = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(fullInput, { tools })),
+    });
+    const isolated = lastSocket();
+    expect(isolated).not.toBe(socket);
+    isolated.emit('open');
+    const sent = JSON.parse(isolated.send.mock.calls[0]![0] as string);
+    expect(sent.previous_response_id).toBeUndefined();
+    expect(sent.input).toEqual(fullInput);
+    emitTextResponse(isolated, 'resp_output_changed', 'changed');
+    await readAll(third);
+  });
+
+});
+
+describe('new-connection pacing', () => {
+  beforeEach(() => {
+    resetResponsesWebSocketConnectionsForTests();
+    fakeSockets.length = 0;
+  });
+
+  /** Records every admission request; production shares one process-wide pacer. */
+  function recordingPacer(admission: UpgradeAdmission = { kind: 'admitted', waitedMs: 0 }) {
+    return { admit: vi.fn(async () => admission) };
+  }
+
+  it('never asks the pacer for a request that reuses an existing connection', async () => {
+    const pacer = recordingPacer();
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-pacing-reuse',
+      pacer,
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'first turn' }] }];
+
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.created', response: { id: 'resp_pace_1' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.output_item.done', output_index: 0,
+      item: {
+        type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'Read',
+        arguments: '{"path":"file.ts"}', status: 'completed',
+      },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.completed', response: { id: 'resp_pace_1' },
+    })));
+    await readAll(first);
+    expect(pacer.admit).toHaveBeenCalledTimes(1);
+
+    // Second turn continues the same head: no new connection, so no pacing.
+    const echoedCall = {
+      type: 'function_call', call_id: 'call_1', name: 'Read', arguments: '{"path":"file.ts"}',
+    };
+    const toolOutput = { type: 'function_call_output', call_id: 'call_1', output: 'contents' };
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([...input, echoedCall, toolOutput])),
+    });
+    expect(fakeSockets).toHaveLength(1);
+    expect(diagnostics.at(-1)).toMatchObject({ event: 'ws_head_decision', decision: 'continuation' });
+    expect(pacer.admit).toHaveBeenCalledTimes(1);
+    emitTextResponse(socket, 'resp_pace_2', 'done');
+    await readAll(second);
+    expect(pacer.admit).toHaveBeenCalledTimes(1);
+  });
+
+  it('asks the pacer for each primary connection it opens', async () => {
+    const pacer = recordingPacer();
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-pacing-open',
+      pacer,
+    });
+    // Two unrelated conversations: each needs its own head.
+    for (const text of ['alpha', 'beta']) {
+      const response = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload(
+          [{ role: 'user', content: [{ type: 'input_text', text }] }],
+          { prompt_cache_key: `relay-session-${text}` },
+        )),
+      });
+      const socket = lastSocket();
+      socket.emit('open');
+      emitTextResponse(socket, `resp_${text}`, 'ok');
+      await readAll(response);
+    }
+    expect(fakeSockets).toHaveLength(2);
+    expect(pacer.admit).toHaveBeenCalledTimes(2);
+  });
+
+  it('records how long a delayed connection waited, on both diagnostics', async () => {
+    const debug: string[] = [];
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, message => debug.push(message), {
+      accountId: 'acct-pacing-delay',
+      pacer: recordingPacer({ kind: 'admitted', waitedMs: 2_500 }),
+      onDiagnostic: event => diagnostics.push(event),
+    });
+
+    const response = await withResponsesWebSocketDiagnosticContext(
+      { requestId: 'req-paced' },
+      () => wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([])),
+      }),
+    );
+    const socket = lastSocket();
+    socket.emit('open');
+    emitTextResponse(socket, 'resp_paced', 'ok');
+    await readAll(response);
+
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: 'ws_new_connection_paced',
+      outcome: 'admitted',
+      waitedMs: 2_500,
+      requestId: 'req-paced',
+    }));
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: 'ws_head_decision',
+      pacingWaitedMs: 2_500,
+    }));
+    expect(debug).toContain('ws: paced new connection by 2500ms');
+  });
+
+  it('refuses without opening a socket, in a shape that classifies as a retryable 429', async () => {
+    const debug: string[] = [];
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, message => debug.push(message), {
+      accountId: 'acct-pacing-refused',
+      pacer: recordingPacer({ kind: 'refused', requiredWaitMs: 7_400, retryAfterSeconds: 8 }),
+      onDiagnostic: event => diagnostics.push(event),
+    });
+
+    const response = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([])),
+    });
+
+    // The whole point: the connection this would have opened is not opened.
+    expect(fakeSockets).toHaveLength(0);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
+    // A real header, not only the prose: the SDK's backoff reads headers and
+    // ignores the body. It does not de-correlate a fan-out — everyone refused at
+    // the same instant gets the same hint — it defers the group long enough for
+    // the bucket to refill.
+    expect(response.headers.get('retry-after')).toBe('8');
+
+    // A refusal happens before any connection or request context exists, so it
+    // cannot go through failContext. Prove the standalone frame still CLASSIFIES
+    // downstream as a retryable rate limit carrying the backoff hint — the same
+    // classification the real upgrade 403 gets. `classifyThroughSdk` runs with
+    // maxRetries: 0, so this pins the classification, not the retrying; the
+    // 403 test above is what exercises an actual SDK retry.
+    const body = await readAll(response);
+    // The frame itself, matching the shape failContext writes for a 403.
+    expect(JSON.parse(body.replace(/^data: /, '').trim())).toMatchObject({
+      type: 'error',
+      error: { type: 'rate_limit_error', code: '429', retry_after_seconds: 8 },
+    });
+    // And through the real provider. Note the hint survives via the PROSE: the
+    // SDK's chunk schema strips `retry_after_seconds`, so the frame field alone
+    // would not reach the client.
+    expect(await classifyThroughSdk(body)).toMatchObject({
+      statusCode: 429,
+      isRetryable: true,
+      retryAfterSeconds: 8,
+    });
+
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: 'ws_new_connection_paced',
+      outcome: 'refused',
+      requiredWaitMs: 7_400,
+      retryAfterSeconds: 8,
+    }));
+    expect(diagnostics.some(event => event.event === 'ws_head_decision')).toBe(false);
+    expect(debug).toContain(
+      'ws: refused a new connection to hold the pacing rate; retry after 8s',
+    );
+  });
+
+  it('does not open a second persistent head for a turn already in flight when it was queued', async () => {
+    // The head scan runs before the wait. A request that is overtaken during the
+    // wait by an identical turn — the same conversation arriving twice, which a
+    // client retry produces — would otherwise leave BOTH registering persistent
+    // nursery heads for one chain: two sockets generating the same response.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    let releaseQueued: (() => void) | undefined;
+    const queued = new Promise<void>(resolve => { releaseQueued = resolve; });
+    let markQueued: (() => void) | undefined;
+    const isQueued = new Promise<void>(resolve => { markQueued = resolve; });
+    let admissions = 0;
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-pacing-overlap',
+      pacer: {
+        admit: async (): Promise<UpgradeAdmission> => {
+          admissions += 1;
+          if (admissions > 1) return { kind: 'admitted', waitedMs: 0 };
+          markQueued!();
+          await queued;
+          return { kind: 'admitted', waitedMs: 25 };
+        },
+      },
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const body = (text: string) => JSON.stringify(sessionPayload(
+      [{ role: 'user', content: [{ type: 'input_text', text }] }],
+    ));
+
+    // Classified with an empty partition, then held inside the pacer.
+    const held = wsFetch('https://x', { method: 'POST', headers: {}, body: body('one turn') });
+    await isQueued;
+
+    // The SAME turn gets in and goes in flight while this one is still queued.
+    const overtaking = await wsFetch('https://x', { method: 'POST', headers: {}, body: body('one turn') });
+    lastSocket().emit('open');
+
+    releaseQueued!();
+    const heldResponse = await held;
+
+    const decisions = diagnostics.filter(event => event.event === 'ws_head_decision');
+    expect(decisions).toHaveLength(2);
+    expect(decisions[1]).toMatchObject({
+      decision: 'parallel_isolated',
+      createdGeneration: 'isolated',
+      pacingWaitedMs: 25,
+      // It waited, so it re-scanned; the sibling head it found was in flight,
+      // so the demotion is still what decided this.
+      pacingRescanOutcome: 'parallel_isolated',
+      // The post-pacing demotion must attribute itself to the head it found,
+      // not leave the field to the arrival scan that saw an empty partition.
+      isolatedByConnectionId: 1,
+    });
+
+    for (const socket of fakeSockets) socket.emit('open');
+    emitTextResponse(fakeSockets[1]!, 'resp_held', 'ok');
+    emitTextResponse(fakeSockets[0]!, 'resp_overtaking', 'ok');
+    await readAll(heldResponse);
+    await readAll(overtaking);
+  });
+
+  it('asks the pacer for every shape of primary new connection', async () => {
+    // Four shapes reach the creation path, and none of them may be left on prose.
+    // The parallel one is now the rare shape — it fires only where the busy head
+    // cannot be told apart from this request — so it is also the easiest to break
+    // without noticing.
+    const pacer = recordingPacer();
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-pacing-shapes',
+      pacer,
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const lastDecision = () => diagnostics.filter(event => event.event === 'ws_head_decision').at(-1);
+    const send = (payload: unknown) => wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(payload),
+    });
+    const turn = (text: string) => [{ role: 'user', content: [{ type: 'input_text', text }] }];
+
+    // 1. unpartitioned_socket — no prompt_cache_key, so there is no partition.
+    const unpartitioned = await send({ model: 'gpt-5.6-sol', input: turn('no session') });
+    lastSocket().emit('open');
+    emitTextResponse(lastSocket(), 'resp_unpartitioned', 'ok');
+    await readAll(unpartitioned);
+    expect(lastDecision()).toMatchObject({ decision: 'unpartitioned_socket' });
+    expect(pacer.admit).toHaveBeenCalledTimes(1);
+
+    // 2. new_partition_head — first turn of a session.
+    const root = await send(sessionPayload(turn('root')));
+    lastSocket().emit('open');
+    emitTextResponse(lastSocket(), 'resp_root', 'ok');
+    await readAll(root);
+    expect(lastDecision()).toMatchObject({ decision: 'new_partition_head' });
+    expect(pacer.admit).toHaveBeenCalledTimes(2);
+
+    // 3. history_mismatch_new_head — same partition, divergent history.
+    const diverged = await send(sessionPayload(turn('a different root')));
+    expect(lastDecision()).toMatchObject({ decision: 'history_mismatch_new_head' });
+    expect(pacer.admit).toHaveBeenCalledTimes(3);
+
+    // 4. parallel_isolated — the same turn again while that one is still in
+    // flight, so nothing distinguishes this request from the response being
+    // generated and it may not branch off it.
+    const parallel = await send(sessionPayload(turn('a different root')));
+    expect(lastDecision()).toMatchObject({ decision: 'parallel_isolated' });
+    expect(pacer.admit).toHaveBeenCalledTimes(4);
+
+    for (const socket of fakeSockets) if (socket.listenerCount('open') > 0) socket.emit('open');
+    emitTextResponse(fakeSockets[2]!, 'resp_diverged', 'ok');
+    emitTextResponse(fakeSockets[3]!, 'resp_parallel', 'ok');
+    await readAll(diverged);
+    await readAll(parallel);
+  });
+
+  it('does not pace the replacement a transport retry opens', async () => {
+    // Deliberate exemption: it recovers a request that was already admitted,
+    // it is capped at one per request, and it is built inside a socket
+    // callback. Pinned so the exemption cannot drift into an accident.
+    const pacer = recordingPacer();
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-pacing-transport-replacement',
+      pacer,
+    });
+    const response = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }])),
+    });
+    fakeSockets[0]!.emit('open');
+    fakeSockets[0]!.emit('error', new Error('connection reset'));
+
+    expect(fakeSockets).toHaveLength(2);
+    expect(pacer.admit).toHaveBeenCalledTimes(1);
+
+    fakeSockets[1]!.emit('open');
+    emitTextResponse(fakeSockets[1]!, 'resp_replaced', 'ok');
+    await readAll(response);
+  });
+
+  it('does not pace the replacement a missing previous response opens', async () => {
+    // The second unpaced replacement path, and the one the deep doc used to
+    // omit entirely.
+    const pacer = recordingPacer();
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-pacing-prev-missing',
+      pacer,
+    });
+    const input = [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }];
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+    fakeSockets[0]!.emit('open');
+    emitTextResponse(fakeSockets[0]!, 'resp_prev_1', 'ok');
+    await readAll(first);
+    expect(pacer.admit).toHaveBeenCalledTimes(1);
+
+    const echoed = [
+      ...input,
+      { role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] },
+      { role: 'user', content: [{ type: 'input_text', text: 'next' }] },
+    ];
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(echoed)),
+    });
+    const continued = fakeSockets.length;
+    fakeSockets[0]!.emit('message', Buffer.from(JSON.stringify({
+      type: 'error', status: 400,
+      error: { code: 'previous_response_not_found', message: 'gone' },
+    })));
+
+    // A replacement socket was opened without consulting the pacer.
+    expect(fakeSockets.length).toBeGreaterThan(continued);
+    expect(pacer.admit).toHaveBeenCalledTimes(1);
+
+    const replacement = lastSocket();
+    replacement.emit('open');
+    emitTextResponse(replacement, 'resp_prev_2', 'ok');
+    await readAll(second);
+  });
+
+  it('demotes a concurrent duplicate even when neither request waited', async () => {
+    // `admit` is async, so even an immediate admission resumes a microtask
+    // later and BOTH requests classify themselves against an empty partition
+    // before either registers. Gating the re-check on having waited would let
+    // both open a persistent head for one key.
+    //
+    // The barrier holds both inside the pacer until both have been classified,
+    // which is the interleaving that makes this deterministic rather than a
+    // race the scheduler happens to win.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    let admitted = 0;
+    let barrierArmed = false;
+    let openBarrier: (() => void) | undefined;
+    const barrier = new Promise<void>(resolve => { openBarrier = resolve; });
+    const debug: string[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, message => debug.push(message), {
+      accountId: 'acct-pacing-concurrent',
+      pacer: {
+        admit: async (): Promise<UpgradeAdmission> => {
+          if (!barrierArmed) return { kind: 'admitted', waitedMs: 0 };
+          admitted += 1;
+          if (admitted === 2) openBarrier!();
+          await barrier;
+          return { kind: 'admitted', waitedMs: 0 };
+        },
+      },
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const send = (text: string) => wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([{ role: 'user', content: [{ type: 'input_text', text }] }])),
+    });
+
+    // Resolve the mocked `ws` module BEFORE the concurrent phase: two dynamic
+    // imports of a mocked module in flight at once can race in vitest and hand
+    // one caller the unmocked module.
+    const warmup = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload(
+        [{ role: 'user', content: [{ type: 'input_text', text: 'warmup' }] }],
+        { prompt_cache_key: 'relay-session-warmup' },
+      )),
+    });
+    lastSocket().emit('open');
+    emitTextResponse(lastSocket(), 'resp_warmup', 'ok');
+    await readAll(warmup);
+    barrierArmed = true;
+
+    // The same turn twice — what a client retry looks like from here.
+    const [alpha, beta] = await Promise.all([send('one turn'), send('one turn')]);
+
+    // The warmup produced a decision of its own; the pair is the last two.
+    const decisions = diagnostics.filter(event => event.event === 'ws_head_decision').slice(-2);
+    expect(decisions).toHaveLength(2);
+    // Both were classified against an empty partition — the race is real...
+    expect(decisions.map(event => event.candidateCount)).toEqual([0, 0]);
+    // ...but only one of them may end up holding a persistent head for this chain.
+    // Without the demotion both are 'nursery': two heads generating one response.
+    expect(decisions.map(event => event.createdGeneration).sort())
+      .toEqual(['isolated', 'nursery']);
+    expect(debug).toContain('ws: parallel request using an isolated socket after pacing');
+
+    for (const socket of fakeSockets.slice(-2)) {
+      socket.emit('open');
+      emitTextResponse(socket, `resp_${fakeSockets.indexOf(socket)}`, 'ok');
+    }
+    await Promise.all([readAll(alpha), readAll(beta)]);
+  });
+
+  it('ages the heads it reports from after the wait, not from arrival', async () => {
+    // The decision record must not mix head ages read on arrival with pool
+    // counts read after the wait; a queued request can be seconds old by then.
+    let clockMs = 0;
+    let waits = 0;
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-pacing-clock',
+      now: () => clockMs,
+      pacer: {
+        admit: async (): Promise<UpgradeAdmission> => {
+          waits += 1;
+          if (waits === 1) return { kind: 'admitted', waitedMs: 0 };
+          clockMs += 4_000;
+          return { kind: 'admitted', waitedMs: 4_000 };
+        },
+      },
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const body = (text: string) => JSON.stringify(sessionPayload(
+      [{ role: 'user', content: [{ type: 'input_text', text }] }],
+    ));
+
+    const first = await wsFetch('https://x', { method: 'POST', headers: {}, body: body('first') });
+    lastSocket().emit('open');
+    emitTextResponse(lastSocket(), 'resp_clock', 'ok');
+    await readAll(first);
+
+    // Same partition, different history: an idle head is reported, not reused.
+    const second = await wsFetch('https://x', { method: 'POST', headers: {}, body: body('second') });
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1);
+    expect(decision).toMatchObject({ pacingWaitedMs: 4_000 });
+    // Read on arrival this head looks freshly used; it is 4s idle by admission.
+    expect((decision as { heads: Array<{ idleMs: number }> }).heads[0]!.idleMs).toBe(4_000);
+
+    lastSocket().emit('open');
+    emitTextResponse(lastSocket(), 'resp_clock_2', 'ok');
+    await readAll(second);
+  });
+
+  it('uses the shared bucket and its env var when no pacer is injected', async () => {
+    // Nothing here injects a pacer, so this fails if production stops
+    // consulting the shared one — or stops reading the environment.
+    // 3/minute, not 1: three is the lowest rate at which refusing can still
+    // reach a refill inside a request's retry schedule at the default
+    // timeouts, and it is far from the default of 60, so this still proves the
+    // environment is read. Rate 1 is covered by the test below.
+    process.env.CLODEX_WS_MAX_NEW_CONNECTIONS_PER_MIN = '3';
+    try {
+      resetResponsesWebSocketConnectionsForTests();
+      const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-pacing-shared',
+        onDiagnostic: event => diagnostics.push(event),
+      });
+      const open = async (text: string) => {
+        const response = await wsFetch('https://x', {
+          method: 'POST',
+          headers: {},
+          body: JSON.stringify(sessionPayload(
+            [{ role: 'user', content: [{ type: 'input_text', text }] }],
+            { prompt_cache_key: `relay-session-${text}` },
+          )),
+        });
+        const socket = fakeSockets[fakeSockets.length - 1];
+        if (socket && socket.listenerCount('open') > 0) {
+          socket.emit('open');
+          emitTextResponse(socket, `resp_${text}`, 'ok');
+        }
+        return readAll(response);
+      };
+
+      // At three new connections per minute the burst of ten is free; the
+      // eleventh needs twenty seconds, far past the wait bound, so it is
+      // refused.
+      for (let index = 0; index < 10; index += 1) await open(`burst-${index}`);
+      expect(fakeSockets).toHaveLength(10);
+
+      const refusedBody = await open('past-the-burst');
+      expect(fakeSockets).toHaveLength(10);
+      expect(await classifyThroughSdk(refusedBody)).toMatchObject({
+        statusCode: 429,
+        isRetryable: true,
+      });
+      expect(diagnostics).toContainEqual(expect.objectContaining({
+        event: 'ws_new_connection_paced',
+        outcome: 'refused',
+      }));
+    } finally {
+      delete process.env.CLODEX_WS_MAX_NEW_CONNECTIONS_PER_MIN;
+      resetResponsesWebSocketConnectionsForTests();
+    }
+  });
+
+  it('admits late instead of refusing at a rate a retry cannot outlast', async () => {
+    // REGRESSION, end to end through the production singleton. Capping the
+    // refusal hint at the wait bound stopped requests overrunning their
+    // deadline, but at 1/minute the first free slot is 60s away while the whole
+    // retry schedule is spent inside 20s — so every refused request used up its
+    // retries and died as a rate-limit error, manufactured by the feature meant
+    // to reduce them. Nothing may be refused here.
+    process.env.CLODEX_WS_MAX_NEW_CONNECTIONS_PER_MIN = '1';
+    try {
+      resetResponsesWebSocketConnectionsForTests();
+      const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-pacing-lowrate',
+        onDiagnostic: event => diagnostics.push(event),
+      });
+      const open = async (text: string) => {
+        const response = await wsFetch('https://x', {
+          method: 'POST',
+          headers: {},
+          body: JSON.stringify(sessionPayload(
+            [{ role: 'user', content: [{ type: 'input_text', text }] }],
+            { prompt_cache_key: `relay-session-${text}` },
+          )),
+        });
+        const socket = fakeSockets[fakeSockets.length - 1];
+        if (socket && socket.listenerCount('open') > 0) {
+          socket.emit('open');
+          emitTextResponse(socket, `resp_${text}`, 'ok');
+        }
+        return readAll(response);
+      };
+
+      // Eleven, opened sequentially: ten spend the burst and the eleventh has
+      // to wait. Arrivals here are sequential rather than simultaneous, so each
+      // one refills roughly what it consumes and keeps paying the bound — the
+      // ceiling is weaker than the configured rate, but it is still a ceiling.
+      for (let index = 0; index < 11; index += 1) await open(`low-${index}`);
+
+      // Every one of them opened a connection; none was turned away.
+      expect(fakeSockets).toHaveLength(11);
+      expect(diagnostics).not.toContainEqual(expect.objectContaining({
+        event: 'ws_new_connection_paced',
+        outcome: 'refused',
+      }));
+
+      // And pacing is still SHAPING, not switched off: the first arrival past
+      // the burst really did wait out the bound. Asserting only that sockets
+      // opened cannot tell this apart from disabled pacing.
+      const waits = diagnostics
+        .filter((event): event is typeof event & { waitedMs: number } =>
+          event.event === 'ws_new_connection_paced'
+          && (event as { outcome?: string }).outcome === 'admitted'
+          && typeof (event as { waitedMs?: unknown }).waitedMs === 'number')
+        .map(event => event.waitedMs);
+      expect(waits).toHaveLength(1);
+      expect(waits[0]).toBeGreaterThan(1_000);
+    } finally {
+      delete process.env.CLODEX_WS_MAX_NEW_CONNECTIONS_PER_MIN;
+      resetResponsesWebSocketConnectionsForTests();
+    }
+    // Deliberately at the SHIPPED timeouts, which is where the failure was
+    // measured, so one request really does wait out the ~4.8s bound.
+  }, 20_000);
+
+  it('opens no connection for a request cancelled while it was queued', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const aborted = Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-pacing-abort',
+      pacer: { admit: vi.fn(async () => { throw aborted; }) },
+      onDiagnostic: event => diagnostics.push(event),
+    });
+
+    await expect(wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([])),
+    })).rejects.toBe(aborted);
+
+    expect(fakeSockets).toHaveLength(0);
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: 'ws_new_connection_paced',
+      outcome: 'aborted',
+    }));
+    // The request never reached a head decision, so none is reported.
+    expect(diagnostics.some(event => event.event === 'ws_head_decision')).toBe(false);
+  });
+  /**
+   * Stage ONE ordering of the overlap: a sibling holding the only head of a
+   * partition while a second same-partition request is classified and then
+   * held inside the pacer. The caller finishes the sibling — through the
+   * production producer, `response.output_item.done` — and releases.
+   *
+   * This ordering is a fixture, NOT a claim about how production reaches the
+   * state. Real traffic arrives at "an idle matching head exists by the time a
+   * queued request is admitted" by several routes, and what the queued request
+   * was classified as on arrival differs between them; the blank-completion
+   * test below stages a different one deliberately. What every route shares is
+   * only the end state, which is what the code reads.
+   */
+  function heldBehindASibling(options: {
+    accountId: string;
+    debug?: string[];
+    diagnostics: ResponsesWebSocketDiagnosticEvent[];
+    /** Elapsed time the held admission reports. It is queued either way. */
+    waitedMs?: number;
+  }) {
+    const clock = { ms: 0 };
+    const waitedMs = options.waitedMs ?? 4_000;
+    const releaseToken = vi.fn();
+    let releaseQueued: (() => void) | undefined;
+    const queued = new Promise<void>(resolve => { releaseQueued = resolve; });
+    let markQueued: (() => void) | undefined;
+    const isQueued = new Promise<void>(resolve => { markQueued = resolve; });
+    let admissions = 0;
+    const wsFetch = createResponsesWebSocketFetch(
+      WS_URL,
+      options.debug ? message => options.debug!.push(message) : undefined,
+      {
+        accountId: options.accountId,
+        // Injected: two heads created in the same millisecond tie on
+        // `lastUsedAt`, and a stable sort then silently reverses which is the
+        // most recent. Nothing here reads the wall clock.
+        now: () => clock.ms,
+        pacer: {
+          admit: async (): Promise<UpgradeAdmission> => {
+            admissions += 1;
+            if (admissions === 1) return { kind: 'admitted', waitedMs: 0, queued: false };
+            markQueued!();
+            await queued;
+            clock.ms += waitedMs;
+            return { kind: 'admitted', waitedMs, queued: true, release: releaseToken };
+          },
+        },
+        onDiagnostic: event => options.diagnostics.push(event),
+      },
+    );
+    return { wsFetch, isQueued, release: () => releaseQueued!(), releaseToken };
+  }
+
+  const FIRST_TURN = [{ role: 'user', content: [{ type: 'input_text', text: 'first turn' }] }];
+  const ECHOED_ASSISTANT = { role: 'assistant', content: [{ type: 'output_text', text: 'hi' }] };
+
+  it('continues a chain head that a sibling freed while this request was queued', async () => {
+    // The head scan runs BEFORE the wait, so this request is classified while
+    // its sibling still holds the only head of the partition — on arrival it
+    // can take nothing but an isolated socket. By the time the pacer admits
+    // it, the sibling has finished and left a head whose lineage it matches
+    // exactly. Continuing that head is one connection fewer and keeps the
+    // cached prefix; opening a duplicate instead is what evicts other
+    // conversations' heads out of the nursery.
+    const debug: string[] = [];
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const nextTurn = { role: 'user', content: [{ type: 'input_text', text: 'second turn' }] };
+    const { wsFetch, isQueued, release, releaseToken } = heldBehindASibling({
+      accountId: 'acct-pacing-rematch',
+      debug,
+      diagnostics,
+    });
+
+    // The sibling opens the only head and is still in flight.
+    const sibling = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(FIRST_TURN)),
+    });
+    const siblingSocket = lastSocket();
+    siblingSocket.emit('open');
+
+    // Same partition, the next turn of the same conversation.
+    const held = wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([...FIRST_TURN, ECHOED_ASSISTANT, nextTurn])),
+    });
+    await isQueued;
+    expect(fakeSockets).toHaveLength(1);
+
+    // The sibling COMPLETES while the queued request waits, leaving an idle
+    // reusable head. Staged through the production producer — the head's
+    // expected-assistant history is built from `response.output_item.done`,
+    // never planted in the request input.
+    emitTextResponse(siblingSocket, 'resp_rematch_1', 'hi');
+    await readAll(sibling);
+
+    release();
+    const heldResponse = await held;
+
+    // No second connection: the freed head carried the turn.
+    expect(fakeSockets).toHaveLength(1);
+    expect(siblingSocket.send).toHaveBeenCalledTimes(2);
+    const sent = JSON.parse(siblingSocket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_rematch_1');
+    expect(sent.input).toEqual([nextTurn]);
+
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1);
+    expect(decision).toMatchObject({
+      decision: 'continuation',
+      pacingWaitedMs: 4_000,
+      pacingRescanOutcome: 'continuation',
+      continuationMatchMode: 'exact',
+      selectedConnectionId: 1,
+      promotedConnectionId: 1,
+      // The duplicate this replaces would have taken a nursery slot of its own.
+      nurseryConnectionCount: 0,
+      establishedConnectionCount: 1,
+      // The candidate counts are the RE-SCANNED partition, as the deep doc
+      // says: on arrival the only head was in flight, so idle and matching
+      // were both zero.
+      candidateCount: 1,
+      idleCandidateCount: 1,
+      matchingCandidateCount: 1,
+    });
+    expect((decision as { heads: Array<{ connectionId: number; inFlight: boolean }> }).heads)
+      .toEqual([expect.objectContaining({ connectionId: 1, inFlight: false })]);
+    // It opened no connection, so the new-connection token it was charged goes
+    // back rather than delaying whoever asks next.
+    expect(releaseToken).toHaveBeenCalledTimes(1);
+    expect((decision as { createdConnectionId?: number }).createdConnectionId).toBeUndefined();
+    // This request WAS blocked by a possible parent on arrival, then continued it
+    // after the wait. A turn that ends up perfectly cached must not be labelled
+    // with the head that briefly blocked it, or the ledger reads as an isolation.
+    expect(decision).not.toHaveProperty('isolatedByConnectionId');
+    expect(debug).toContain('ws: continuing a chain head that freed up during the pacing wait');
+
+    emitTextResponse(siblingSocket, 'resp_rematch_2', 'done');
+    await readAll(heldResponse);
+  });
+
+  it('opens its own head when the head freed during the wait does not match', async () => {
+    // The safety property. A head that frees up mid-wait is continued ONLY
+    // where the exact-prefix check accepts it; continuing a chain whose
+    // lineage does not match is the failure that check exists to prevent, and
+    // a re-scan that ignored it would reintroduce exactly that.
+    const debug: string[] = [];
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const otherConversation = [
+      { role: 'user', content: [{ type: 'input_text', text: 'an unrelated conversation' }] },
+    ];
+    const { wsFetch, isQueued, release, releaseToken } = heldBehindASibling({
+      accountId: 'acct-pacing-rematch-mismatch',
+      debug,
+      diagnostics,
+    });
+
+    const sibling = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(FIRST_TURN)),
+    });
+    const siblingSocket = lastSocket();
+    siblingSocket.emit('open');
+
+    // Same partition (one Claude session, one model), divergent history.
+    const held = wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(otherConversation)),
+    });
+    await isQueued;
+
+    emitTextResponse(siblingSocket, 'resp_mismatch_1', 'hi');
+    await readAll(sibling);
+
+    release();
+    const heldResponse = await held;
+
+    // A head was freed and it was NOT continued.
+    expect(fakeSockets).toHaveLength(2);
+    const ownSocket = lastSocket();
+    ownSocket.emit('open');
+    const sent = JSON.parse(ownSocket.send.mock.calls[0]![0] as string);
+    expect(sent.previous_response_id).toBeUndefined();
+    expect(sent.input).toEqual(otherConversation);
+
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1);
+    expect(decision).toMatchObject({
+      decision: 'history_mismatch_new_head',
+      pacingWaitedMs: 4_000,
+      pacingRescanOutcome: 'no_change',
+      createdConnectionId: 2,
+      // Persistent, not isolated: an unrelated conversation is entitled to a head
+      // of its own even though a sibling happened to be busy when it arrived.
+      createdGeneration: 'nursery',
+    });
+    expect((decision as { selectedConnectionId?: number }).selectedConnectionId).toBeUndefined();
+    expect(debug).not.toContain('ws: continuing a chain head that freed up during the pacing wait');
+    // It DID open a connection, so it keeps the token it was charged for it.
+    expect(releaseToken).not.toHaveBeenCalled();
+
+    emitTextResponse(ownSocket, 'resp_mismatch_2', 'done');
+    await readAll(heldResponse);
+  });
+
+  it('continues a head whose response completed with no output, having copied nothing from it', async () => {
+    // THE SHAPE THAT MAKES THIS FEATURE REACHABLE, and it is not the obvious
+    // one. A continuation needs the head's stored `requestInput ++
+    // expectedAssistant` to be a strict prefix of the waiting request — which
+    // reads like the waiter must already contain the head's OUTPUT, i.e. must
+    // have been sent it, which two independent agents never are.
+    //
+    // `expectedAssistant` can be EMPTY. A response that completes with no
+    // output items stores a prefix equal to its own input alone, so any
+    // same-partition request that merely extends that input matches it having
+    // copied nothing. Two agents fanned out from one Claude session open with
+    // byte-identical inputs, which is exactly that condition.
+    //
+    // Everything here is staged through production producers: agent B's second
+    // turn is reconstructed only from frames B was itself sent, and agent A's
+    // head is built by A's own `response.completed`.
+    const debug: string[] = [];
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const releaseToken = vi.fn();
+    const clock = { ms: 0 };
+    let holdNext = false;
+    let releaseQueued: (() => void) | undefined;
+    const queued = new Promise<void>(resolve => { releaseQueued = resolve; });
+    let markQueued: (() => void) | undefined;
+    const isQueued = new Promise<void>(resolve => { markQueued = resolve; });
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, message => debug.push(message), {
+      accountId: 'acct-pacing-blank-head',
+      now: () => clock.ms,
+      pacer: {
+        // Held on demand rather than by counting admissions: this ordering has
+        // four of them and only the last one queues.
+        admit: async (): Promise<UpgradeAdmission> => {
+          if (!holdNext) return { kind: 'admitted', waitedMs: 0, queued: false };
+          holdNext = false;
+          markQueued!();
+          await queued;
+          clock.ms += 4_000;
+          return { kind: 'admitted', waitedMs: 4_000, queued: true, release: releaseToken };
+        },
+      },
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    // The identical opening two subagents of one session are handed.
+    const OPENING = [
+      { role: 'user', content: [{ type: 'input_text', text: '<system-reminder>shared preamble' }] },
+      { role: 'user', content: [{ type: 'input_text', text: 'do the assigned task' }] },
+    ];
+    const send = (input: unknown[]) => wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+    });
+
+    // Agent A takes the partition's head and is still in flight.
+    const agentA = await send(OPENING);
+    const socketA = lastSocket();
+    socketA.emit('open');
+
+    // Agent B's first turn: same partition, byte-identical input, so it is
+    // classified `parallel_isolated` and retains no head of its own.
+    const agentBFirst = await send(OPENING);
+    const socketB = lastSocket();
+    socketB.emit('open');
+    emitTextResponse(socketB, 'resp_b_1', 'B answer');
+    await readAll(agentBFirst);
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+      .toMatchObject({ decision: 'parallel_isolated', createdGeneration: 'isolated' });
+
+    // Agent B's second turn, built only from what B was sent.
+    const bAssistant = { role: 'assistant', content: [{ type: 'output_text', text: 'B answer' }] };
+    const bNextUser = { role: 'user', content: [{ type: 'input_text', text: 'B follow-up' }] };
+    holdNext = true;
+    const held = send([...OPENING, bAssistant, bNextUser]);
+    await isQueued;
+    expect(fakeSockets).toHaveLength(2);
+
+    // Agent A completes with NO output items — a real terminal shape — leaving
+    // a head whose stored prefix is its own two-item input and nothing else.
+    socketA.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.created', response: { id: 'resp_a_blank' },
+    })));
+    socketA.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.completed', response: { id: 'resp_a_blank' },
+    })));
+    await readAll(agentA);
+
+    releaseQueued!();
+    const heldResponse = await held;
+
+    // B continued A's head, on A's socket, with no new connection.
+    expect(fakeSockets).toHaveLength(2);
+    expect(socketA.send).toHaveBeenCalledTimes(2);
+    const sent = JSON.parse(socketA.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_a_blank');
+    expect(sent.input).toEqual([bAssistant, bNextUser]);
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+      .toMatchObject({
+        decision: 'continuation',
+        pacingRescanOutcome: 'continuation',
+        continuationMatchMode: 'exact',
+        selectedConnectionId: 1,
+        incrementalInputItems: 2,
+      });
+    expect(releaseToken).toHaveBeenCalledTimes(1);
+
+    emitTextResponse(socketA, 'resp_a_next', 'done');
+    await readAll(heldResponse);
+  });
+
+  it('re-matches on the pacer\'s queued flag, not on the elapsed time it reports', async () => {
+    // `waitedMs` is a difference of two clock reads, so a clock stepped
+    // backwards during the wait reports 0 for a request that really did queue.
+    // Gating on the number would skip the re-scan exactly there and open the
+    // duplicate connection this change exists to avoid.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const nextTurn = { role: 'user', content: [{ type: 'input_text', text: 'second turn' }] };
+    const { wsFetch, isQueued, release } = heldBehindASibling({
+      accountId: 'acct-pacing-rematch-clockskew',
+      diagnostics,
+      waitedMs: 0,
+    });
+
+    const sibling = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(FIRST_TURN)),
+    });
+    const siblingSocket = lastSocket();
+    siblingSocket.emit('open');
+    const held = wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([...FIRST_TURN, ECHOED_ASSISTANT, nextTurn])),
+    });
+    await isQueued;
+    emitTextResponse(siblingSocket, 'resp_skew_1', 'hi');
+    await readAll(sibling);
+    release();
+    const heldResponse = await held;
+
+    expect(fakeSockets).toHaveLength(1);
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1);
+    expect(decision).toMatchObject({
+      decision: 'continuation',
+      pacingRescanOutcome: 'continuation',
+    });
+    // It reported no elapsed time, so the paced-wait field is absent — and the
+    // re-scan ran anyway.
+    expect(decision).not.toHaveProperty('pacingWaitedMs');
+
+    emitTextResponse(siblingSocket, 'resp_skew_2', 'done');
+    await readAll(heldResponse);
+  });
+
+  it('does not continue a freed head that diverges deep inside a long history', async () => {
+    // THE STRONGEST SAFETY TEST IN THIS FILE, because this is the property whose
+    // failure corrupts a conversation: continuing a chain whose lineage is not
+    // actually ours. The other negative diverges at the FIRST item, which a
+    // matcher that compared only the first item would still reject — so it
+    // cannot see a shallow-comparison regression. This one diverges at item 20
+    // of a 25-item stored prefix: everything before it is byte-identical, which
+    // is what a genuine rewind or branch of a long agent conversation looks
+    // like.
+    const debug: string[] = [];
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    // 24 alternating turns, all produced the same way, so the only difference
+    // between the two histories is the one this test is about.
+    const longHistory = (rewoundAt?: number) => Array.from({ length: 24 }, (_, index) => (
+      index % 2 === 0
+        ? { role: 'user', content: [{ type: 'input_text', text: `turn ${index}` }] }
+        : {
+          role: 'assistant',
+          content: [{
+            type: 'output_text',
+            text: index === rewoundAt ? `answer ${index} (regenerated)` : `answer ${index}`,
+          }],
+        }
+    ));
+    const { wsFetch, isQueued, release, releaseToken } = heldBehindASibling({
+      accountId: 'acct-pacing-rematch-deep',
+      debug,
+      diagnostics,
+    });
+
+    const sibling = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(longHistory())),
+    });
+    const siblingSocket = lastSocket();
+    siblingSocket.emit('open');
+
+    // Same 24 turns except item 20, then this conversation's own next turn: 26
+    // items against a 25-item stored prefix, agreeing on the first 19.
+    const divergent = [
+      ...longHistory(19),
+      { role: 'assistant', content: [{ type: 'output_text', text: 'hi' }] },
+      { role: 'user', content: [{ type: 'input_text', text: 'branch follow-up' }] },
+    ];
+    const held = wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(divergent)),
+    });
+    await isQueued;
+
+    // The sibling completes, leaving a 25-item prefix (24 sent + one answer).
+    emitTextResponse(siblingSocket, 'resp_deep_1', 'hi');
+    await readAll(sibling);
+
+    release();
+    const heldResponse = await held;
+
+    // Rejected: its own head, full context, nothing continued.
+    expect(fakeSockets).toHaveLength(2);
+    const ownSocket = lastSocket();
+    ownSocket.emit('open');
+    const sent = JSON.parse(ownSocket.send.mock.calls[0]![0] as string);
+    expect(sent.previous_response_id).toBeUndefined();
+    expect(sent.input).toEqual(divergent);
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+      .toMatchObject({ pacingRescanOutcome: 'no_change', createdGeneration: 'nursery' });
+    expect(debug).not.toContain('ws: continuing a chain head that freed up during the pacing wait');
+    expect(releaseToken).not.toHaveBeenCalled();
+
+    emitTextResponse(ownSocket, 'resp_deep_2', 'done');
+    await readAll(heldResponse);
+  });
+
+  it('continues a head opened by a shorter sibling that overtook it from an empty partition', async () => {
+    // #173's OWN ordering, which none of the tests above stage: the queued
+    // request is the FIRST into an empty partition, so it is classified
+    // `new_partition_head` and keeps `persistent` — and then a shorter sibling
+    // overtakes it and completes while it waits. Rematching only requests that
+    // arrived non-persistent would leave every other test here green and this
+    // one opening a second connection.
+    const debug: string[] = [];
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const clock = { ms: 0 };
+    let holdNext = true;
+    let releaseQueued: (() => void) | undefined;
+    const queued = new Promise<void>(resolve => { releaseQueued = resolve; });
+    let markQueued: (() => void) | undefined;
+    const isQueued = new Promise<void>(resolve => { markQueued = resolve; });
+    const releaseToken = vi.fn();
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, message => debug.push(message), {
+      accountId: 'acct-pacing-rematch-overtaken',
+      now: () => clock.ms,
+      pacer: {
+        admit: async (): Promise<UpgradeAdmission> => {
+          if (!holdNext) return { kind: 'admitted', waitedMs: 0, queued: false };
+          holdNext = false;
+          markQueued!();
+          await queued;
+          clock.ms += 4_000;
+          return { kind: 'admitted', waitedMs: 4_000, queued: true, release: releaseToken };
+        },
+      },
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const opening = { role: 'user', content: [{ type: 'input_text', text: 'shared opening' }] };
+    const longer = [
+      opening,
+      { role: 'assistant', content: [{ type: 'output_text', text: 'its own earlier answer' }] },
+      { role: 'user', content: [{ type: 'input_text', text: 'its own follow-up' }] },
+    ];
+
+    // First into an EMPTY partition, then held: nothing to demote it, so it is
+    // classified as the partition's new head and stays persistent.
+    const held = wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(longer)),
+    });
+    await isQueued;
+    expect(fakeSockets).toHaveLength(0);
+
+    // A shorter sibling overtakes it, and finishes with no output — so its head
+    // stores only its own one-item input, which the queued request extends.
+    const overtaking = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([opening])),
+    });
+    const overtakingSocket = lastSocket();
+    overtakingSocket.emit('open');
+    overtakingSocket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.created', response: { id: 'resp_overtaking' },
+    })));
+    overtakingSocket.emit('message', Buffer.from(JSON.stringify({
+      type: 'response.completed', response: { id: 'resp_overtaking' },
+    })));
+    await readAll(overtaking);
+
+    releaseQueued!();
+    const heldResponse = await held;
+
+    // One connection for both, and the queued request continued the chain.
+    expect(fakeSockets).toHaveLength(1);
+    expect(overtakingSocket.send).toHaveBeenCalledTimes(2);
+    const sent = JSON.parse(overtakingSocket.send.mock.calls[1]![0] as string);
+    expect(sent.previous_response_id).toBe('resp_overtaking');
+    expect(sent.input).toEqual(longer.slice(1));
+    // What the HELD request was classified as on arrival — the paced event
+    // carries the pre-wait decision, and it is the only place that survives.
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: 'ws_new_connection_paced',
+      outcome: 'admitted',
+      decision: 'new_partition_head',
+      waitedMs: 4_000,
+    }));
+    const decisions = diagnostics.filter(event => event.event === 'ws_head_decision');
+    expect(decisions.at(-1)).toMatchObject({
+      decision: 'continuation',
+      pacingRescanOutcome: 'continuation',
+      selectedConnectionId: 1,
+    });
+    expect(releaseToken).toHaveBeenCalledTimes(1);
+
+    emitTextResponse(overtakingSocket, 'resp_overtaken_next', 'done');
+    await readAll(heldResponse);
+  });
+
+  it('does not warn about degraded caching for a turn that then continued a freed head', async () => {
+    // The arrival classification can raise the "Prompt caching is degraded for
+    // this turn" canary against an idle head it gave up on — and then the
+    // re-scan continues a DIFFERENT head that freed up during the wait, so the
+    // turn was cached after all. Showing that warning anyway is how the one
+    // warning whose value depends on being believed gets trained away.
+    resetToolArgumentGapWarningsForTests();
+    const debug: string[] = [];
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const notices: string[] = [];
+    const releaseSink = installParentNoticeSink(line => notices.push(line));
+    try {
+      const clock = { ms: 0 };
+      let holdNext = false;
+      let releaseQueued: (() => void) | undefined;
+      const queued = new Promise<void>(resolve => { releaseQueued = resolve; });
+      let markQueued: (() => void) | undefined;
+      const isQueued = new Promise<void>(resolve => { markQueued = resolve; });
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, message => debug.push(message), {
+        accountId: 'acct-pacing-rematch-warning',
+        now: () => clock.ms,
+        pacer: {
+          admit: async (): Promise<UpgradeAdmission> => {
+            if (!holdNext) return { kind: 'admitted', waitedMs: 0, queued: false };
+            holdNext = false;
+            markQueued!();
+            await queued;
+            clock.ms += 4_000;
+            return { kind: 'admitted', waitedMs: 4_000, queued: true };
+          },
+        },
+        onDiagnostic: event => diagnostics.push(event),
+      });
+      const opening = { role: 'user', content: [{ type: 'input_text', text: 'run the search' }] };
+      const send = (input: unknown[]) => wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(input)),
+      });
+
+      // A forked head: its snapshot of the call carries no filler, the echo
+      // does, so abandoning it trips the filler-strip canary.
+      const forked = await send([opening]);
+      const forkedSocket = lastSocket();
+      forkedSocket.emit('open');
+      forkedSocket.emit('message', Buffer.from(JSON.stringify({
+        type: 'response.created', response: { id: 'resp_forked' },
+      })));
+      forkedSocket.emit('message', Buffer.from(JSON.stringify({
+        type: 'response.output_item.done', output_index: 0,
+        item: {
+          type: 'function_call', id: 'fc_1', call_id: 'call_w', name: 'Ripgrep',
+          arguments: '{"pattern":"x"}', status: 'completed',
+        },
+      })));
+      forkedSocket.emit('message', Buffer.from(JSON.stringify({
+        type: 'response.completed', response: { id: 'resp_forked' },
+      })));
+      await readAll(forked);
+
+      // The queued turn: it mismatches that head only by the filler the strip
+      // rule removes, so classification warns — and is then held.
+      const echoedCall = {
+        type: 'function_call', call_id: 'call_w', name: 'Ripgrep',
+        arguments: '{"pattern":"x","glob":null}',
+      };
+      const output = { type: 'function_call_output', call_id: 'call_w', output: 'hits' };
+      holdNext = true;
+      const held = send([opening, echoedCall, output]);
+      await isQueued;
+      expect(debug.some(line => line.startsWith('ws: tool argument normalization gap'))).toBe(false);
+
+      // A sibling runs to completion inside that wait and leaves a head the
+      // queued turn extends exactly.
+      const sibling = await send([opening]);
+      const siblingSocket = lastSocket();
+      siblingSocket.emit('open');
+      siblingSocket.emit('message', Buffer.from(JSON.stringify({
+        type: 'response.created', response: { id: 'resp_sibling' },
+      })));
+      siblingSocket.emit('message', Buffer.from(JSON.stringify({
+        type: 'response.completed', response: { id: 'resp_sibling' },
+      })));
+      await readAll(sibling);
+
+      releaseQueued!();
+      const heldResponse = await held;
+
+      // It continued a head, on an existing socket ...
+      expect(fakeSockets).toHaveLength(2);
+      const sent = JSON.parse(siblingSocket.send.mock.calls[1]![0] as string);
+      expect(sent.previous_response_id).toBe('resp_sibling');
+      // ... so nothing was degraded, and the user is told nothing. This is the
+      // assertion the whole test exists for; it is checked before the ledger.
+      expect(notices.join('')).not.toContain('Prompt caching is degraded');
+      expect(notices.join('')).not.toContain('Ripgrep');
+      expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+        .toMatchObject({
+          decision: 'continuation',
+          pacingRescanOutcome: 'continuation',
+          suppressedMismatchWarnings: 1,
+        });
+      // The drop is never invisible: it is in the trace and on the record.
+      expect(debug).toContain(
+        'ws: suppressed 1 arrival mismatch warning(s) after continuing a head that freed up '
+        + 'during the pacing wait',
+      );
+
+      emitTextResponse(siblingSocket, 'resp_sibling_next', 'done');
+      await readAll(heldResponse);
+    } finally {
+      releaseSink();
+      resetToolArgumentGapWarningsForTests();
+    }
+  });
+
+  it('reports prompt drift against the head it adopted, not against another idle branch', async () => {
+    // The arrival scan picks a diagnostic stand-in when nothing matches — the
+    // most recently used idle head, which on a busy session is some other
+    // branch of the same conversation. If the re-scan then adopts a DIFFERENT
+    // head, the record must describe the one actually being continued;
+    // otherwise the ledger attributes a prompt change to a chain that never
+    // saw it, which is the sort of thing these records get read to settle.
+    const debug: string[] = [];
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const clock = { ms: 0 };
+    let holdNext = false;
+    let releaseQueued: (() => void) | undefined;
+    const queued = new Promise<void>(resolve => { releaseQueued = resolve; });
+    let markQueued: (() => void) | undefined;
+    const isQueued = new Promise<void>(resolve => { markQueued = resolve; });
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, message => debug.push(message), {
+      accountId: 'acct-pacing-rematch-prompt',
+      now: () => clock.ms,
+      pacer: {
+        admit: async (): Promise<UpgradeAdmission> => {
+          if (!holdNext) return { kind: 'admitted', waitedMs: 0, queued: false };
+          holdNext = false;
+          markQueued!();
+          await queued;
+          clock.ms += 4_000;
+          return { kind: 'admitted', waitedMs: 4_000, queued: true };
+        },
+      },
+      onDiagnostic: event => diagnostics.push(event),
+    });
+
+    // A stale branch of the same session, left idle under DIFFERENT
+    // instructions. It is the newest idle head, so it is the stand-in the
+    // arrival scan reaches for.
+    const branch = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload(
+        [{ role: 'user', content: [{ type: 'input_text', text: 'an older branch' }] }],
+        { instructions: 'You are a coding assistant. A different skill was active.' },
+      )),
+    });
+    lastSocket().emit('open');
+    emitTextResponse(lastSocket(), 'resp_branch_head', 'branch answer');
+    await readAll(branch);
+
+    // The sibling, under the instructions the queued request also sends.
+    const sibling = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(FIRST_TURN)),
+    });
+    const siblingSocket = lastSocket();
+    siblingSocket.emit('open');
+
+    // The queued turn declares one more tool than either head was snapshotted
+    // under, so the two candidates disagree about what drifted: measured
+    // against the stale branch it is `instructions,tools`, against the head it
+    // actually continues it is `tools` alone.
+    const nextTurn = { role: 'user', content: [{ type: 'input_text', text: 'second turn' }] };
+    holdNext = true;
+    const held = wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([...FIRST_TURN, ECHOED_ASSISTANT, nextTurn], {
+        tools: [
+          { type: 'function', name: 'Read', parameters: { type: 'object' } },
+          { type: 'function', name: 'Write', parameters: { type: 'object' } },
+        ],
+      })),
+    });
+    await isQueued;
+    emitTextResponse(siblingSocket, 'resp_prompt_1', 'hi');
+    await readAll(sibling);
+    releaseQueued!();
+    const heldResponse = await held;
+
+    const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1);
+    expect(decision).toMatchObject({
+      decision: 'continuation',
+      pacingRescanOutcome: 'continuation',
+      selectedConnectionId: 2,
+      promptChanges: ['tools'],
+    });
+    expect(debug).toContain('ws: prompt fields changed: tools');
+
+    emitTextResponse(siblingSocket, 'resp_prompt_2', 'done');
+    await readAll(heldResponse);
+  });
+
+  it('keeps an adopted head reusable when its transport then fails', async () => {
+    // The adopting request was demoted on arrival, and that demotion also
+    // cleared the persistence a replacement connection inherits. Adopting a
+    // head has to put it back: otherwise a transport failure on the very turn
+    // it continued drops the chain onto a throwaway socket, and the turn after
+    // that resends full context and opens yet another connection.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const nextTurn = { role: 'user', content: [{ type: 'input_text', text: 'second turn' }] };
+    const secondTurnInput = [...FIRST_TURN, ECHOED_ASSISTANT, nextTurn];
+    const { wsFetch, isQueued, release } = heldBehindASibling({
+      accountId: 'acct-pacing-rematch-persistent',
+      diagnostics,
+    });
+
+    const sibling = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(FIRST_TURN)),
+    });
+    const siblingSocket = lastSocket();
+    siblingSocket.emit('open');
+    const held = wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(secondTurnInput)),
+    });
+    await isQueued;
+    emitTextResponse(siblingSocket, 'resp_persist_1', 'hi');
+    await readAll(sibling);
+    release();
+    const heldResponse = await held;
+    expect(fakeSockets).toHaveLength(1);
+
+    // That continued turn's transport fails before any downstream output, so
+    // it replays with full context on a replacement connection.
+    siblingSocket.emit('error', Object.assign(new Error('reset'), { code: 'ECONNRESET' }));
+    expect(fakeSockets).toHaveLength(2);
+    const replacement = lastSocket();
+    replacement.emit('open');
+    expect(JSON.parse(replacement.send.mock.calls[0]![0] as string).input).toEqual(secondTurnInput);
+    emitTextResponse(replacement, 'resp_persist_2', 'recovered');
+    await readAll(heldResponse);
+
+    // The replacement kept the chain, so the next turn continues it instead of
+    // opening a third connection.
+    const third = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([
+        ...secondTurnInput,
+        { role: 'assistant', content: [{ type: 'output_text', text: 'recovered' }] },
+        { role: 'user', content: [{ type: 'input_text', text: 'third turn' }] },
+      ])),
+    });
+    expect(fakeSockets).toHaveLength(2);
+    expect(JSON.parse(replacement.send.mock.calls[1]![0] as string).previous_response_id)
+      .toBe('resp_persist_2');
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+      .toMatchObject({ decision: 'continuation' });
+    emitTextResponse(replacement, 'resp_persist_3', 'done');
+    await readAll(third);
+  });
+
+  it('re-scans nothing for a request that was never delayed', async () => {
+    // `CLODEX_WS_MAX_NEW_CONNECTIONS_PER_MIN=0` switches pacing off, which is
+    // where the whole race is unreachable: nothing waits, so nothing is
+    // re-scanned and the decision is exactly the one the arrival scan made.
+    // A zero-wait admission resumes in the same microtask turn, and a head can
+    // only be freed by an upstream completion, which arrives on a socket event.
+    process.env.CLODEX_WS_MAX_NEW_CONNECTIONS_PER_MIN = '0';
+    try {
+      resetResponsesWebSocketConnectionsForTests();
+      const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+      let clockMs = 0;
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-pacing-disabled',
+        now: () => clockMs,
+        onDiagnostic: event => diagnostics.push(event),
+      });
+
+      const sibling = await wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(FIRST_TURN)),
+      });
+      const siblingSocket = lastSocket();
+      siblingSocket.emit('open');
+
+      clockMs += 4_000;
+      const parallel = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(sessionPayload([...FIRST_TURN, ECHOED_ASSISTANT,
+          { role: 'user', content: [{ type: 'input_text', text: 'second turn' }] }])),
+      });
+
+      const decision = diagnostics.filter(event => event.event === 'ws_head_decision').at(-1);
+      expect(decision).toMatchObject({
+        decision: 'parallel_isolated',
+        createdGeneration: 'isolated',
+      });
+      // Unpaced, so neither pacing field is recorded at all.
+      expect(decision).not.toHaveProperty('pacingWaitedMs');
+      expect(decision).not.toHaveProperty('pacingRescanOutcome');
+
+      emitTextResponse(siblingSocket, 'resp_unpaced_1', 'hi');
+      await readAll(sibling);
+      const ownSocket = lastSocket();
+      ownSocket.emit('open');
+      emitTextResponse(ownSocket, 'resp_unpaced_2', 'done');
+      await readAll(parallel);
+    } finally {
+      delete process.env.CLODEX_WS_MAX_NEW_CONNECTIONS_PER_MIN;
+      resetResponsesWebSocketConnectionsForTests();
+    }
+  });
+});
+
+describe('usage-limit diagnostics', () => {
+  // A missing event has to mean the server sent nothing, not that nobody looked.
+
+  function quotaFrame(overrides: Record<string, unknown> = {}): string {
+    return JSON.stringify({
+      type: 'codex.rate_limits',
+      rate_limits: {
+        // Fractional on purpose, to show the value is not coerced.
+        primary: { used_percent: 12.5, window_minutes: 10_080, reset_at: 1_789_805_434 },
+        // A present zero must stay distinguishable from an absent field.
+        secondary: { used_percent: 0 },
+      },
+      plan_type: 'pro',
+      ...overrides,
+    });
+  }
+
+  it('captures a rate-limit frame that arrives DURING a response', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(quotaFrame()));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+
+    const observed = diagnostics.filter(d => d.event === 'ws_rate_limits');
+    expect(observed).toHaveLength(1);
+    expect(observed[0]!.phase).toBe('during_response');
+    expect(observed[0]!.planType).toBe('pro');
+    const limits = observed[0]!.rateLimits as {
+      primary: { used_percent: number; window_minutes: number };
+      secondary: { used_percent: number };
+    };
+    // Fractional precision survives, and is not coerced to an integer.
+    expect(limits.primary.used_percent).toBe(12.5);
+    expect(limits.primary.window_minutes).toBe(10_080);
+    // A measured zero is recorded AS zero, not dropped.
+    expect(limits.secondary.used_percent).toBe(0);
+  });
+
+  it('captures a rate-limit frame that arrives with NO request in flight', async () => {
+    // The case the transport used to discard outright: handleSocketMessage returned
+    // before parsing whenever `entry.current` was absent, so an account-meter frame
+    // between or after responses was seen by nobody.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+    diagnostics.length = 0;
+
+    socket.emit('message', Buffer.from(quotaFrame()));
+
+    const observed = diagnostics.filter(d => d.event === 'ws_rate_limits');
+    expect(observed).toHaveLength(1);
+    expect(observed[0]!.phase).toBe('idle');
+  });
+
+  it('omits a field the server did not send rather than reporting it as zero', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'codex.rate_limits',
+      rate_limits: { primary: { used_percent: 3 } },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+
+    const observed = diagnostics.find(d => d.event === 'ws_rate_limits')!;
+    const limits = observed.rateLimits as { primary: Record<string, unknown> };
+    expect(limits.primary.used_percent).toBe(3);
+    expect('window_minutes' in limits.primary).toBe(false);
+    expect(observed.planType).toBeUndefined();
+  });
+
+  it('captures the sibling allowance ledgers that ride the same frame', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    const frame = {
+      type: 'codex.rate_limits',
+      rate_limits: { primary: { used_percent: 2 } },
+      // Keyed by allowance name, as live frames send it.
+      additional_rate_limits: {
+        'gpt-reserve': {
+          allowed: true,
+          limit_reached: false,
+          primary: { used_percent: 2, window_minutes: 10_080, reset_at: 1_789_382_732 },
+          secondary: null,
+        },
+      },
+      code_review_rate_limits: { allowed: true, primary: { used_percent: 4 } },
+      credits: null,
+      promo: { active: false },
+    };
+    socket.emit('message', Buffer.from(JSON.stringify(frame)));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+
+    const observed = diagnostics.find(d => d.event === 'ws_rate_limits')!;
+    const additional = observed.additionalRateLimits as Record<string, { primary: { used_percent: number } }>;
+    expect(additional['gpt-reserve']!.primary.used_percent).toBe(2);
+    // A null ledger is recorded as null, not dropped as if absent.
+    expect(observed.credits).toBeNull();
+    expect('credits' in observed).toBe(true);
+    expect((observed.codeReviewRateLimits as { primary: { used_percent: number } }).primary.used_percent).toBe(4);
+    expect(observed.promo).toEqual({ active: false });
+
+    // Every ledger's size is the size of THAT ledger, and the event names the
+    // socket the head decision for this request created. A swapped byte count
+    // or a stale connection id would otherwise pass the field-by-field checks.
+    const size = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+    const decision = diagnostics.find(d => d.event === 'ws_head_decision')!;
+    expect(observed).toMatchObject({
+      connectionId: decision.createdConnectionId,
+      generation: decision.createdGeneration,
+      phase: 'during_response',
+      upstreamEventType: 'codex.rate_limits',
+      fieldCount: 6,
+      fieldsPresent: ['type', 'rate_limits', 'additional_rate_limits', 'code_review_rate_limits', 'credits', 'promo'],
+      rateLimits: frame.rate_limits,
+      rateLimitsBytes: size(frame.rate_limits),
+      additionalRateLimits: frame.additional_rate_limits,
+      additionalRateLimitsBytes: size(frame.additional_rate_limits),
+      codeReviewRateLimits: frame.code_review_rate_limits,
+      codeReviewRateLimitsBytes: size(frame.code_review_rate_limits),
+      credits: null,
+      creditsBytes: size(null),
+      promo: frame.promo,
+      promoBytes: size(frame.promo),
+    });
+    expect(observed.planType).toBeUndefined();
+  });
+
+  it('stays silent on an idle frame that carries no meter state', async () => {
+    // Silence has to mean silence, or a null result is unreadable.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+    diagnostics.length = 0;
+
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.output_text.delta', delta: 'x' })));
+    socket.emit('message', Buffer.from('not json at all'));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'codex.response.metadata', rate_limits: {} })));
+    expect(diagnostics.filter(d => d.event === 'ws_rate_limits')).toHaveLength(0);
+
+    // The same idle path does report a real meter frame, so the silence above came
+    // from the filter and not from an observer that was never listening.
+    socket.emit('message', Buffer.from(quotaFrame()));
+    expect(diagnostics.filter(d => d.event === 'ws_rate_limits')).toHaveLength(1);
+  });
+
+  it('attributes a meter frame to the request in flight, not to the request that opened the socket', async () => {
+    // Socket callbacks run in the async context of the request that CREATED the
+    // socket. On a reused head that is an older request, so a frame correlated from
+    // the ambient store carries the wrong requestId and session. The emits below run
+    // inside the first request's context to reproduce that.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const contextA = { requestId: 'req-A', claudeSessionId: 'session-A' };
+    const inA = (fn: () => void) => withResponsesWebSocketDiagnosticContext(contextA, fn);
+    const firstUser = { role: 'user', content: [{ type: 'input_text', text: 'first' }] };
+
+    const socketsBefore = socketCount();
+    const first = await withResponsesWebSocketDiagnosticContext(
+      contextA,
+      () => wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([firstUser])),
+      }),
+    );
+    const socket = lastSocket();
+    inA(() => {
+      socket.emit('open');
+      emitTextResponse(socket, 'resp_A', 'first answer');
+    });
+    await readAll(first);
+
+    const secondInput = [
+      firstUser,
+      { role: 'assistant', content: [{ type: 'output_text', text: 'first answer' }] },
+      { role: 'user', content: [{ type: 'input_text', text: 'second' }] },
+    ];
+    const second = await withResponsesWebSocketDiagnosticContext(
+      { requestId: 'req-B', claudeSessionId: 'session-B' },
+      () => wsFetch('https://x', {
+        method: 'POST', headers: {}, body: JSON.stringify(sessionPayload(secondInput)),
+      }),
+    );
+    expect(socketCount()).toBe(socketsBefore + 1);
+    inA(() => {
+      socket.emit('message', Buffer.from(quotaFrame()));
+      emitTextResponse(socket, 'resp_B', 'second answer');
+    });
+    await readAll(second);
+    inA(() => socket.emit('message', Buffer.from(quotaFrame())));
+
+    const [during, idle] = diagnostics.filter(d => d.event === 'ws_rate_limits');
+    expect(during).toMatchObject({ phase: 'during_response', requestId: 'req-B', claudeSessionId: 'session-B' });
+    expect(idle!.phase).toBe('idle');
+    expect(idle!.requestId).toBeUndefined();
+    expect(idle!.claudeSessionId).toBeUndefined();
+  });
+
+  it('observes idle meter frames on a replacement socket after a transport retry', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', {
+      method: 'POST', headers: {}, body: JSON.stringify(sessionPayload([])),
+    });
+    const socketsBefore = socketCount();
+    lastSocket().emit('error', Object.assign(new Error('reset'), { code: 'ECONNRESET' }));
+    expect(socketCount()).toBe(socketsBefore + 1);
+    const replacement = lastSocket();
+    replacement.emit('open');
+    emitTextResponse(replacement, 'resp_replacement', 'recovered');
+    await readAll(res);
+    diagnostics.length = 0;
+
+    replacement.emit('message', Buffer.from(quotaFrame()));
+
+    const observed = diagnostics.filter(d => d.event === 'ws_rate_limits');
+    expect(observed).toHaveLength(1);
+    expect(observed[0]!.phase).toBe('idle');
+  });
+
+  it('keeps the size of a ledger too large to record verbatim', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(quotaFrame({
+      additional_rate_limits: [{ limit_name: 'x'.repeat(9000) }],
+      credits: { balance: '0' },
+    })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+
+    const observed = diagnostics.find(d => d.event === 'ws_rate_limits')!;
+    expect(observed.additionalRateLimits).toBeUndefined();
+    expect(observed.additionalRateLimitsBytes).toBeGreaterThan(8000);
+    expect(observed.credits).toEqual({ balance: '0' });
+    expect(observed.creditsBytes).toBe(JSON.stringify({ balance: '0' }).length);
+  });
+
+  it('measures ledger size in UTF-8 bytes', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    const promo = { label: 'Früh bucher €' };
+    socket.emit('message', Buffer.from(quotaFrame({ promo })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+
+    const observed = diagnostics.find(d => d.event === 'ws_rate_limits')!;
+    expect(observed.promoBytes).toBe(Buffer.byteLength(JSON.stringify(promo)));
+    expect(observed.promoBytes).toBeGreaterThan(JSON.stringify(promo).length);
+    // Under the limit in characters but over it in bytes: dropped, size kept.
+    diagnostics.length = 0;
+    const res2 = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket2 = lastSocket();
+    socket2.emit('open');
+    const wide = { label: '€'.repeat(3000) };
+    socket2.emit('message', Buffer.from(quotaFrame({ promo: wide })));
+    socket2.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res2);
+    const dropped = diagnostics.find(d => d.event === 'ws_rate_limits')!;
+    expect(dropped.promo).toBeUndefined();
+    expect(dropped.promoBytes).toBe(Buffer.byteLength(JSON.stringify(wide)));
+  });
+
+  it('leaves a response untouched when diagnostics are off', async () => {
+    // Without a diagnostic sink the meter frame must be skipped, not dereferenced.
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {});
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    socket.emit('message', Buffer.from(quotaFrame()));
+    emitTextResponse(socket, 'resp_no_diagnostics', 'still answered');
+    expect(await readAll(res)).toContain('still answered');
+  });
+
+  it('bounds and sanitizes the field names and identifiers it records', async () => {
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, () => {}, {
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const res = await wsFetch('https://x', { method: 'POST', headers: {}, body: '{}' });
+    const socket = lastSocket();
+    socket.emit('open');
+    const extra: Record<string, number> = { 'bad\nkey': 1 };
+    for (let i = 0; i < 40; i += 1) extra[`field_${i}`] = i;
+    socket.emit('message', Buffer.from(quotaFrame({ plan_type: 'pro\nforged', ...extra })));
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.completed' })));
+    await readAll(res);
+
+    const observed = diagnostics.find(d => d.event === 'ws_rate_limits')!;
+    const fields = observed.fieldsPresent as string[];
+    expect(fields.length).toBeLessThanOrEqual(24);
+    expect(fields).toContain('rate_limits');
+    expect(fields).not.toContain('bad\nkey');
+    expect(observed.fieldCount).toBe(44);
+    expect(observed.planType).toBeUndefined();
+  });
+});
+
+describe('descriptor exhaustion', () => {
+  beforeEach(() => {
+    resetResponsesWebSocketConnectionsForTests();
+    resetDescriptorExhaustionNoticeForTests();
+    descriptorProbe.failWith = undefined;
+    fakeSockets.length = 0;
+  });
+
+  /** Admits every request at once; the shared pacer would queue a large fan-out. */
+  const instantPacer = () => ({ admit: vi.fn(async () => ({ kind: 'admitted' as const, waitedMs: 0 })) });
+
+  const rootPayload = (text: string, sessionId: string) => sessionPayload(
+    [{ role: 'user', content: [{ type: 'input_text', text }] }],
+    { prompt_cache_key: sessionId },
+  );
+
+  /** Opens one head per session id and completes its turn, leaving it idle. */
+  async function openIdleHeads(
+    wsFetch: ReturnType<typeof createResponsesWebSocketFetch>,
+    sessionIds: string[],
+  ): Promise<FakeWebSocket[]> {
+    const sockets: FakeWebSocket[] = [];
+    for (const sessionId of sessionIds) {
+      const response = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(rootPayload(`root ${sessionId}`, sessionId)),
+      });
+      const socket = lastSocket();
+      socket.emit('open');
+      emitTextResponse(socket, `resp_${sessionId}`, 'ok');
+      await readAll(response);
+      sockets.push(socket);
+    }
+    return sockets;
+  }
+
+  it('keeps more heads than the old caps allowed, with no cap eviction', async () => {
+    // 48 was the nursery cap this replaces; every one of these heads is a
+    // conversation whose next turn would otherwise resend its history uncached.
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-unbounded',
+      pacer: instantPacer(),
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const sessionIds = Array.from({ length: 60 }, (_, index) => `session-${index}`);
+    const sockets = await openIdleHeads(wsFetch, sessionIds);
+    expect(sockets.every(socket => !socket.close.mock.calls.length)).toBe(true);
+    const evictions = diagnostics
+      .filter(event => event.event === 'ws_head_decision')
+      .flatMap(event => (event.evictions ?? []) as Record<string, unknown>[]);
+    expect(evictions).toEqual([]);
+    // A decision is recorded before its own head registers, so the last one
+    // counts the 59 heads already held.
+    expect(diagnostics.at(-1)).toMatchObject({
+      event: 'ws_head_decision',
+      nurseryConnectionCount: 59,
+      maxNurseryConnections: null,
+    });
+  });
+
+  it('sheds idle heads on EMFILE, retries on freed descriptors, and tells the user once', async () => {
+    const notices: string[] = [];
+    const release = installParentNoticeSink(line => notices.push(line));
+    try {
+      const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-emfile',
+        pacer: instantPacer(),
+        onDiagnostic: event => diagnostics.push(event),
+      });
+      const [older, newer] = await openIdleHeads(wsFetch, ['older', 'newer']);
+
+      const response = await withResponsesWebSocketDiagnosticContext(
+        { requestId: 'req-emfile' },
+        () => wsFetch('https://x', {
+          method: 'POST', headers: {},
+          body: JSON.stringify(rootPayload('third conversation', 'third')),
+        }),
+      );
+      const starved = lastSocket();
+      expect(fakeSockets).toHaveLength(3);
+      starved.emit('error', Object.assign(new Error('connect EMFILE 1.2.3.4:443'), { code: 'EMFILE' }));
+
+      // Idle heads are torn down hard — a graceful close keeps the descriptor
+      // until the peer answers — and the replacement is dialled right away.
+      expect(older!.terminate).toHaveBeenCalledOnce();
+      expect(newer!.terminate).toHaveBeenCalledOnce();
+      expect(older!.close).not.toHaveBeenCalled();
+      expect(fakeSockets).toHaveLength(4);
+      const replacement = lastSocket();
+      replacement.emit('open');
+      emitTextResponse(replacement, 'resp_third', 'recovered');
+      expect(await readAll(response)).toContain('recovered');
+
+      expect(diagnostics).toContainEqual(expect.objectContaining({
+        event: 'ws_descriptor_exhaustion',
+        requestId: 'req-emfile',
+        code: 'EMFILE',
+        detectedBy: 'error_code',
+        heldConnections: 2,
+        shedConnections: 2,
+      }));
+      expect(diagnostics).toContainEqual(expect.objectContaining({
+        event: 'ws_transport_retry', outcome: 'recovered', requestId: 'req-emfile',
+      }));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain("this process's open-file limit was reached (EMFILE)");
+      expect(notices[0]).toContain('had 2 pooled connection(s) registered');
+      expect(notices[0]).toContain('closed 2 idle');
+      expect(notices[0]).toContain('ulimit -n');
+
+      // A later exhaustion in the same process is recorded, not re-announced.
+      const again = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(rootPayload('fourth conversation', 'fourth')),
+      });
+      // The shed heads are gone from the pool: this decision sees only the
+      // recovered third head.
+      expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+        .toMatchObject({ activeConnectionCount: 1 });
+      lastSocket().emit('error', Object.assign(new Error('connect ENFILE'), { code: 'ENFILE' }));
+      const secondReplacement = lastSocket();
+      secondReplacement.emit('open');
+      emitTextResponse(secondReplacement, 'resp_fourth', 'again');
+      expect(await readAll(again)).toContain('again');
+      expect(diagnostics.filter(event => event.event === 'ws_descriptor_exhaustion'))
+        .toHaveLength(2);
+      expect(notices).toHaveLength(1);
+    } finally {
+      release();
+    }
+  });
+
+  it('never sheds a head that is carrying a response', async () => {
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-emfile-busy',
+      pacer: instantPacer(),
+    });
+    const busyResponse = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(rootPayload('busy conversation', 'busy')),
+    });
+    const busySocket = lastSocket();
+    busySocket.emit('open');
+    // Its turn is still streaming: nothing has completed on this socket.
+    const [idle] = await openIdleHeads(wsFetch, ['idle']);
+
+    const starvedResponse = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(rootPayload('starved conversation', 'starved')),
+    });
+    lastSocket().emit('error', Object.assign(new Error('connect EMFILE'), { code: 'EMFILE' }));
+
+    expect(idle!.terminate).toHaveBeenCalledOnce();
+    expect(busySocket.terminate).not.toHaveBeenCalled();
+    expect(busySocket.close).not.toHaveBeenCalled();
+
+    const replacement = lastSocket();
+    replacement.emit('open');
+    emitTextResponse(replacement, 'resp_starved', 'starved ok');
+    expect(await readAll(starvedResponse)).toContain('starved ok');
+    emitTextResponse(busySocket, 'resp_busy', 'busy ok');
+    expect(await readAll(busyResponse)).toContain('busy ok');
+  });
+
+  it('fails with an actionable message when the retry is starved too, and does not loop', async () => {
+    const notices: string[] = [];
+    const release = installParentNoticeSink(line => notices.push(line));
+    try {
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-emfile-exhausted',
+        pacer: instantPacer(),
+      });
+      const response = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(rootPayload('only conversation', 'only')),
+      });
+      lastSocket().emit('error', Object.assign(new Error('connect EMFILE'), { code: 'EMFILE' }));
+      expect(fakeSockets).toHaveLength(2);
+      lastSocket().emit('error', Object.assign(new Error('connect EMFILE'), { code: 'EMFILE' }));
+      expect(fakeSockets).toHaveLength(2);
+
+      const body = await readAll(response);
+      expect(body).toContain('open-file limit was reached (EMFILE)');
+      expect(body).toContain('0 pooled connection(s) registered');
+      expect(body).toContain('ulimit -n');
+      expect(body).not.toContain('connect EMFILE');
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain('closed 0 idle');
+    } finally {
+      release();
+    }
+  });
+
+  it('leaves other socket errors on the ordinary retry path', async () => {
+    const notices: string[] = [];
+    const release = installParentNoticeSink(line => notices.push(line));
+    try {
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-not-emfile',
+        pacer: instantPacer(),
+      });
+      const [idle] = await openIdleHeads(wsFetch, ['idle']);
+      const response = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(rootPayload('reset conversation', 'reset')),
+      });
+      lastSocket().emit('error', Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }));
+      expect(idle!.terminate).not.toHaveBeenCalled();
+      expect(notices).toEqual([]);
+      const replacement = lastSocket();
+      replacement.emit('open');
+      emitTextResponse(replacement, 'resp_reset', 'ok');
+      expect(await readAll(response)).toContain('ok');
+    } finally {
+      release();
+    }
+  });
+
+  it('sheds established heads too, oldest first', async () => {
+    // Established heads are the dominant idle population a full descriptor
+    // table finds (organic peak 28 vs 1-4 nursery), and promotion happens only
+    // on a continuation — so this stages a real second turn.
+    let clock = 1_000_000;
+    const now = () => clock;
+    const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+    const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+      accountId: 'acct-emfile-established',
+      pacer: instantPacer(),
+      now,
+      onDiagnostic: event => diagnostics.push(event),
+    });
+    const firstInput = [{ role: 'user', content: [{ type: 'input_text', text: 'turn one' }] }];
+    const first = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload(firstInput, { prompt_cache_key: 'established' })),
+    });
+    const established = lastSocket();
+    established.emit('open');
+    emitTextResponse(established, 'resp_e1', 'one');
+    await readAll(first);
+
+    clock += 1_000;
+    const second = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(sessionPayload([
+        ...firstInput,
+        { role: 'assistant', content: [{ type: 'output_text', text: 'one' }] },
+        { role: 'user', content: [{ type: 'input_text', text: 'turn two' }] },
+      ], { prompt_cache_key: 'established' })),
+    });
+    expect(fakeSockets).toHaveLength(1);
+    expect(JSON.parse(established.send.mock.calls[1]![0] as string).previous_response_id).toBe('resp_e1');
+    // Promotion happens when the head is selected, so the decision already
+    // reports the generation the shed will find.
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+      .toMatchObject({ decision: 'continuation', selectedGeneration: 'established' });
+    emitTextResponse(established, 'resp_e2', 'two');
+    await readAll(second);
+
+    // A younger nursery head, used more recently than the established one.
+    clock += 1_000;
+    const [nursery] = await openIdleHeads(wsFetch, ['younger']);
+
+    clock += 1_000;
+    const starved = await wsFetch('https://x', {
+      method: 'POST', headers: {},
+      body: JSON.stringify(rootPayload('starved', 'starved')),
+    });
+    expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+      .toMatchObject({ establishedConnectionCount: 1, nurseryConnectionCount: 1 });
+    lastSocket().emit('error', Object.assign(new Error('connect EMFILE'), { code: 'EMFILE' }));
+
+    expect(established.terminate).toHaveBeenCalledOnce();
+    expect(nursery!.terminate).toHaveBeenCalledOnce();
+    expect(established.close).not.toHaveBeenCalled();
+    // Oldest first: the established head was last used before the nursery one.
+    expect(established.terminate.mock.invocationCallOrder[0]!)
+      .toBeLessThan(nursery!.terminate.mock.invocationCallOrder[0]!);
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      event: 'ws_descriptor_exhaustion', heldConnections: 2, shedConnections: 2,
+    }));
+    const replacement = lastSocket();
+    replacement.emit('open');
+    emitTextResponse(replacement, 'resp_starved', 'recovered');
+    expect(await readAll(starved)).toContain('recovered');
+  });
+
+  it('detects exhaustion behind a hostname lookup failure by probing a descriptor', async () => {
+    // The shipped route is a hostname, and a full descriptor table fails inside
+    // getaddrinfo — the socket reports ENOTFOUND, not EMFILE.
+    const notices: string[] = [];
+    const release = installParentNoticeSink(line => notices.push(line));
+    try {
+      const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-enotfound',
+        pacer: instantPacer(),
+        onDiagnostic: event => diagnostics.push(event),
+      });
+      const [idle] = await openIdleHeads(wsFetch, ['idle']);
+      const response = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(rootPayload('starved', 'starved')),
+      });
+      descriptorProbe.failWith = 'EMFILE';
+      lastSocket().emit('error', Object.assign(new Error('getaddrinfo ENOTFOUND chatgpt.com'), { code: 'ENOTFOUND' }));
+      descriptorProbe.failWith = undefined;
+
+      expect(idle!.terminate).toHaveBeenCalledOnce();
+      expect(diagnostics).toContainEqual(expect.objectContaining({
+        event: 'ws_descriptor_exhaustion',
+        code: 'EMFILE',
+        detectedBy: 'descriptor_probe',
+        socketErrorCode: 'ENOTFOUND',
+        heldConnections: 1,
+        shedConnections: 1,
+      }));
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain('(EMFILE)');
+      const replacement = lastSocket();
+      replacement.emit('open');
+      emitTextResponse(replacement, 'resp_starved', 'recovered');
+      expect(await readAll(response)).toContain('recovered');
+    } finally {
+      release();
+    }
+  });
+
+  it('leaves a genuine lookup failure alone when descriptors are available', async () => {
+    const notices: string[] = [];
+    const release = installParentNoticeSink(line => notices.push(line));
+    try {
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-real-enotfound',
+        pacer: instantPacer(),
+      });
+      const [idle] = await openIdleHeads(wsFetch, ['idle']);
+      const response = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(rootPayload('offline', 'offline')),
+      });
+      lastSocket().emit('error', Object.assign(new Error('getaddrinfo ENOTFOUND chatgpt.com'), { code: 'ENOTFOUND' }));
+      lastSocket().emit('error', Object.assign(new Error('getaddrinfo ENOTFOUND chatgpt.com'), { code: 'ENOTFOUND' }));
+      expect(idle!.terminate).not.toHaveBeenCalled();
+      expect(notices).toEqual([]);
+      expect(await readAll(response)).toContain('ENOTFOUND');
+    } finally {
+      release();
+    }
+  });
+
+  it('names the system-wide limit on ENFILE and does not prescribe ulimit', async () => {
+    const notices: string[] = [];
+    const release = installParentNoticeSink(line => notices.push(line));
+    try {
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-enfile',
+        pacer: instantPacer(),
+      });
+      const response = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(rootPayload('only', 'only')),
+      });
+      lastSocket().emit('error', Object.assign(new Error('connect ENFILE'), { code: 'ENFILE' }));
+      lastSocket().emit('error', Object.assign(new Error('connect ENFILE'), { code: 'ENFILE' }));
+      const body = await readAll(response);
+      expect(body).toContain('system-wide open-file limit was reached (ENFILE)');
+      expect(body).not.toContain('ulimit');
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain('system-wide open-file limit was reached (ENFILE)');
+      expect(notices[0]).not.toContain('ulimit');
+    } finally {
+      release();
+    }
+  });
+
+  it('honours an env cap above the old 1024 ceiling instead of ignoring it', async () => {
+    process.env.CLODEX_WS_MAX_NURSERY_CONNECTIONS = '2000';
+    try {
+      const diagnostics: ResponsesWebSocketDiagnosticEvent[] = [];
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-big-cap',
+        onDiagnostic: event => diagnostics.push(event),
+      });
+      await openIdleHeads(wsFetch, ['one']);
+      expect(diagnostics.filter(event => event.event === 'ws_head_decision').at(-1))
+        .toMatchObject({ maxNurseryConnections: 2000 });
+    } finally {
+      delete process.env.CLODEX_WS_MAX_NURSERY_CONNECTIONS;
+    }
+  });
+
+  it('does not shed on an error from a socket that is already open', async () => {
+    // An open socket holds its own descriptor; a mid-stream failure there is not
+    // a starved dial, and after output there is no retry to benefit from a shed.
+    const notices: string[] = [];
+    const release = installParentNoticeSink(line => notices.push(line));
+    try {
+      const wsFetch = createResponsesWebSocketFetch(WS_URL, undefined, {
+        accountId: 'acct-open-error',
+        pacer: instantPacer(),
+      });
+      const [idle] = await openIdleHeads(wsFetch, ['idle']);
+      const response = await wsFetch('https://x', {
+        method: 'POST', headers: {},
+        body: JSON.stringify(rootPayload('streaming', 'streaming')),
+      });
+      const streaming = lastSocket();
+      streaming.emit('open');
+      streaming.emit('message', Buffer.from(JSON.stringify({ type: 'response.created', response: { id: 'resp_s' } })));
+      streaming.emit('message', Buffer.from(JSON.stringify({
+        type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'msg_s' },
+      })));
+      streaming.emit('message', Buffer.from(JSON.stringify({
+        type: 'response.output_text.delta', item_id: 'msg_s', delta: 'partial',
+      })));
+      descriptorProbe.failWith = 'EMFILE';
+      streaming.emit('error', Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }));
+      descriptorProbe.failWith = undefined;
+      expect(idle!.terminate).not.toHaveBeenCalled();
+      expect(notices).toEqual([]);
+      expect(fakeSockets).toHaveLength(2);
+      expect(await readAll(response)).toContain('ECONNRESET');
+    } finally {
+      release();
+    }
   });
 });
