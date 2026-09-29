@@ -313,8 +313,15 @@ describe('help text', () => {
     // Both surfaces matter: --fast is where someone discovers Codex fast mode,
     // and --alias is where they act on it for a single agent.
     expect(modelsHelpText()).toContain('-fast');
-    expect(modelsHelpText()).toContain('sol-fast=clodex:openai-oauth:gpt-5.6-sol');
+    expect(modelsHelpText()).toContain('sol-fast=clodex:openai-oauth:gpt-6-sol');
     expect(claudeHelpText()).toContain('-fast alias');
+  });
+
+  it('marks direct provider/model launches as endpoint mode', () => {
+    const help = claudeHelpText();
+    expect(help).toContain('--provider   Endpoint mode only');
+    expect(help).toContain('--model      Endpoint mode only');
+    expect(help).toContain('clodex claude --endpoint --provider openai-oauth --model gpt-6-sol');
   });
 
   it('no longer mentions the removed --http-proxy alias', () => {

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { projectProviderCachedModels } from '../src/registry/materialize.js';
+import { materializeRegistry, projectProviderCachedModels } from '../src/registry/materialize.js';
 import { buildOpenAiOAuthModels } from '../src/data/openai-oauth-models.js';
-import type { RegistryProvider } from '../src/registry/types.js';
+import type { CachedModel, ProviderRegistry, RegistryProvider } from '../src/registry/types.js';
 
 /**
  * A catalog cached before the context-budget fields existed carries none of them.
@@ -187,6 +187,16 @@ describe('legacy OAuth cache overlay', () => {
     },
   );
 
+  it('keeps the Codex catalog limits and transport flags for seeded GPT-5.5', () => {
+    const model = buildOpenAiOAuthModels().find(row => row.id === 'gpt-5.5');
+    expect(model).toMatchObject({
+      contextWindow: 272_000,
+      maxContextWindow: 272_000,
+      preferWebSockets: true,
+      useResponsesLite: false,
+    });
+  });
+
   // The seed list is written straight into the cache on the Tier-3 discovery-outage
   // path, so a share injected here would be persisted even though projection strips it
   // on the way back out. Assert the source, not just the projection, or the injection
@@ -196,6 +206,34 @@ describe('legacy OAuth cache overlay', () => {
       expect(model.effectiveContextPercent, model.id).toBeUndefined();
     }
   });
+
+  // Same reason as the share: the seed list is written straight into the cache on the
+  // Tier-3 discovery-outage path. A seed row that records no window must not be
+  // topped up with clodex's invented 200,000, or that number becomes the ceiling the
+  // user is clamped to for as long as the outage cache survives.
+  it('takes each seed window from the most authoritative tier that claims it', () => {
+    const windows = new Map(buildOpenAiOAuthModels().map(model => [model.id, model.contextWindow]));
+    // Declared on the row itself wins.
+    expect(windows.get('o1')).toBe(200_000);
+    expect(windows.get('o3')).toBe(200_000);
+    expect(windows.get('o1-mini')).toBe(128_000);
+    expect(windows.get('gpt-6-astra')).toBe(272_000);
+    expect(windows.get('gpt-6-sol')).toBe(272_000);
+    expect(windows.get('gpt-6-luna')).toBe(272_000);
+    // Not declared, but a heuristic rule claims it.
+    expect(windows.get('o3-mini')).toBe(1_000_000);
+    // Nothing here may be the invented default standing in for a miss.
+    expect([...windows.values()].every(w => typeof w === 'number' && w > 0)).toBe(true);
+  });
+
+  // The builder reads `lookupKnownContextWindow`, which reports `undefined` rather than
+  // inventing 200,000 for a model no tier claims. That property is pinned directly in
+  // tests/context-window.test.ts ('reports nothing for a model neither tier claims').
+  // It cannot also be pinned HERE: every seed row now either declares its own window or
+  // is claimed by a heuristic rule, so `lookupKnownContextWindow` and the inventing
+  // `resolveContextWindow` return the same answer for all of them and the wiring is
+  // unobservable from this seam. Add a seed that no rule claims and this becomes
+  // testable again — and worth testing, because that is the row the invention would hit.
 
   // The migration for installs that refreshed while clodex still imposed a share.
   // A cached 95 is not a provider answer — the Codex catalog reports null for this
@@ -232,5 +270,137 @@ describe('legacy OAuth cache overlay', () => {
     expect(sol?.contextWindow).toBe(272_000);
     expect(sol?.effectiveContextPercent).toBeUndefined();
     expect(sol?.maxContextWindow).toBeUndefined();
+  });
+});
+
+/**
+ * Flagless rows can have different origins. GPT-5.6 Sol and Terra were already seeded,
+ * so their rows did not come from the unseeded branch: Tier-2 can persist `entry ?? seed`
+ * with both flags undefined, and Tier-3 can persist flagless rows too. Older GPT-6 rows
+ * written before their ids were seeded came through the unseeded branch, which carries no
+ * Codex-only `use_responses_lite` / `prefer_websockets`. Without use_responses_lite clodex
+ * never sends the Responses-Lite headers; prefer_websockets is recorded for catalog parity
+ * (all OAuth Responses requests already use WebSocket transport).
+ *
+ * The window differs by when the row was written. Before #259 the unseeded branch
+ * persisted an invented 200,000 default, so GPT-6 Astra / Daybreak rows from before
+ * their seeding, and GPT-6 Sol / Luna rows from before #259, carry an explicit 200,000.
+ * v2.16.0 (after #259, before GPT-6 Sol / Luna were seeded in #266) had no GPT-6
+ * heuristic, so it wrote those two with NO window; today the 1,050,000 GPT-6 heuristic
+ * would clamp that to the 872,000 ceiling instead of the 272,000 standard window.
+ *
+ * The bare-row cases below pin the absent-field contract for every id, not what the
+ * historical producer emitted for each one; the legacy-window case pins the explicit
+ * 200,000 shape.
+ */
+const RESPONSES_LITE_IDS = [
+  'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-daybreak-blue-latest',
+  'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna',
+];
+
+function bareRow(id: string, extra: Partial<CachedModel> = {}): CachedModel {
+  return { id, name: id, upstreamModelId: id, modelFormat: 'openai', npm: '@ai-sdk/openai', ...extra };
+}
+
+function providerWithRows(models: CachedModel[]): RegistryProvider {
+  return providerWithLegacyCache({
+    modelsCache: { fetchedAt: '2026-09-01T00:00:00.000Z', models },
+  });
+}
+
+describe('Responses-Lite fields missing from an older cache', () => {
+  it.each(RESPONSES_LITE_IDS)('backfills the flags and standard window for %s', id => {
+    const model = projectProviderCachedModels(providerWithRows([bareRow(id)]))[0];
+    expect(model?.useResponsesLite).toBe(true);
+    expect(model?.preferWebSockets).toBe(true);
+    expect(model?.contextWindow).toBe(272_000);
+    expect(model?.maxContextWindow).toBe(872_000);
+  });
+
+  // What the user actually runs on: the launch-time model. Without the window
+  // backfill the heuristic 1,050,000 is clamped to the ceiling and reported as 872,000.
+  it('reports the 272,000 standard window and the header flag on the launch model', () => {
+    const registry = {
+      schemaVersion: 4,
+      providers: [providerWithRows(RESPONSES_LITE_IDS.map(id => bareRow(id)))],
+    } as unknown as ProviderRegistry;
+    const [local] = materializeRegistry(registry, () => 'oauth-token');
+    for (const id of RESPONSES_LITE_IDS) {
+      const model = local?.models.find(m => m.id === id);
+      expect(model?.contextWindow, id).toBe(272_000);
+      expect(model?.useResponsesLite, id).toBe(true);
+      expect(model?.preferWebSockets, id).toBe(true);
+    }
+  });
+
+  // The shape older clodex actually persisted for Astra / Daybreak (and for Sol / Luna
+  // before #259): an explicit legacy 200,000 window and no flags. The flags must be
+  // repaired; the window is left alone because the cache cannot tell an invented
+  // default from a catalog-reported value.
+  it('repairs the flags on a legacy row that carries an explicit 200,000 window', () => {
+    const rows = RESPONSES_LITE_IDS.map(id => bareRow(id, { contextWindow: 200_000 }));
+    const projected = projectProviderCachedModels(providerWithRows(rows));
+    const registry = {
+      schemaVersion: 4,
+      providers: [providerWithRows(rows)],
+    } as unknown as ProviderRegistry;
+    const [local] = materializeRegistry(registry, () => 'oauth-token');
+    for (const id of RESPONSES_LITE_IDS) {
+      const cached = projected.find(m => m.id === id);
+      expect(cached?.useResponsesLite, id).toBe(true);
+      expect(cached?.preferWebSockets, id).toBe(true);
+      expect(cached?.contextWindow, id).toBe(200_000);
+      const model = local?.models.find(m => m.id === id);
+      expect(model?.useResponsesLite, id).toBe(true);
+      expect(model?.preferWebSockets, id).toBe(true);
+      expect(model?.contextWindow, id).toBe(200_000);
+    }
+  });
+
+  // The catalog does report these fields, so whatever it sent is a provider answer.
+  // `false` must survive: a truthiness fallback would silently turn it back on.
+  it.each(['gpt-6-sol', 'gpt-5.6-sol', 'gpt-5.6-terra'])(
+    'keeps explicit false flags and an explicit window for %s', id => {
+      const row = bareRow(id, {
+        useResponsesLite: false,
+        preferWebSockets: false,
+        contextWindow: 400_000,
+      });
+      const model = projectProviderCachedModels(providerWithRows([row]))[0];
+      expect(model?.useResponsesLite).toBe(false);
+      expect(model?.preferWebSockets).toBe(false);
+      expect(model?.contextWindow).toBe(400_000);
+    },
+  );
+
+  // Under-scope: seeds that carry no flags must not grow one, and a model the seed does
+  // not know keeps exactly what discovery wrote.
+  it('invents nothing for a seed without the flags or an unseeded model', () => {
+    const models = projectProviderCachedModels(providerWithRows([
+      bareRow('gpt-5.4'),
+      bareRow('gpt-6-unreleased'),
+    ]));
+    const legacy = models.find(m => m.id === 'gpt-5.4');
+    expect(legacy?.useResponsesLite).toBeUndefined();
+    expect(legacy?.preferWebSockets).toBeUndefined();
+    expect(legacy?.contextWindow).toBe(272_000);
+    const unseeded = models.find(m => m.id === 'gpt-6-unreleased');
+    expect(unseeded?.useResponsesLite).toBeUndefined();
+    expect(unseeded?.preferWebSockets).toBeUndefined();
+    expect(unseeded?.contextWindow).toBeUndefined();
+  });
+
+  // Only the ChatGPT OAuth path is Codex. An API-key provider must not be sent the
+  // Codex-internal Responses-Lite headers because its model id matches a seed.
+  it('does not backfill for a non-OAuth provider', () => {
+    const provider = providerWithLegacyCache({
+      id: 'openai',
+      authType: 'api',
+      authRef: 'keyring:provider:openai',
+      modelsCache: { fetchedAt: '2026-09-01T00:00:00.000Z', models: [bareRow('gpt-6-sol')] },
+    });
+    const [sol] = projectProviderCachedModels(provider);
+    expect(sol?.useResponsesLite).toBeUndefined();
+    expect(sol?.contextWindow).toBeUndefined();
   });
 });

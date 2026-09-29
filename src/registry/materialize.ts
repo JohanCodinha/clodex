@@ -2,14 +2,15 @@
 
 import { shouldHideModel, type CompatibilityAgent } from '../model-compatibility.js';
 import { deriveBrand } from '../models.js';
+import { requiresNewerCodexClient } from '../codex-client-version.js';
 import {
   contextLimitsFrom,
   resolveContextStop,
   selectContextStop,
 } from '../context-modes.js';
-import { applyOAuthSeedContextMetadata } from '../data/openai-oauth-models.js';
+import { applyOAuthSeedContextMetadata, openAiPricingMetadata } from '../data/openai-oauth-models.js';
 import { isChatGptOAuthProvider } from './provider-kind.js';
-import { resolveContextWindow } from '../context-window.js';
+import { lookupKnownContextWindow } from '../context-window.js';
 import type { LocalProvider, LocalProviderModel } from '../types.js';
 import { normalizeGoogleDisplayName, normalizeGoogleModelId } from './google-model-id.js';
 import { findModelsDevModel } from './models-dev.js';
@@ -18,7 +19,7 @@ import type { CachedModel, ProviderRegistry, RegistryProvider } from './types.js
 import { isValidProviderId } from './validate.js';
 import {
   isRetainedOpenCodeGoProvider,
-  openCodeGoPinnedApiUrl,
+  openCodeGoPinnedModelApiUrl,
   resolveProviderTemplate,
   retainedOpenCodeGoTemplate,
 } from './resolve-template.js';
@@ -64,14 +65,19 @@ export { openCodeGoPinnedApiUrl } from './resolve-template.js';
 
 /**
  * Project persisted model caches onto the authority that owns their provider identity.
- * Ordinary and custom providers retain their cache array unchanged; retained OpenCode
- * identities are fail-closed against the committed template catalog, and OpenRouter's
- * model-specific transport exception is applied here and only here, so the persisted
- * cache stays provider-native and a cache written by any release materializes the same way.
+ * OpenAI API-key caches gain missing pricing metadata without requiring a refresh;
+ * retained OpenCode identities are fail-closed against the committed template catalog;
+ * and OpenRouter's model-specific transport exception is applied here and only here, so
+ * the persisted cache stays provider-native and a cache written by any release
+ * materializes the same way.
  */
 export function projectProviderCachedModels(provider: RegistryProvider): CachedModel[] {
   const cached = provider.modelsCache?.models ?? [];
-  if (isChatGptOAuthProvider(provider)) return applyOAuthSeedContextMetadata(cached);
+  if (isChatGptOAuthProvider(provider)) {
+    // Preserve unavailable entries in storage so a newer clodex pin restores them
+    // without another refresh. All picker, patch and runtime catalogs use this view.
+    return applyOAuthSeedContextMetadata(cached).filter(model => !requiresNewerCodexClient(model));
+  }
   if (isRetainedOpenCodeGoProvider(provider)) {
     const template = retainedOpenCodeGoTemplate();
     return template ? applyTemplateModelMetadata(template, cached) : [];
@@ -79,7 +85,18 @@ export function projectProviderCachedModels(provider: RegistryProvider): CachedM
   if (resolveProviderTemplate(provider)?.id === OPENROUTER_PROVIDER_ID) {
     return cached.map(model => projectOpenRouterModelTransport(model, provider.api.url));
   }
-  return cached;
+  if (!cached.some(model => (model.npm ?? provider.api.npm) === '@ai-sdk/openai')) return cached;
+  return cached.map(model => {
+    // A compatible endpoint can use the same ids without OpenAI's prices.
+    // Match the effective SDK just as runtime routing does, not the id alone.
+    if ((model.npm ?? provider.api.npm) !== '@ai-sdk/openai') return model;
+    const pricing = openAiPricingMetadata(model.upstreamModelId ?? model.id);
+    return {
+      ...model,
+      pricingBoundary: model.pricingBoundary ?? pricing.pricingBoundary,
+      pricingBoundaryNote: model.pricingBoundaryNote ?? pricing.pricingBoundaryNote,
+    };
+  });
 }
 
 function resolveMaterializedApiUrl(
@@ -90,7 +107,7 @@ function resolveMaterializedApiUrl(
   if (!isRetainedOpenCodeGoProvider(provider)) {
     return cached.apiUrl ?? provider.api.url ?? '';
   }
-  return openCodeGoPinnedApiUrl(npm);
+  return openCodeGoPinnedModelApiUrl(npm);
 }
 
 /**
@@ -106,7 +123,7 @@ function projectContextStop(
   LocalProviderModel,
   'contextWindow' | 'rawContextWindow' | 'contextStop' | 'pricingBoundary'
 > {
-  const limits = contextLimitsFrom(cached, resolveContextWindow(modelId));
+  const limits = contextLimitsFrom(cached, lookupKnownContextWindow(modelId));
   const stop = selectContextStop(providerId, modelId);
   const resolved = resolveContextStop(limits, stop);
   return {

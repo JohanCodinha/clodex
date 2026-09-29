@@ -287,7 +287,11 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
             ...(spec.headers ? { headers: spec.headers } : {}),
             fetch: fetchWithoutCredentialHeaders,
           }
-        : { apiKey, ...(spec.headers ? { headers: spec.headers } : {}) };
+        // An API-key route to a third-party Responses host (OpenCode Go serves
+        // Muse Spark only on /v1/responses) must reach THAT host: without the
+        // base URL the SDK defaults to api.openai.com and sends the provider's
+        // key there.
+        : { apiKey, ...(baseURL ? { baseURL } : {}), ...(spec.headers ? { headers: spec.headers } : {}) };
     const openai = createOpenAI(oauthOptions);
     return useResponsesEndpoint ? openai.responses(modelId) : openai.chat(modelId);
   }
@@ -557,7 +561,17 @@ function hasSupportedParameter(metadata: ReasoningMetadata | undefined, param: s
   return (metadata?.supportedParameters ?? []).some(p => p === param);
 }
 
-function isOpenRouterRoute(npm: string, metadata?: ReasoningMetadata): boolean {
+/**
+ * Whether a route is OpenRouter's. Recognition is endpoint-derived on purpose: a
+ * custom provider id comes from the display name the user typed and a gateway can
+ * list `openrouter/*` model ids, so neither is evidence of the upstream. This
+ * predicate decides reasoning capabilities and effort mapping, where a false
+ * positive silently changes what a provider is asked to do.
+ *
+ * Exported for the request-level session header, the one consumer outside this
+ * module; it reuses this answer rather than growing a second OpenRouter test.
+ */
+export function isOpenRouterRoute(npm: string, metadata?: ReasoningMetadata): boolean {
   return npm === '@openrouter/ai-sdk-provider'
     || metadata?.providerId === 'openrouter'
     || metadata?.apiBaseUrl?.includes('openrouter.ai') === true;
@@ -706,13 +720,16 @@ function supportsExtendedCodexEffort(modelId: string): boolean {
  *   400 Unsupported value: 'none' is not supported with the 'gpt-6-astra' model.
  *   Supported values are: 'low', 'medium', 'high', 'xhigh', and 'max'.
  * So it stays an explicit per-family opt-in instead of riding along with the
- * extended range above. Both entries below were confirmed to accept it on
- * 2026-09-04; guessing wrong here is a hard 400, not a downgrade.
+ * extended range above. GPT-5.6 Sol/Terra/Luna and Daybreak Blue were confirmed on
+ * the Codex backend; GPT-6 Sol and Luna document `none` support in their API model
+ * guides. Guessing wrong here is a hard 400, not a downgrade.
  */
 function supportsNoneEffort(modelId: string): boolean {
   // Deliberately narrower than the extended-range rule above: only the colours
   // actually confirmed to accept it, not every gpt-daybreak-* alias.
-  return /^gpt-5\.6(?:-|$)/i.test(modelId) || /^gpt-daybreak-blue(?:-|$)/i.test(modelId);
+  return /^gpt-5\.6(?:-|$)/i.test(modelId)
+    || /^gpt-6-(?:sol|luna)(?:-|$)/i.test(modelId)
+    || /^gpt-daybreak-blue(?:-|$)/i.test(modelId);
 }
 
 // gpt-5.3-codex-spark rejects `reasoning.summary` outright:

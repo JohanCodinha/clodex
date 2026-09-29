@@ -130,6 +130,25 @@ align the builds and re-run `clodex patch`; re-run it after favorites or patch c
 as well. Equal version labels are not enough because supported same-version distributions have
 shipped different bytes.
 
+The wrapper stays silent about that drift beyond its one output-channel line, by design: it runs on
+every spawn and must stay fast and fail-open. The loud warning lives in the two user-run commands
+instead (#257): `clodex patch` (after a successful patch and on the "already patched" no-op, which
+is the run a user makes after the extension self-updated) and `clodex install-vscode-launcher` (on
+every platform, against the manifest's `claudeVersion`/`binaryPath`; no manifest, no check).
+`src/editor-extension-version.ts` reads the installed version from each editor's default extensions
+directory under `os.homedir()` — VS Code, Insiders, `.vscode-server`, VSCodium, Cursor, Windsurf —
+preferring `extensions.json` (superseded version directories linger) and falling back to a numeric
+version sort of `anthropic.claude-code-<version>[-<platform>]` directories minus `.obsolete`. It
+only reads, prints nothing when no editor has the extension, and compares version labels only, so
+its silence is not proof of equal bytes. The fix command follows the patched install: a global
+npm install gets `npm install -g @anthropic-ai/claude-code@<v>` — decided by comparing the patched
+path against `npm root -g` (spawned once, only when a warning is printed; a shell on Windows for
+`npm.cmd`; any failure means the generic text), because a path-shape rule also matched Claude Code's
+npm-local `~/.claude/local/node_modules`, project `node_modules`, and other Node versions' roots,
+none of which `npm install -g` updates. The native installer (`.local/share/claude/versions/<v>`)
+gets `claude install <v>`; anything else gets a generic instruction naming the path. Every variant
+ends with `clodex patch` on its own line (Windows PowerShell 5.1 rejects `&&`).
+
 **The wrapper must `exec` into claude (`process.execve`), never spawn it as a child.** Claude Code
 starts each background pty host with `detached: true`, then delivers resizes to that process group
 via `process.kill(-process.pid, 'SIGWINCH')`. A wrapper that parents claude keeps the group-leader
@@ -262,13 +281,44 @@ model-list and models.dev refresh, AI-SDK upstream calls) honors those variables
 otherwise it uses a direct `Agent`. Pinning fetch to HTTP/1.1 prevents Node 26's bundled undici 8
 from retaining a destroyed pooled HTTP/2 session and failing every later request to that origin.
 
-Transports that do not use the undici dispatcher share the same resolver: the `ws`-based OAuth
-Responses WebSocket gets an `https-proxy-agent` CONNECT tunnel via `outboundWsProxyAgent()`, and the
-raw first-party passthrough creates one keep-alive `outboundHttpProxyAgent()` synchronously after
-the local bridge binds and reuses it. If the resolved proxy URL names that same listener — by exact
-address, loopback alias, or a local interface behind a wildcard bind — raw passthrough warns and
-connects directly rather than recursively tunnelling through itself. Malformed proxy URLs also warn
-and fall back to direct connections.
+Three transports do not use the undici dispatcher and share the same resolver instead:
+
+- The `ws`-based OAuth Responses WebSocket gets an `https-proxy-agent` CONNECT tunnel via
+  `outboundWsProxyAgent()`.
+- The raw first-party Anthropic passthrough creates one keep-alive `outboundHttpProxyAgent()`
+  synchronously after the local bridge binds and reuses it.
+- Proxy mode's **pass-through CONNECT tunnels** — every `CONNECT` the MITM listener does not
+  intercept, which in proxy mode is all of the child's non-Anthropic web traffic, since the child's
+  `HTTPS_PROXY` points at that listener. `startHttpProxy` keeps a `Map` of
+  `outboundHttpProxyAgent()` instances keyed by resolved proxy URL and calls `agent.connect()` per
+  CONNECT (a fresh socket each time, so sharing is safe); the map is destroyed and cleared on close.
+  Without the agent the handler falls back to the direct `net.connect()` it always used.
+
+Each of the three resolves its proxy per target, so `NO_PROXY` still applies. The raw passthrough
+and CONNECT handler guard against naming the local listener — by exact address, literal loopback
+spellings (including `localhost.` and IPv4-mapped IPv6), or a local interface behind a wildcard
+bind — and connect directly rather than recursively tunnelling through themselves. For other
+aliases and A→B→A cycles, the CONNECTs from the raw passthrough, pass-through tunnels, and WebSocket
+agents carry a per-process random `x-clodex-proxy-hop` header. The CONNECT handler refuses its own
+marker with HTTP 508 only where it would otherwise re-dial through the outbound proxy, and emits a
+diagnostic naming the proxy env var; a literal self-target instead tunnels direct. An unrecognized
+marker is ignored. Undici fetch CONNECTs do not carry the marker: if a fetch enters a loop, the
+listener's next CONNECT uses a marked agent and terminates it. Inbound marker values are removed
+before forwarding to the real upstream, including raw Anthropic requests and upgrades. The plain
+HTTP and intercepted TLS refusal sites are defence-in-depth for manually supplied markers, not
+reachable loops from clodex's own CONNECT headers. With `NODE_USE_ENV_PROXY=1`, forwarded plain-HTTP
+requests can still loop even when `HTTP_PROXY` uses literal `127.0.0.1` (see #285). A middle
+proxy that removes the header, or that originates its own CONNECT instead of relaying ours
+(including another clodex), defeats this guard;
+only literal spellings remain protected in that case. The passthrough agent checks once at bind
+time; the CONNECT handler must re-check per request and reads `proxyServer.address()` **inside the
+handler rather than caching it at startup**, because `listenTcpServer` resolves `listen()` and only
+then probes the port, so a CONNECT arriving during that probe would find an unset cache and disarm
+the guard. Its warning is emitted once per server.
+
+Malformed proxy URLs also warn and fall back to direct connections. All of these warnings go through
+`emitParentNotice`, not `console.error`: the CONNECT paths fire while the spawned Claude Code owns
+the terminal and `launchClaude` has muted the parent's stderr, so a bare write would never be seen.
 
 Claude Code's own `NO_PROXY` matcher has two behaviors worth knowing before changing this area:
 `no_proxy || NO_PROXY` means **lowercase wins outright — do not union the casings**, and `*` is
