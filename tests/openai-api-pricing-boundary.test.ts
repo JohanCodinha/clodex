@@ -205,6 +205,23 @@ describe('OpenAI API-key pricing boundaries', () => {
     expect(projected.map(model => model.pricingBoundary)).toEqual([undefined, 272_000, undefined]);
   });
 
+  it('gives GitHub Copilot GPT models no OpenAI pricing band although they use the OpenAI SDK', () => {
+    // Copilot bills per request, not per token, yet its Responses-transport GPT
+    // models carry `npm: '@ai-sdk/openai'` pointed at Copilot's own API. A band
+    // here would warn Copilot users about OpenAI surcharges they never pay.
+    const copilot: RegistryProvider = {
+      ...provider([
+        oldCache('gpt-5.6-sol', { npm: '@ai-sdk/openai', contextWindow: 272_000 }),
+        oldCache('gpt-6-astra', { npm: '@ai-sdk/openai', contextWindow: 272_000 }),
+      ], '@ai-sdk/openai-compatible'),
+      id: 'github-copilot', templateId: 'github-copilot', name: 'GitHub Copilot', authType: 'oauth',
+    };
+    copilot.api.url = 'https://api.business.githubcopilot.com';
+    const projected = projectProviderCachedModels(copilot);
+    expect(projected.map(model => model.pricingBoundary)).toEqual([undefined, undefined]);
+    expect(projected.map(model => model.pricingBoundaryNote)).toEqual([undefined, undefined]);
+  });
+
   it('carries old-cache pricing boundaries into proxy routes without reducing the full context window', () => {
     withRegistryWriteLockSync(() => saveRegistry({
       version: 1, providers: [provider([

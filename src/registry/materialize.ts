@@ -24,6 +24,7 @@ import {
   retainedOpenCodeGoTemplate,
 } from './resolve-template.js';
 import { classifyFreeStatus, isFreeStatus } from '../free-models.js';
+import { GITHUB_COPILOT_PROVIDER_ID } from '../github-copilot.js';
 import {
   OPENROUTER_PROVIDER_ID,
   projectOpenRouterModelTransport,
@@ -82,9 +83,13 @@ export function projectProviderCachedModels(provider: RegistryProvider): CachedM
     const template = retainedOpenCodeGoTemplate();
     return template ? applyTemplateModelMetadata(template, cached) : [];
   }
-  if (resolveProviderTemplate(provider)?.id === OPENROUTER_PROVIDER_ID) {
+  const templateId = resolveProviderTemplate(provider)?.id;
+  if (templateId === OPENROUTER_PROVIDER_ID) {
     return cached.map(model => projectOpenRouterModelTransport(model, provider.api.url));
   }
+  // Copilot bills per request, not per token, but its Responses-transport GPT
+  // models use the OpenAI SDK against Copilot's API — the SDK is no price signal.
+  if (templateId === GITHUB_COPILOT_PROVIDER_ID) return cached;
   if (!cached.some(model => (model.npm ?? provider.api.npm) === '@ai-sdk/openai')) return cached;
   return cached.map(model => {
     // A compatible endpoint can use the same ids without OpenAI's prices.
