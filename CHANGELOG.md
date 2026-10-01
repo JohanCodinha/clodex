@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.18.7](https://github.com/bman654/clodex/compare/v2.18.6...v2.18.7) (2026-09-30)
+
+
+### Bug Fixes
+
+* **providers:** allow self-hosted model servers reached over Tailscale or HTTPS on your LAN ([#305](https://github.com/bman654/clodex/issues/305)) ([9de5845](https://github.com/bman654/clodex/commit/9de5845cace41496e22a32bb4989c3598538fb3d))
+* **providers:** let servers added without an API key refresh their model list ([#306](https://github.com/bman654/clodex/issues/306)) ([c320aef](https://github.com/bman654/clodex/commit/c320aef015b702ada971c55f448e7aa57e329d2b))
+
+## [2.18.6](https://github.com/bman654/clodex/compare/v2.18.5...v2.18.6) (2026-09-30)
+
+
+### Bug Fixes
+
+* **models:** hide ChatGPT-plan models clodex's version cannot use yet, so requests don't fail ([#303](https://github.com/bman654/clodex/issues/303)) ([76e69da](https://github.com/bman654/clodex/commit/76e69da81c1f49c031349e1e1adc212f93983fdc))
+
+## [2.18.5](https://github.com/bman654/clodex/compare/v2.18.4...v2.18.5) (2026-09-30)
+
+
+### Bug Fixes
+
+* **models:** add GPT-6 Luna on OpenCode Go and stop GPT-6.1 Sol failing on ChatGPT plans ([#300](https://github.com/bman654/clodex/issues/300)) ([0674978](https://github.com/bman654/clodex/commit/0674978a11509bea88badf85670acdc7c7b80836))
+
 ## [2.18.4](https://github.com/bman654/clodex/compare/v2.18.3...v2.18.4) (2026-09-28)
 
 

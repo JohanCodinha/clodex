@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { materializeRegistry, projectProviderCachedModels } from '../src/registry/materialize.js';
 import { buildOpenAiOAuthModels } from '../src/data/openai-oauth-models.js';
+import { resetContextStops, setSessionContextStops } from '../src/context-modes.js';
 import type { CachedModel, ProviderRegistry, RegistryProvider } from '../src/registry/types.js';
 
 /**
@@ -218,12 +219,28 @@ describe('legacy OAuth cache overlay', () => {
     expect(windows.get('o3')).toBe(200_000);
     expect(windows.get('o1-mini')).toBe(128_000);
     expect(windows.get('gpt-6-astra')).toBe(272_000);
+    expect(windows.get('gpt-6.1-sol')).toBe(272_000);
     expect(windows.get('gpt-6-sol')).toBe(272_000);
     expect(windows.get('gpt-6-luna')).toBe(272_000);
     // Not declared, but a heuristic rule claims it.
     expect(windows.get('o3-mini')).toBe(1_000_000);
     // Nothing here may be the invented default standing in for a miss.
     expect([...windows.values()].every(w => typeof w === 'number' && w > 0)).toBe(true);
+  });
+
+  it('includes GPT-6.1 Sol with its published output limit and higher-rate boundary', () => {
+    const sol = buildOpenAiOAuthModels().find(model => model.id === 'gpt-6.1-sol');
+    expect(sol).toMatchObject({
+      name: 'GPT-6.1 Sol',
+      maxOutputTokens: 128_000,
+      reasoning: true,
+      pricingBoundary: 272_000,
+      useResponsesLite: true,
+      preferWebSockets: true,
+      minimalClientVersion: '0.159.0',
+      contextWindow: 272_000,
+      maxContextWindow: 872_000,
+    });
   });
 
   // The builder reads `lookupKnownContextWindow`, which reports `undefined` rather than
@@ -309,6 +326,37 @@ function providerWithRows(models: CachedModel[]): RegistryProvider {
 }
 
 describe('Responses-Lite fields missing from an older cache', () => {
+  it('backfills the verified Sol 6.1 transport on the actual launch model', () => {
+    const provider = providerWithRows([bareRow('gpt-6.1-sol')]);
+    expect(projectProviderCachedModels(provider)[0]?.minimalClientVersion).toBe('0.159.0');
+    const registry = {
+      schemaVersion: 4,
+      providers: [provider],
+    } as unknown as ProviderRegistry;
+    const [local] = materializeRegistry(registry, () => 'oauth-token');
+    const sol = local?.models.find(model => model.id === 'gpt-6.1-sol');
+    expect(sol).toMatchObject({
+      contextWindow: 272_000,
+      useResponsesLite: true,
+      preferWebSockets: true,
+    });
+  });
+
+  it('lets the max stop reach the seeded Sol 6.1 ceiling on the launch model', () => {
+    const registry = {
+      schemaVersion: 4,
+      providers: [providerWithRows([bareRow('gpt-6.1-sol')])],
+    } as unknown as ProviderRegistry;
+    setSessionContextStops({ 'openai-oauth:gpt-6.1-sol': 'max' });
+    try {
+      const [local] = materializeRegistry(registry, () => 'oauth-token');
+      const sol = local?.models.find(model => model.id === 'gpt-6.1-sol');
+      expect(sol).toMatchObject({ contextWindow: 872_000, contextStop: 'max' });
+    } finally {
+      resetContextStops();
+    }
+  });
+
   it.each(RESPONSES_LITE_IDS)('backfills the flags and standard window for %s', id => {
     const model = projectProviderCachedModels(providerWithRows([bareRow(id)]))[0];
     expect(model?.useResponsesLite).toBe(true);
@@ -359,7 +407,7 @@ describe('Responses-Lite fields missing from an older cache', () => {
 
   // The catalog does report these fields, so whatever it sent is a provider answer.
   // `false` must survive: a truthiness fallback would silently turn it back on.
-  it.each(['gpt-6-sol', 'gpt-5.6-sol', 'gpt-5.6-terra'])(
+  it.each(['gpt-6.1-sol', 'gpt-6-sol', 'gpt-5.6-sol', 'gpt-5.6-terra'])(
     'keeps explicit false flags and an explicit window for %s', id => {
       const row = bareRow(id, {
         useResponsesLite: false,

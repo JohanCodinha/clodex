@@ -209,6 +209,7 @@ describe('getReasoningCapabilities', () => {
   // test still green. astra omits 'none' because the backend rejects it.
   it.each([
     ['gpt-6-astra', ['low', 'medium', 'high', 'xhigh', 'max']],
+    ['gpt-6.1-sol', ['low', 'medium', 'high', 'xhigh', 'max']],
     ['gpt-daybreak-blue-latest', ['none', 'low', 'medium', 'high', 'xhigh', 'max']],
     ['gpt-7-example', ['low', 'medium', 'high', 'xhigh', 'max']],
     ['gpt-5.6-sol', ['none', 'low', 'medium', 'high', 'xhigh', 'max']],
@@ -238,6 +239,7 @@ describe('getReasoningCapabilities', () => {
   // availability differs WITHIN the extended-range families.
   it.each([
     ['gpt-6-astra', false],
+    ['gpt-6.1-sol', false],
     ['gpt-daybreak-blue-latest', true],
     ['gpt-5.6-sol', true],
     ['gpt-6-sol', true],
@@ -682,8 +684,8 @@ describe('createLanguageModel', () => {
     vi.doUnmock('@ai-sdk/openai');
   });
 
-  // OpenCode Go serves Muse Spark only on /v1/responses. An API-key Responses
-  // route that dropped its base URL would default to api.openai.com and send
+  // OpenCode Go serves Muse Spark and GPT-6 Luna only on /v1/responses.
+  // An API-key route that dropped its base URL would default to api.openai.com and send
   // the Go key there, so the destination is asserted, not assumed.
   it('passes the configured base URL on an API-key Responses route', async () => {
     vi.resetModules();

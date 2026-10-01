@@ -31,7 +31,7 @@ describe('ChatGPT OAuth model seeds', () => {
   });
 
   it('lists the newest family first so the picker leads with it', () => {
-    expect(buildOpenAiOAuthModels()[0]?.id).toBe('gpt-6-astra');
+    expect(buildOpenAiOAuthModels()[0]?.id).toBe('gpt-6.1-sol');
   });
 });
 
