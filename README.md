@@ -274,16 +274,15 @@ The suffix only means something on ChatGPT/Codex OAuth models. On GitHub Copilot
 OpenRouter, an OpenAI API key, or any other provider, a name ending in `-fast` is
 just a name.
 
-Two further limits, both shared with `--fast`:
+The OpenAI SDK only sends `service_tier` for models it recognises as supporting
+priority processing. With `@ai-sdk/openai` 4.0.11 that allowlist is `gpt-4*`,
+`gpt-5*` (excluding `-nano` and `-chat`), `o3*` and `o4-mini*`, which leaves out
+every `gpt-6*` model. On ChatGPT/Codex OAuth routes clodex writes the tier back
+into the request itself, so `gpt-6-astra` and `gpt-6.1-sol` run fast too.
 
-- The OpenAI SDK will not send `service_tier` for a model it does not recognise as
-  supporting priority processing. With `@ai-sdk/openai` 4.0.11 that allowlist is
-  `gpt-4*`, `gpt-5*` (excluding `-nano` and `-chat`), `o3*` and `o4-mini*` — so
-  `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` and `gpt-5.3-codex` are sent,
-  while `gpt-6-astra` is not. When the SDK drops it, clodex warns once and the
-  backend default is used.
-- A request diagnostic records the tier clodex resolved before dispatch. That is
-  requested intent, not proof of what the provider billed.
+A request diagnostic records the tier clodex resolved before dispatch, for a
+`-fast` alias and for `--fast` alike. That is requested intent, not proof of what
+the provider billed.
 
 #### Context stops and the pricing boundary
 
@@ -427,9 +426,10 @@ clodex --version    # version
   the same environment before a dry-run preview. A saved `-fast` alias overrides
   both for the requests addressed to it — see
   [per-alias fast mode](#per-alias-codex-fast-mode). Request diagnostics record
-  this pre-dispatch intent, not proof of wire serialization. If the provider
-  SDK reports that it omitted the tier for a model, clodex warns once and the
-  backend default remains in use.
+  this pre-dispatch intent, not proof of wire serialization. The OpenAI SDK
+  omits the tier for models outside its own list, every `gpt-6*` among them;
+  clodex restores it on these routes. If a tier is still omitted, clodex warns
+  once and the backend default remains in use.
 - **Outbound proxy:** when `HTTP_PROXY`/`HTTPS_PROXY` (and optionally `NO_PROXY`) are set in clodex's environment, all clodex-originated network calls honor them — OAuth sign-in and token refresh, model-list and models.dev refreshes, upstream OpenAI API calls, and the ChatGPT/Codex OAuth WebSocket transport (tunneled via HTTP CONNECT). In proxy mode this also covers the web traffic Claude Code itself makes through the clodex proxy, so web fetches and searches work behind a corporate proxy instead of failing on a blocked direct connection. clodex's CONNECT requests for passthrough tunnels and WebSockets to that proxy carry an `x-clodex-proxy-hop` header with a random per-process ID to detect proxy loops, and the header is never sent to the destination.
 - **Provider timeouts:** `CLODEX_UPSTREAM_IDLE_TIMEOUT_MS` controls how long an
   SDK-backed translated stream may produce no event (default `120000`; range

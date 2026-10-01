@@ -17,6 +17,17 @@ hand-rolled per-provider translation. Preserved hard-won behavior:
   responses in testing.
 - Cache reads and GPT-5.6 cache writes map to Anthropic
   `cache_read_input_tokens`/`cache_creation_input_tokens`.
+- **ChatGPT/Codex OAuth Responses models carry the Codex service tier past the SDK.**
+  `@ai-sdk/openai` deletes `service_tier: priority` for ids outside its own list (`gpt-4*`,
+  `gpt-5*`, `o3*`, `o4-mini*`), which silently ran every `gpt-6*` `-fast` alias at normal speed
+  although the Codex catalog offers them the Fast tier. `codexServiceTierMiddleware` moves the
+  resolved tier into a private header, `withCodexServiceTier` writes it back into the body
+  ahead of the WebSocket transport and strips the header, and the SDK's "unsupported
+  serviceTier" warning is dropped so `reportUnsupportedServiceTier` does not announce a tier
+  that was sent. Codex echoes `service_tier: "default"` in its response whichever tier ran
+  (seen for GPT-5.6 Sol, whose tier the SDK always sent, on 2026-10-01), so speed is the only
+  signal: 303 output tokens streamed in ~4.75 s on the Fast tier versus ~9.0 s without, for
+  `gpt-6.1-sol` and `gpt-6-astra`.
 - **On OpenRouter routes, translated requests carry an `x-session-id` header** so OpenRouter can
   keep a conversation on one upstream provider; its prompt-caching guide names the header as its
   sticky routing key. The value is Claude Code's session UUID put through
