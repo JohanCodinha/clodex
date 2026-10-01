@@ -1161,10 +1161,12 @@ export function effortProviderOptions(
 
   if (npm === '@ai-sdk/openai' || npm === '@ai-sdk/azure') {
     // A catalog-declared ladder (GitHub Copilot's Grok, gpt-5-mini) wins over
-    // the id-pattern rules, which only know OpenAI's own model names.
+    // the id-pattern rules, which only know OpenAI's own model names. The ladder
+    // says the model reasons; without forceReasoning the SDK, not knowing the id,
+    // drops the effort from the Responses request (Grok, OpenCode Go's gpt-6-luna).
     if (modelId && metadata?.compatibility?.reasoningEffortMap) {
       const reasoningEffort = compatibilityReasoningEffort(effort, modelId, metadata.compatibility);
-      return reasoningEffort ? { openai: { reasoningEffort } } : undefined;
+      return reasoningEffort ? { openai: { reasoningEffort, forceReasoning: true } } : undefined;
     }
     // The id pattern list predates gpt-6 and the codenamed aliases, so on its own it
     // silently dropped the user's effort for both. Widen it by FAMILY rather than by

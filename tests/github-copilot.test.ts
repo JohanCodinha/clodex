@@ -644,7 +644,7 @@ describe('copilot effort and fast mode from the catalog', () => {
   // effort at all; the catalog ladder has to win in the OpenAI SDK branch.
   it('sends the catalog effort for Responses models the id rules do not know', () => {
     const metadata = { providerId: 'github-copilot', compatibility: byId['grok-4.6']!.compatibility };
-    expect(effortProviderOptions('@ai-sdk/openai', 'xhigh', 'grok-4.6', metadata)).toEqual({ openai: { reasoningEffort: 'xhigh' } });
+    expect(effortProviderOptions('@ai-sdk/openai', 'xhigh', 'grok-4.6', metadata)).toEqual({ openai: { reasoningEffort: 'xhigh', forceReasoning: true } });
     // A level the model does not offer is not sent rather than guessed.
     expect(effortProviderOptions('@ai-sdk/openai', 'max', 'grok-4.6', metadata)).toBeUndefined();
     // Without a catalog ladder the OpenAI rules are untouched.
