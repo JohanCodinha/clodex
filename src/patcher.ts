@@ -211,21 +211,19 @@ export function buildPatchModelConfig(
       alias: source,
       reason: 'target-not-favorite',
     })));
-  const aliasByFavorite = new Map(
-    normalizedAliases.aliases
-      .filter(alias => favoriteTargets.has(`${alias.providerId}:${alias.modelId}`))
-      .map(alias => [
-        `${alias.providerId}:${alias.modelId}`,
-        alias.name,
-      ]),
-  );
+  const aliasesByFavorite = new Map<string, string[]>();
+  for (const alias of normalizedAliases.aliases) {
+    const target = `${alias.providerId}:${alias.modelId}`;
+    if (!favoriteTargets.has(target)) continue;
+    aliasesByFavorite.set(target, [...(aliasesByFavorite.get(target) ?? []), alias.name]);
+  }
 
   for (const favorite of favorites) {
     const id = stripOneMContextSuffix(httpProxyModelId(favorite.providerId, favorite.modelId));
     if (config[id]) continue;
     const meta = modelMetaFor(favorite.providerId, favorite.modelId);
     const context = meta?.contextWindow;
-    const alias = aliasByFavorite.get(`${favorite.providerId}:${favorite.modelId}`);
+    const [alias, ...moreAliases] = aliasesByFavorite.get(`${favorite.providerId}:${favorite.modelId}`) ?? [];
     const entry: PatchScriptModelConfig[string] = {};
     if (alias) entry.alias = alias;
     // An absent window and an explicit 200_000 must keep producing the SAME entry: both
@@ -240,6 +238,13 @@ export function buildPatchModelConfig(
     if (effort) entry.effort = effort;
     config[id] = entry;
     if (meta) metaById[id] = meta;
+    // Each further alias of the same model (`sol` beside `sol-fast`) is an identity
+    // of its own in the binary, so it gets its own entry, keyed by its name. That
+    // key cannot collide with a canonical id: alias names never contain `:`.
+    for (const name of moreAliases) {
+      config[name] = { ...entry, alias: name };
+      if (meta) metaById[name] = meta;
+    }
   }
   return {
     config,

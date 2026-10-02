@@ -463,7 +463,12 @@ relocates the Bun section and strands its old copy; that is independent of the r
   context-window map (PATCH 7). Subagent/skill/agent `model:` frontmatter is validated against
   that same enum, so injecting canonical ids made `model: sol` fail with InputValidationError.
   Favorites with no alias fall back to their canonical id as the identity (enum + validator +
-  context map only; no resolver case, no picker entry).
+  context map only; no resolver case, no picker entry). A favorite with several aliases (`sol`
+  beside `sol-fast`) has one identity per alias: `buildPatchModelConfig` keeps the first saved on
+  the canonical-id entry and gives each further one an entry keyed by its own name, which cannot
+  collide with a canonical id because alias names never contain `:`. A one-entry map from target
+  to alias used to keep only the last, so a `-fast` alias hid its plain twin from the picker and
+  the Agent tool. The config hash moves only for favorites with more than one alias.
 - **PATCH 6 (alias resolver switch) maps each alias to ITSELF.** The case must exist — the switch's
   `default:` returns null — but resolving to the canonical id would make Claude Code send one name
   while looking its context window up under another. That is the same mismatch as the response-echo

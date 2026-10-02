@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { applyClodexPatches, type PatchScriptModelConfig } from '../src/patch-transforms.js';
+import { buildPatchModelConfig } from '../src/patcher.js';
 import { CLAUDE_FIXTURE, PICKER_ENTRY_POINT } from './fixtures/claude-bundle.js';
 
 // PATCH 11 injects the clodex rows at the /model picker's entry point, where the served-catalog
@@ -147,5 +148,37 @@ describe('PATCH 11: catalog picker options', () => {
     expect(result.results.find(r => r.name === 'PATCH 11: catalog picker options'))
       .toEqual({ status: 'FAIL', name: 'PATCH 11: catalog picker options', extra: 'anchor not found' });
     expect(result.content).toContain(drifted);
+  });
+
+  // A `-fast` alias is saved BESIDE the plain one for the same model, so one agent can run fast
+  // while the rest of the session does not. Both are identities Claude Code must offer: built
+  // from the saved preferences, not from a hand-written config, because the one-alias-per-model
+  // map that dropped the plain name lived in buildPatchModelConfig.
+  describe('two aliases for one model', () => {
+    const favorite = { providerId: 'openai-oauth', modelId: 'gpt-6.1-sol' };
+    const display = 'GPT-6.1 Sol (OpenAI (ChatGPT))';
+    const { config } = buildPatchModelConfig(
+      [favorite],
+      [{ name: 'gpt-6.1-sol', ...favorite }, { name: 'gpt-6.1-sol-fast', ...favorite }],
+      () => ({ contextWindow: 272_000, displayName: display }),
+    );
+    const patched = applyClodexPatches(CLAUDE_FIXTURE, config);
+    const row = (value: string) => ({ value, label: value.charAt(0).toUpperCase() + value.slice(1), description: display });
+
+    it('applies every patch site', () => {
+      expect(patched.results.filter(r => r.status !== 'OK')).toEqual([]);
+    });
+
+    it('lists both in the /model picker', () => {
+      expect(runPicker(patched.content, SERVED).rows)
+        .toEqual([...SERVED, row('gpt-6.1-sol'), row('gpt-6.1-sol-fast')]);
+    });
+
+    it('offers both to the Agent tool and gives both the model\'s context window', () => {
+      const agentEnum = JSON.parse(/\.enum\((\[[^\]]*\])\)\.optional\(\)/.exec(patched.content)![1]!) as string[];
+      expect(agentEnum).toEqual(expect.arrayContaining(['gpt-6.1-sol', 'gpt-6.1-sol-fast']));
+      const windows = JSON.parse(/\/\*ccpatch:ctx\*\/var _ccw=\((\{[^}]*\})\)/.exec(patched.content)![1]!) as Record<string, number>;
+      expect(windows).toMatchObject({ 'gpt-6.1-sol': 272_000, 'gpt-6.1-sol-fast': 272_000 });
+    });
   });
 });

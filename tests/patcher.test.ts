@@ -154,6 +154,41 @@ describe('buildPatchModelConfig', () => {
     expect(unknownWindows).toEqual(['clodex:openai:mystery-model']);
   });
 
+  // `sol` and `sol-fast` name the same model; the second used to overwrite the first, so only
+  // one of them reached the picker and the Agent tool.
+  it('gives every alias of one model its own entry, the first on the canonical id', () => {
+    const favorite = { providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' };
+    const { config, metaById, unknownWindows } = buildPatchModelConfig(
+      [favorite],
+      [{ name: 'sol', ...favorite }, { name: 'sol-fast', ...favorite }],
+      (providerId, modelId) => meta.get(`${providerId}:${modelId}`),
+    );
+    const shared = {
+      context: 272_000,
+      display: 'GPT-5.6 Sol (OpenAI (ChatGPT))',
+      effort: { levels: ['low', 'medium', 'high', 'xhigh', 'max'], defaultLevel: 'high' },
+    };
+    expect(config).toEqual({
+      'clodex:openai-oauth:gpt-5.6-sol': { alias: 'sol', ...shared },
+      'sol-fast': { alias: 'sol-fast', ...shared },
+    });
+    expect(Object.keys(config)).toEqual(['clodex:openai-oauth:gpt-5.6-sol', 'sol-fast']);
+    expect(metaById['sol-fast']).toBe(metaById['clodex:openai-oauth:gpt-5.6-sol']);
+    expect(unknownWindows).toEqual([]);
+  });
+
+  // The key a single alias already had is what an existing patch is hashed on.
+  it('leaves a model with one alias keyed exactly as before', () => {
+    const favorite = { providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' };
+    const { config } = buildPatchModelConfig(
+      [favorite],
+      [{ name: 'sol-fast', ...favorite }],
+      (providerId, modelId) => meta.get(`${providerId}:${modelId}`),
+    );
+    expect(Object.keys(config)).toEqual(['clodex:openai-oauth:gpt-5.6-sol']);
+    expect(config['clodex:openai-oauth:gpt-5.6-sol']?.alias).toBe('sol-fast');
+  });
+
   it('omits context when the window equals the 200k default', () => {
     const { config, unknownWindows } = buildPatchModelConfig(
       [{ providerId: 'openai', modelId: 'davinci-002' }],
