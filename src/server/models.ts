@@ -7,6 +7,7 @@ import { maskGatewayModelId } from './vendor-mask.js';
 import type { FreeStatus } from '../free-models.js';
 import type { ModelAlias } from '../types.js';
 import type { ModelRuntimeCompatibility } from '../model-runtime-compatibility.js';
+import { resolveAliasDaybreak, type AccessPrograms, type CyberAccessProgram } from '../daybreak.js';
 
 export interface GatewayModelOptions {
   maskGatewayIds?: boolean;
@@ -49,6 +50,10 @@ export interface ServerModelInfo {
   preferWebSockets?: boolean;
   /** Provider-neutral per-model wire quirks. */
   compatibility?: ModelRuntimeCompatibility;
+  /** Access programs the ChatGPT Codex catalog offers this account for the model. */
+  cyberAccessPrograms?: CyberAccessProgram[];
+  /** Responses `access_programs` to send; set only on the copy a Daybreak alias resolves to. */
+  accessPrograms?: AccessPrograms;
   /** Fallback reasoning effort when the client omits output_config.effort. */
   defaultEffort?: string;
   contextWindow?: number;
@@ -67,6 +72,8 @@ export interface ServerModelInfo {
 export interface ModelCatalog {
   get: (id: string) => ServerModelInfo | undefined;
   list: () => ServerModelInfo[];
+  /** Why a saved alias this catalog will not serve is refused, if it is one. */
+  refusal?: (id: string) => string | undefined;
 }
 
 const CREATED_AT_ISO = '2025-01-01T00:00:00Z';
@@ -163,7 +170,9 @@ export function formatGatewayAnthropicModels(models: ServerModelInfo[], opts?: G
  *   3. the canonical `clodex:{provider}:{model}` id (same spelling the
  *      proxy-mode MITM routes on);
  *   4. saved short aliases from `clodex models --alias` (same alias table the
- *      proxy resolves) — anything else is a 400.
+ *      proxy resolves) — anything else is a 400. A Daybreak alias resolves to
+ *      a copy of its target carrying the program; one whose Daybreak opt-in
+ *      cannot be met is not mapped, and `refusal` names why.
  * Forms 3-4 are accepted INPUT only: `list()` (and every /models listing built
  * from it) still advertises exactly the canonical/masked ids it always did.
  */
@@ -186,18 +195,33 @@ export function createGatewayModelCatalog(
     const canonicalId = httpProxyModelId(gatewayProviderId(model), model.id);
     if (!byId.has(canonicalId)) byId.set(canonicalId, model);
   }
+  const refusals = new Map<string, string>();
   for (const alias of normalizeModelAliases(modelAliases).aliases) {
     if (byId.has(alias.name)) continue;
-    const target = models.find(
-      model => gatewayProviderId(model) === alias.providerId && model.id === alias.modelId,
-    );
-    if (target) byId.set(alias.name, target);
+    const target = gatewayAliasTarget(models, alias);
+    if (!target) continue;
+    const daybreak = gatewayAliasDaybreak(alias, target);
+    if (daybreak.kind === 'on') byId.set(alias.name, { ...target, accessPrograms: daybreak.accessPrograms });
+    else if (daybreak.kind === 'off') byId.set(alias.name, target);
+    else refusals.set(alias.name, daybreak.reason);
   }
 
   return {
     get: (id: string) => byId.get(id),
     list: () => [...models],
+    refusal: (id: string) => refusals.get(id),
   };
+}
+
+export function gatewayAliasTarget(
+  models: readonly ServerModelInfo[],
+  alias: Pick<ModelAlias, 'providerId' | 'modelId'>,
+): ServerModelInfo | undefined {
+  return models.find(model => gatewayProviderId(model) === alias.providerId && model.id === alias.modelId);
+}
+
+export function gatewayAliasDaybreak(alias: Pick<ModelAlias, 'daybreak' | 'modelId'>, target: ServerModelInfo) {
+  return resolveAliasDaybreak(alias, { ...target, modelId: alias.modelId });
 }
 
 /** Model id to send upstream (OpenCode / provider API), not the gateway alias. */

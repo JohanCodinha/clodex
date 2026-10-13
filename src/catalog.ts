@@ -12,6 +12,7 @@ import {
   normalizeModelAliases,
 } from './model-aliases.js';
 import { isSdkMigratedNpm } from './provider-factory.js';
+import { resolveAliasDaybreak } from './daybreak.js';
 import { aliasModelId } from './proxy.js';
 import type { ProxyModelAlias, ProxyRoute } from './proxy.js';
 import type {
@@ -56,6 +57,7 @@ export function localModelToRoute(lp: LocalProvider, model: LocalProviderModel):
     useResponsesLite: model.useResponsesLite,
     preferWebSockets: model.preferWebSockets,
     compatibility: model.compatibility,
+    cyberAccessPrograms: model.cyberAccessPrograms,
   };
 }
 
@@ -79,12 +81,15 @@ export function resolveCatalogModelAliases(
     catalogRoutes.map(route => normalizeRouteLookupId(route.aliasId)),
   );
   return [
-    ...normalized.accepted.map(({ alias, source, sources }) => {
+    ...normalized.accepted.map(({ alias, source, sources }): ProxyModelAlias => {
       const route = resolveRoute(alias.providerId, alias.modelId);
       const collidesWithCatalog = catalogRouteIds.has(
         normalizeRouteLookupId(alias.name),
       );
       const sourceNames = [...new Set(sources.map(entry => entry.name))];
+      const daybreak = route
+        ? resolveAliasDaybreak(alias, { ...route, modelId: alias.modelId })
+        : { kind: 'off' as const };
       return {
         name: alias.name,
         ...(source.name === alias.name ? {} : { savedName: source.name }),
@@ -97,9 +102,13 @@ export function resolveCatalogModelAliases(
         ...(
           collidesWithCatalog
             ? { unavailableReason: 'conflicts with a catalog model id' }
-            : route
-              ? {}
-              : { unavailableReason: 'target unavailable' }
+            : !route
+              ? { unavailableReason: 'target unavailable' }
+              : daybreak.kind === 'unavailable'
+                ? { unavailableReason: daybreak.reason }
+                : daybreak.kind === 'on'
+                  ? { accessPrograms: daybreak.accessPrograms }
+                  : {}
         ),
       };
     }),
@@ -111,6 +120,40 @@ export function resolveCatalogModelAliases(
       unavailableReason: describeModelAliasRejection(rejection.reason),
     })),
   ];
+}
+
+/**
+ * Daybreak aliases for a single-model launch. That launch answers every model id
+ * it does not know with its one model, so without these entries a Daybreak alias
+ * would be served without its program. An alias for the launched model gets its
+ * program (or its refusal); one for any other model is refused, and so is a
+ * saved name that normalization rejected while it asked for Daybreak in any
+ * form (conflicting duplicates, a non-boolean `daybreak`).
+ * Other aliases keep the single-model fallback they always had.
+ */
+export function singleModelDaybreakAliases(
+  modelAliases: unknown,
+  route: ProxyRoute,
+  target: FavoriteModel,
+): ProxyModelAlias[] {
+  const normalized = normalizeModelAliases(modelAliases);
+  const daybreakNames = new Set([
+    ...normalized.aliases.filter(alias => alias.daybreak).map(alias => alias.name),
+    ...normalized.rejected
+      .filter(alias => alias.daybreak !== undefined && alias.daybreak !== false)
+      .map(alias => canonicalModelAliasName(alias.name)),
+  ]);
+  if (daybreakNames.size === 0) return [];
+  const resolveRoute = (providerId: string, modelId: string) => (
+    providerId === target.providerId && modelId === target.modelId ? route : undefined
+  );
+  return resolveCatalogModelAliases(modelAliases, resolveRoute, [route])
+    .filter(alias => daybreakNames.has(alias.name))
+    .map(alias => (
+      alias.unavailableReason === 'target unavailable'
+        ? { ...alias, unavailableReason: `this launch serves only ${modelAliasTarget(target)}` }
+        : alias
+    ));
 }
 
 /**

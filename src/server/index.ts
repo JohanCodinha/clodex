@@ -25,6 +25,8 @@ import { loadRegistry } from '../registry/io.js';
 import type { ServerModelInfo, GatewayModelOptions } from './models.js';
 import {
   upstreamModelId,
+  gatewayAliasDaybreak,
+  gatewayAliasTarget,
   gatewayProviderId,
   gatewayProviderLabel,
   buildDedupedModelRows,
@@ -171,6 +173,15 @@ export async function loadServerModels(): Promise<ServerModelInfo[]> {
   }
 
   return models.map(enrichServerModelReasoning);
+}
+
+/**
+ * Whether `clodex server --endpoint` answers this name as one of its own model
+ * ids. Those win over saved aliases, so an alias with that name is never used
+ * there.
+ */
+export async function endpointServerAnswersModelId(name: string): Promise<boolean> {
+  return createGatewayModelCatalog(await loadServerModels(), { maskGatewayIds: true }).get(name) !== undefined;
 }
 
 export function enrichServerModelReasoning(model: ServerModelInfo): ServerModelInfo {
@@ -466,6 +477,14 @@ export async function runServerCommand(options: ServerCommandOptions = {}): Prom
   const targetUnavailableAliases = unavailableAliases.filter(({ alias }) => (
     !collidingAliasNames.has(alias.name)
   ));
+  const daybreakUnavailableAliases = normalizedAliases.accepted.flatMap(entry => {
+    if (collidingAliasNames.has(entry.alias.name)) return [];
+    const target = gatewayAliasTarget(models, entry.alias);
+    const daybreak = target ? gatewayAliasDaybreak(entry.alias, target) : undefined;
+    return daybreak?.kind === 'unavailable' ? [{ ...entry, reason: daybreak.reason }] : [];
+  });
+  // A Daybreak alias that cannot be met stays in the catalog's alias table so its
+  // requests are refused with the reason instead of as an unknown model.
   const inactiveAliasNames = new Set([
     ...targetUnavailableAliases.map(({ alias }) => alias.name),
     ...collidingAliasNames,
@@ -480,6 +499,9 @@ export async function runServerCommand(options: ServerCommandOptions = {}): Prom
     ))),
     ...collidingAliases.flatMap(({ sources }) => sources.map(source => (
       `${JSON.stringify(source.name)} — conflicts with a catalog model id`
+    ))),
+    ...daybreakUnavailableAliases.flatMap(({ sources, reason }) => sources.map(source => (
+      `${JSON.stringify(source.name)} — ${reason}`
     ))),
   ];
   if (aliasWarnings.length > 0) {

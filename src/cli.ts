@@ -27,19 +27,21 @@ import { loadRegistry } from './registry/io.js';
 import { projectProviderCachedModels } from './registry/materialize.js';
 import { needsFirstRunSetup, runFirstRunWizard } from './first-run.js';
 import { MAX_MODEL_CATALOG } from './constants.js';
-import { startProxy, startProxyCatalog } from './proxy.js';
+import { singleModelProxyRoute, startProxy, startProxyCatalog } from './proxy.js';
 import type { ProxyHandle, ProxyModelAlias, ProxyRoute } from './proxy.js';
 import {
   buildCatalogRoutes,
   makeRouteResolver,
   resolveCatalogModelAliases,
+  singleModelDaybreakAliases,
 } from './catalog.js';
-import { runServerCommand } from './server/index.js';
+import { endpointServerAnswersModelId, runServerCommand } from './server/index.js';
 import { loadPreferences, savePreferences, recordLaunchSelection, resolveBridgeMode } from './config.js';
 import { pickLocalModel } from './prompts.js';
 import { fetchProviderCatalog, providersForPicker, resolveLocalProviderApiKey } from './provider-catalog.js';
 import { VERSION } from './constants.js';
-import type { ParsedArgs, FavoriteModel, LocalProvider, LocalProviderModel } from './types.js';
+import type { ParsedArgs, FavoriteModel, LocalProvider, LocalProviderModel, ModelAlias } from './types.js';
+import { daybreakProgramLabel } from './daybreak.js';
 import { addFavorite, removeFavorite, isFavorite } from './favorites.js';
 import {
   canonicalModelAliasName,
@@ -75,6 +77,7 @@ import {
 import {
   loadHttpProxyRoutes,
   printHttpProxyModels,
+  resolveDaybreakAliasCandidate,
   reportSkippedHttpProxyFavorites,
   startConfiguredHttpProxy,
 } from './http-proxy/index.js';
@@ -284,6 +287,7 @@ export function parseArgs(args: string[]): ParsedArgs {
       else if (arg === '--list') parsed.favoritesList = true;
       else if (arg === '--json') parsed.favoritesJson = true;
       else if (arg === '--save') parsed.contextSave = true;
+      else if (arg === '--daybreak') parsed.favoritesDaybreak = true;
       else if (arg === '--context' || arg.startsWith('--context=')) {
         const consumed = consumeServerOptionValue(arg, rest, i, '--context', parsed);
         if (!consumed) return parsed;
@@ -598,6 +602,7 @@ ${pc.bold('Usage:')}
   clodex favorites
   clodex models --list
   clodex models --alias sol=clodex:openai-oauth:gpt-6-sol
+  clodex models --alias luna-blue=clodex:openai-oauth:gpt-6-luna --daybreak
   clodex models --unalias sol
   clodex models --context sol=max --save
   clodex models --json
@@ -614,6 +619,11 @@ ${pc.bold('Behavior:')}
   --alias <name=target> saves a short name for a proxy-mode favorite. The
   target is clodex:<provider-id>:<model-id> (the clodex: prefix is optional).
   Alias names are stored lowercase and cannot use client-reserved model names.
+  --daybreak, with --alias, makes requests through that alias use OpenAI's
+  Daybreak cybersecurity access program. ChatGPT/Codex sign-in only; the
+  program comes from your account's model catalog, and the alias is refused
+  if the model doesn't offer Daybreak to your account. Saving the alias again
+  without --daybreak turns it off.
   --unalias <name> removes a saved short name.
   --context <model=stop> chooses how much of a model's window to use. Stops are
   standard (the provider's tuned default), max (its ceiling), default (clear a
@@ -889,6 +899,7 @@ interface FavoritesCommandOptions {
   list?: boolean;
   alias?: string;
   unalias?: string;
+  daybreak?: boolean;
   json?: boolean;
   contextAssignments?: ContextStopAssignment[];
   saveContext?: boolean;
@@ -900,7 +911,15 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
     p.log.error('--alias/--unalias apply one at a time to proxy-mode favorites.');
     return 1;
   }
+  if (opts.daybreak && opts.alias === undefined) {
+    p.log.error('--daybreak applies to --alias.');
+    return 1;
+  }
   const assignments = opts.contextAssignments ?? [];
+  if (changesAlias && (opts.json || assignments.length > 0)) {
+    p.log.error('--alias/--unalias run on their own, without --json or --context.');
+    return 1;
+  }
   if (opts.saveContext && assignments.length === 0) {
     p.log.error('--save applies to --context assignments; none were given.');
     return 1;
@@ -937,11 +956,30 @@ export async function runModelsCommand(opts: FavoritesCommandOptions = {}): Prom
       p.log.error('Saved model aliases are malformed: "modelAliases" must be an array.');
       return 1;
     }
+    const alias: ModelAlias = opts.daybreak ? { ...parsed, daybreak: true } : parsed;
+    let programLabel = '';
+    if (alias.daybreak && await endpointServerAnswersModelId(alias.name)) {
+      p.log.error(
+        `Daybreak can't be enabled on ${alias.name}: the endpoint server answers that name as a model id, `
+        + 'so requests there would not use Daybreak. Choose another alias name.',
+      );
+      return 1;
+    }
+    if (alias.daybreak) {
+      const daybreak = await resolveDaybreakAliasCandidate(alias);
+      if (daybreak.kind !== 'on') {
+        p.log.error(`Daybreak can't be enabled on ${alias.name}: ${
+          daybreak.kind === 'unavailable' ? daybreak.reason : 'its target has no usable proxy route'
+        }.`);
+        return 1;
+      }
+      programLabel = ` (${daybreakProgramLabel(daybreak.accessPrograms.cyber)})`;
+    }
     const aliases = prefs.modelAliases ?? [];
-    const modelAliases = aliases.filter(alias => !modelAliasMatchesName(alias, parsed.name));
-    modelAliases.push(parsed);
+    const modelAliases = aliases.filter(saved => !modelAliasMatchesName(saved, alias.name));
+    modelAliases.push(alias);
     savePreferences({ modelAliases });
-    p.log.success(`Saved model alias ${parsed.name} → ${modelAliasTarget(parsed)}.`);
+    p.log.success(`Saved model alias ${alias.name} → ${modelAliasTarget(alias)}${programLabel}.`);
     return 0;
   }
   if (opts.unalias !== undefined) {
@@ -1652,10 +1690,9 @@ export async function runClaudeCommand(parsed: ParsedArgs): Promise<number> {
     );
   } else {
     try {
-      proxyHandle = await startProxy(
+      const route = singleModelProxyRoute(
         selectedModel.completionsUrl ?? '',
         selectedModel.id,
-        trace,
         selectedModel.contextWindow,
         {
           npm: selectedModel.npm,
@@ -1672,8 +1709,22 @@ export async function runClaudeCommand(parsed: ParsedArgs): Promise<number> {
           compatibility: selectedModel.compatibility,
           headers: activeProvider.headers,
           pricingBoundary: selectedModel.pricingBoundary,
+          cyberAccessPrograms: selectedModel.cyberAccessPrograms,
         },
         launchApiKey ?? '',
+      );
+      proxyHandle = await startProxyCatalog(
+        [route],
+        route.aliasId,
+        trace,
+        undefined,
+        undefined,
+        undefined,
+        singleModelDaybreakAliases(
+          prefs.modelAliases,
+          route,
+          { providerId: activeProvider.id, modelId: selectedModel.id },
+        ),
       );
       if (!isAgentStdoutMode()) {
         p.log.info(
@@ -1795,6 +1846,7 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       list: parsed.favoritesList,
       alias: parsed.favoritesAlias,
       unalias: parsed.favoritesUnalias,
+      daybreak: parsed.favoritesDaybreak,
       json: parsed.favoritesJson,
       contextAssignments,
       saveContext: parsed.contextSave,

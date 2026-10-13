@@ -25,6 +25,7 @@ import {
 } from '../anthropic-endpoints.js';
 import { resolveProviderCredential } from '../env.js';
 import { reportPricingBoundaryCrossing } from '../pricing-boundary.js';
+import { routeUnavailableMessage } from '../route-unavailable.js';
 import {
   injectClaudeCodeBillingSystemLine,
   injectClaudeIdentity,
@@ -865,7 +866,10 @@ function lookupModel(res: ServerResponse, catalog: ModelCatalog, modelId: unknow
 
   const model = catalog.get(modelId);
   if (!model) {
-    sendJson(res, 400, { error: { message: `Unknown model: ${modelId}` } });
+    const refusal = catalog.refusal?.(modelId);
+    sendJson(res, 400, {
+      error: { message: refusal ? routeUnavailableMessage(modelId, refusal) : `Unknown model: ${modelId}` },
+    });
     return null;
   }
 
@@ -880,12 +884,15 @@ async function getOrInitLanguageModel(
   apiKey: string,
   webSocketDiagnosticsLogPath?: string,
 ): Promise<LanguageModel> {
+  // A Daybreak alias and its plain target share every other field, so without
+  // the program here whichever is asked for first decides what both send.
   const cacheKey = [
     model.providerId ?? model.sourceBackend,
     model.id,
     upstreamModelId(model),
     npm,
     baseURL ?? '',
+    model.accessPrograms?.cyber ?? '',
   ].join('\x1f');
   let cached = modelCache.get(cacheKey);
   if (!cached || cached.apiKey !== apiKey) {
@@ -901,6 +908,7 @@ async function getOrInitLanguageModel(
       useResponsesLite: model.useResponsesLite,
       preferWebSockets: model.preferWebSockets,
       compatibility: model.compatibility,
+      accessPrograms: model.accessPrograms,
       onWebSocketDiagnostic: webSocketDiagnosticsLogPath
         ? event => writeWebSocketDiagnosticLog(webSocketDiagnosticsLogPath, event)
         : undefined,
