@@ -2,7 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/%40bman654%2Fclodex.svg)](https://www.npmjs.com/package/@bman654/clodex)
 
-**clodex** lets you use your ChatGPT/Codex plan, OpenAI API models, or OpenCode Go models with Claude Code as first-class model choices.
+**clodex** lets you use your ChatGPT/Codex plan, OpenAI API models, OpenCode Go or Ollama Cloud models, or models from a custom OpenAI-compatible server with Claude Code as first-class model choices.
 You can use them anywhere you use Anthropic models like Opus and Sonnet — as the main session model, and in subagents, workflows, and agent teams. Clodex integrates them directly into Claude Code, using Claude Code's system prompt.
 It works with your existing Claude Code plan as well as your Codex plans WITHOUT violating Anthropic's ToS.
 No messing with CMUX or child codex processes or any of that stuff.
@@ -43,6 +43,7 @@ clodex claude                  # 5. launch Claude Code on an OpenAI model
 | OpenAI (ChatGPT / Codex plan) | OAuth | Fully supported by the clodex maintainer |
 | OpenCode Go | API key | Community-supported — maintained by its contributor |
 | Custom OpenAI-compatible server (OpenRouter, vLLM, …) | API key, or none | Community-supported — maintained by its contributor |
+| Ollama Cloud | API key | Community-supported — maintained by its contributor |
 
 **Community-supported** means the maintainer holds no account for that service,
 so it cannot be exercised against the live API here or debugged when the vendor
@@ -124,7 +125,7 @@ Launch Claude Code bridged to configured model providers. Unrecognized flags (an
 | `--dry-run` | Run the wizard but print a launch preview instead of launching (never persists anything) |
 | `--trace` | Write debug logs to `~/.clodex/logs/` and show errors on exit |
 | `--fast` | Request Codex fast mode (`service_tier=priority`) for ChatGPT/Codex OAuth routes; equivalent to `CLODEX_SERVICE_TIER=fast` |
-| `--provider <id>` | Endpoint mode only: boot provider id (`openai`, `openai-oauth`, or `opencode-go`); with `--model`, skips the wizard |
+| `--provider <id>` | Endpoint mode only: boot provider id of a configured provider (e.g. `openai`, `openai-oauth`, `opencode-go`, `ollama-cloud`, or `custom-<name>`); with `--model`, skips the wizard |
 | `--model <id>` | Endpoint mode only: boot model id; with `--provider`, skips the wizard |
 | `--context <model=stop>` | Use a different share of a model's context window for this launch only; never saved. Reaches Claude Code through the exported catalog, so a binary patched by `clodex patch` keeps its baked window until the stop is saved and the patch re-run |
 | `--help`, `--version` | Help / version |
@@ -304,7 +305,7 @@ Two things worth knowing about the numbers:
 | Subcommand | Effect |
 | --- | --- |
 | *(none)* | Provider hub wizard |
-| `add` | Add OpenAI or OpenCode Go with an API key, add a custom OpenAI-compatible server by base URL, or sign in with ChatGPT |
+| `add` | Add OpenAI, OpenCode Go or Ollama Cloud with an API key, add a custom OpenAI-compatible server by base URL, or sign in with ChatGPT |
 | `auth openai` | Sign in with ChatGPT/Codex-plan OAuth (device code; `--browser` for workspaces that disable device codes) |
 | `list` | Show configured providers |
 | `remove <id>` | Remove a provider by id |
@@ -324,7 +325,9 @@ and their seeded flags when discovery omits them. Models not using Responses-Lit
 this version header and are not hidden by this check. This check does not establish your
 account's model entitlement.
 
-Providers supported: `openai` (API key, platform.openai.com), `openai-oauth` (ChatGPT/Codex plan), and `opencode-go` (OpenCode Go API key). OpenCode Go exposes its Anthropic Messages, Chat Completions, and Responses models; only entries whose transport has been verified, live or against OpenCode's per-model endpoint table, are included. See [OpenCode Go provider](docs/opencode-go.md).
+Providers supported: `openai` (API key, platform.openai.com), `openai-oauth` (ChatGPT/Codex plan), `opencode-go` (OpenCode Go API key), and `ollama-cloud` (Ollama Cloud API key). OpenCode Go exposes its Anthropic Messages, Chat Completions, and Responses models; only entries whose transport has been verified, live or against OpenCode's per-model endpoint table, are included. See [OpenCode Go provider](docs/opencode-go.md).
+
+Ollama Cloud exposes a curated set of four Chat Completions models from `https://ollama.com/v1`; other models Ollama Cloud lists are hidden. See [Ollama Cloud provider](docs/ollama-cloud.md).
 
 A **custom OpenAI-compatible server** is any OpenAI-style API, given by its base URL (the part before `/chat/completions`), such as `https://openrouter.ai/api/v1`. `providers add` asks for a name, the base URL and an API key (leave it empty for a local server without auth), lists the server's models to check the connection, and saves the provider as `custom-<name>`. Its models then appear in `clodex models`; once saved as favorites they are addressed as `clodex:custom-<name>:<model>` and can be given a short alias with `clodex models --alias`. The base URL is checked before anything is saved and again when its models are refreshed: plain `http://` is accepted only after you confirm it, and only if every address the host resolves to is on this machine, your LAN or a private network such as Tailscale (loopback, private, unique-local IPv6 or carrier-grade-NAT `100.64.0.0/10` addresses); `https://` is accepted on any of those networks as well as the public internet; and a link-local (`169.254.0.0/16`, `fe80::/10`) or well-known cloud-metadata address is refused whether or not HTTP was approved. A server on another machine in your tailnet can be added by its `100.x` address, its MagicDNS name, or the HTTPS name `tailscale serve` gives it. A model's id and name are stored with surrounding whitespace trimmed, and a model whose trimmed id or name still contains a control character is skipped, whether the list is fetched by `providers add` or by `providers refresh-models`, and error text from the server is shown with control characters replaced by spaces. Only the OpenAI-compatible kind is offered in the menu.
 
