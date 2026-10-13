@@ -15,6 +15,15 @@ hand-rolled per-provider translation. Preserved hard-won behavior:
   and strips Claude Code's volatile billing-attribution header from instructions, but omits
   `prompt_cache_options` and explicit breakpoints — those produced successful-but-empty OAuth
   responses in testing.
+- **ChatGPT/Codex OAuth also sends that key as the WebSocket handshake's `session-id` header**,
+  as a root native Codex session does (Codex subagents send their own session id; clodex keeps one
+  key per Claude session). The body field alone did not keep fresh sockets on a warm cache.
+  Measured 2026-10-13 on one account, each resend byte-identical and on a new socket: on
+  Responses-Lite models 3 of 22 hit the cache without the header and 21 of 22 with it; through a
+  built endpoint server on gpt-6.1-sol, 0 of 10 versus 10 of 10 (99.5% cached). A stable value
+  other than the key also hit; a new value per request mostly missed. Non-Lite gpt-5.5 hit 5 of 6
+  even without the header. Fresh sockets are common: subagents, Claude Code's agent-summary forks,
+  and conversations whose socket expired open one and resend their history.
 - Cache reads and GPT-5.6 cache writes map to Anthropic
   `cache_read_input_tokens`/`cache_creation_input_tokens`.
 - **On OpenRouter routes, translated requests carry an `x-session-id` header** so OpenRouter can
