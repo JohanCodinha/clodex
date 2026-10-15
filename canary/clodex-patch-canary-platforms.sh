@@ -133,8 +133,15 @@ archive_repo() { # archive_repo <repo> <out.tar>
     || die "cannot archive $1"
 }
 
-# Asked once per run: `docker info` talks to the daemon, and on a Mac with Docker Desktop quit it
-# blocks for a while before failing.
+# Asked once per run: `docker version` talks to the daemon, and on a Mac with Docker Desktop quit
+# it blocks for a while before failing.
+#
+# Not `docker info`: before it asks the daemon anything, it starts every CLI plugin (30+ under
+# Docker Desktop) to list them. Under launchd's Background + LowPriorityIO throttling, cold after
+# hours idle and with this canary loading the machine, that alone ran past the 60s budget and a
+# running Docker was reported as down; the daemon never saw the request. `docker version` lists no
+# plugins. Docker Desktop's Resource Saver answers it from cache while the VM is stopped, which is
+# fine: the container leg's `docker run` wakes the VM.
 #
 # Deliberately silent. Its caller `platform_mode` is read through `$(...)`, so anything written to
 # stdout here would be captured as part of the mode and every platform would resolve to a mode no
@@ -145,7 +152,7 @@ docker_ready() {
     if [ "${opt_container:-1}" -ne 1 ]; then
       DOCKER_READY=no
     elif command -v docker >/dev/null 2>&1 &&
-         with_timeout 60 docker info >/dev/null 2>&1; then
+         with_timeout 60 docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
       DOCKER_READY=yes
     else
       DOCKER_READY=no
@@ -873,7 +880,7 @@ coverage_gap_action() { # coverage_gap_action <host-platform> <retry-hours>
   if [ -n "$downgraded" ]; then
     if [ "${opt_container:-1}" -eq 1 ]; then
       acts="$acts
-- *Start Docker Desktop.* That is the whole fix: $downgraded can only be patched for real inside a container, and with the daemon down they fall back to a bundle-only probe. The canary re-tries a partly covered release every ${retry_h}h, so the next run after Docker is up should clear this by itself — or run \`clodex-patch-canary.sh --force\` to settle it now."
+- *Start Docker Desktop* (or restart it, if it is already running): it did not answer \`docker version\` within 60s. That is the whole fix: $downgraded can only be patched for real inside a container, and with the daemon unreachable they fall back to a bundle-only probe. The canary re-tries a partly covered release every ${retry_h}h, so the next run after Docker is up should clear this by itself — or run \`clodex-patch-canary.sh --force\` to settle it now."
     else
       acts="$acts
 - \`--no-container\` was passed, so $downgraded were never patched for real. Re-run without it."
