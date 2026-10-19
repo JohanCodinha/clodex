@@ -44,8 +44,8 @@ function boundFunction(patched: string): { name: string; declStart: number } {
   const at = patched.indexOf(MARKER);
   expect(at, 'marker present').toBeGreaterThan(-1);
   const before = patched.slice(0, at);
-  const m = before.match(/function ([\w$]+)\(\)\{$/);
-  expect(m, 'marker sits immediately inside a zero-arg function').toBeTruthy();
+  const m = before.match(/function ([\w$]+)\([\w$]*\)\{$/);
+  expect(m, 'marker sits immediately inside a zero- or one-parameter function').toBeTruthy();
   return { name: m![1]!, declStart: before.length - m![0]!.length };
 }
 
