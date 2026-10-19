@@ -227,7 +227,7 @@ The models-list fetch validates only `{id, display_name, description}`. The serv
 lookup is unreachable anyway: it is gated on the Anthropic base URL being `api.anthropic.com`, and
 `src/env.ts` points the child at `127.0.0.1`.
 
-## The shared child-environment builder (verified 2.1.221, re-verified 2.1.239, 2.1.260 and 2.1.290)
+## The shared child-environment builder (verified 2.1.221, re-verified 2.1.239, 2.1.260, 2.1.290 and 2.1.304)
 
 The shared child-env builder — `pH()` in 2.1.221, with 14 call sites there and 16 in every 2.1.239
 build. The split that matters for bridge isolation:
@@ -246,7 +246,13 @@ the typed env accessor instead (`i=a.CLAUDE_CODE_REMOTE===!0`), and `us()` (darw
 2.1.290, which replaced the settings-colour env with the full settings env for children
 (`{settingsEnvForChildren:s}=e`), laid it over a base copy before the passthrough
 (`i=process.env;if(c){i={...process.env};for(…)i[Crt(i,p)]=A}`), and declared an overlay ahead of
-the returned copy (`let Z={...r,...m},E={...i};…return E}`). That is why PATCH 10's anchor
+the returned copy (`let Z={...r,...m},E={...i};…return E}`), and `is(e)` in all eight builds of
+2.1.304, which took an optional base env the parent's env is spread over
+(`if(_||e!==void 0){i={...e,...process.env};…}`) and passes through only when it is absent
+(`if(e===void 0&&…)return process.env`). Of its 32 references in each 2.1.304 build, 30 are
+no-argument calls, one is a dependency object (`{childEnv:is}`, invoked as `s.childEnv()`), and the
+only call passing the parameter, `Object.keys(is(this.#r))` with the shell snapshot's exports, reads
+nothing but the key set. That is why PATCH 10's anchor
 identifies the function by landmarks inside its body that survive all of that — the agent-proxy env
 it folds in (`getAgentProxyEnv`, spelled inline by every measured builder from 2.1.246 on, with the
 `CLAUDE_CODE_REMOTE` ternary the measured 2.1.238 builder uses still accepted as the alternative),

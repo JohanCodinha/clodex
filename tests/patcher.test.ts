@@ -679,8 +679,8 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
       .join('\n');
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
-      version: 15,
-      digest: '5c44e60d902c72b7dfca3869f21d7dd51f7734d8935f80170a26829f7e5c1d90',
+      version: 16,
+      digest: '1f5ca5267151721aa29c681282602bee7b3c290063fa54cac4946df6d0ea6c9e',
     });
   });
 });
@@ -2060,6 +2060,8 @@ function executeChildEnv(
   env: NodeJS.ProcessEnv,
   extraEnv: NodeJS.ProcessEnv = {},
   settingsEnvForChildren: NodeJS.ProcessEnv = {},
+  // 2.1.304's optional base env parameter; earlier fixtures take no parameter and ignore it.
+  baseEnv?: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
   const declaration = source
     .split('\n')
@@ -2092,8 +2094,8 @@ function executeChildEnv(
       getAgentProxyEnv: () => extraEnv,
     },
     {},
-  ) as () => NodeJS.ProcessEnv;
-  return childEnv();
+  ) as (base?: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
+  return childEnv(baseEnv);
 }
 
 type CapabilityFunctionName = 'OI' | 'I_e' | 'eqe';
@@ -2476,6 +2478,16 @@ describe('patch script identity naming', () => {
     )
     .replace('let v={...process.env,...e,...s};', 'let z={...e,...s},v={...i};Object.assign(v,z);');
 
+  // Claude Code 2.1.304 gave the same builder an optional parameter, a base env the
+  // parent's `process.env` is spread over (`function is(e){…i={...e,...process.env}…`),
+  // and made the passthrough early-out require it to be absent. The head admitted only a
+  // zero-arg `function X(){` and the body check required a literal `{...process.env`, so
+  // `clodex patch` refused the release.
+  const CLAUDE_FIXTURE_304 = CLAUDE_FIXTURE_290
+    .replace('function childEnv(){', 'function childEnv(x){')
+    .replace('if(n){i={...process.env};', 'if(n||x!==void 0){i={...x,...process.env};')
+    .replace('if(!t&&!n&&!o[0])return process.env;', 'if(x===void 0&&!t&&!n&&!o[0])return process.env;');
+
   // The copy is preferred FIRST, so every builder through 2.1.289 binds exactly as before.
   // Here the second declarator is also returned — from a nested block — so taking it first
   // would end the match on that nested `return z}` and the brace walk would refuse.
@@ -2643,25 +2655,27 @@ describe('patch script identity naming', () => {
     expect(result.content).toContain('return _clodexChildEnv;let z={...e,...s},v={...i};');
   });
 
-  describe('through the 2.1.290-shaped builder', () => {
-    const contract = JSON.stringify({
-      version: 1,
-      original: {
-        HTTPS_PROXY: 'http://corp-proxy.example:8080',
-        NODE_EXTRA_CA_CERTS: null,
-      },
-      injected: {
-        HTTPS_PROXY: 'http://127.0.0.1:3457',
-        NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
-      },
-    });
-    const injectedEnv = (): NodeJS.ProcessEnv => ({
-      PATH: '/usr/bin',
+  // The parent env as clodex's wrapper leaves it: injected proxy and CA, plus the contract
+  // recording what they replaced. Shared by the 2.1.290- and 2.1.304-shaped scenarios.
+  const injectedContract = JSON.stringify({
+    version: 1,
+    original: {
+      HTTPS_PROXY: 'http://corp-proxy.example:8080',
+      NODE_EXTRA_CA_CERTS: null,
+    },
+    injected: {
       HTTPS_PROXY: 'http://127.0.0.1:3457',
       NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
-      [NETWORK_ENV_CONTRACT_VAR]: contract,
-    });
+    },
+  });
+  const injectedEnv = (): NodeJS.ProcessEnv => ({
+    PATH: '/usr/bin',
+    HTTPS_PROXY: 'http://127.0.0.1:3457',
+    NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
+    [NETWORK_ENV_CONTRACT_VAR]: injectedContract,
+  });
 
+  describe('through the 2.1.290-shaped builder', () => {
     it('restores the original network environment when no settings env is set', () => {
       const env = executeChildEnv(runPatchScript(config, CLAUDE_FIXTURE_290), injectedEnv());
 
@@ -2700,6 +2714,86 @@ describe('patch script identity naming', () => {
       expect(env['HTTPS_PROXY']).toBe('http://settings-level.example:9999');
       expect(env['NODE_EXTRA_CA_CERTS']).toBeUndefined();
     });
+  });
+
+  it('patches a child builder that takes a base env parameter', () => {
+    expect(CLAUDE_FIXTURE_304, 'the 2.1.304 head must take a parameter')
+      .toContain('function childEnv(x){');
+    expect(CLAUDE_FIXTURE_304, 'the 2.1.304 base copy must spread the parameter first')
+      .toContain('i={...x,...process.env}');
+    expect(CLAUDE_FIXTURE_304, 'no literal `{...process.env` may survive')
+      .not.toContain('{...process.env');
+
+    const result = applyClodexPatches(CLAUDE_FIXTURE_304, config);
+
+    expect(result.results.at(-1)).toEqual({
+      status: 'OK',
+      name: 'PATCH 10: child network environment',
+    });
+    expect(result.content.match(/\/\*ccpatch:child-network-env\*\//g)).toHaveLength(1);
+    expect(result.content).toContain('function childEnv(x){/*ccpatch:child-network-env*/');
+    expect(result.content).toContain('i={...x,..._clodexChildEnv}');
+    expect(result.content).toContain('if(x===void 0&&!t&&!n&&!o[0])return _clodexChildEnv;');
+  });
+
+  describe('through the 2.1.304-shaped builder', () => {
+    it('restores the original network environment when no base env is passed', () => {
+      const env = executeChildEnv(runPatchScript(config, CLAUDE_FIXTURE_304), injectedEnv());
+
+      expect(env).toMatchObject({ PATH: '/usr/bin', HTTPS_PROXY: 'http://corp-proxy.example:8080' });
+      expect(env['NODE_EXTRA_CA_CERTS']).toBeUndefined();
+      expect(env[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
+    });
+
+    it('lets the restored env win over a base env that carries the injected proxy', () => {
+      const parent = injectedEnv();
+      const env = executeChildEnv(
+        runPatchScript(config, CLAUDE_FIXTURE_304),
+        parent,
+        {},
+        {},
+        { FROM_BASE: 'yes', HTTPS_PROXY: 'http://127.0.0.1:3457' },
+      );
+
+      expect(env).toMatchObject({
+        PATH: '/usr/bin',
+        HTTPS_PROXY: 'http://corp-proxy.example:8080',
+        FROM_BASE: 'yes',
+      });
+      expect(env['NODE_EXTRA_CA_CERTS']).toBeUndefined();
+      expect(env[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
+      expect(parent, 'the parent environment is never mutated').toEqual(injectedEnv());
+    });
+  });
+
+  // The head admits exactly one plain parameter, the shape every 2.1.304 build has. A wider
+  // signature is a shape no build has shown yet, so it refuses loudly rather than binding.
+  it('refuses a child builder with two parameters', () => {
+    const source = CLAUDE_FIXTURE_304.replace('function childEnv(x){', 'function childEnv(x,y){');
+    expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_304);
+
+    expect(() => runPatchScript(config, source)).toThrow(
+      'clodex patch: required patch failed: PATCH 10: child network environment',
+    );
+  });
+
+  // A one-parameter function that opens with the same agent-proxy read must not steal the
+  // match now that the head admits a parameter: the body run cannot cross `}function `.
+  it('does not let a preceding one-parameter decoy with the same opening read steal the match', () => {
+    const source = CLAUDE_FIXTURE_304.replace(
+      'function childEnv(x){',
+      'function zzDecoy(h){let e=h.getAgentProxyEnv?.()??{},z=Object.keys(e).length>0;return z}'
+      + 'function childEnv(x){',
+    );
+    expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_304);
+
+    const out = runPatchScript(config, source);
+
+    expect(out.match(/\/\*ccpatch:child-network-env\*\//g)).toHaveLength(1);
+    expect(out).toContain('function childEnv(x){/*ccpatch:child-network-env*/');
+    expect(out, 'the decoy is left exactly as it was').toContain(
+      'function zzDecoy(h){let e=h.getAgentProxyEnv?.()??{},z=Object.keys(e).length>0;return z}',
+    );
   });
 
   it('ties the tail to the FIRST declarator after the passthrough when it is the one returned', () => {
@@ -3058,7 +3152,7 @@ describe('patch script identity naming', () => {
     const noMerge = CLAUDE_FIXTURE.replace('let v={...process.env,...e,...s}', 'let v={...te,...e,...s}');
     expect(() => runPatchScript(config, noMerge)).toThrow(
       'clodex patch: child network environment target validation failed: '
-      + 'body does not contain {...process.env',
+      + 'body does not contain ...process.env',
     );
 
     // The brace walk reads `/` as division, never as the start of a regex literal — telling those

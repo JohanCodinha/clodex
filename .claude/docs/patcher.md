@@ -352,7 +352,8 @@ relocates the Bun section and strands its old copy; that is independent of the r
   published builds refused to patch at all. Neither end was load-bearing for the replacement: what
   the transform needs is the function's opening brace, its body, and its closing brace. Describe
   each end by what the builder MEANS and let back-references tie the repeats:
-  * the head runs from `function X(){` + `let`/`let{`/`let[` to a pinned name over `[^;{}]`
+  * the head runs from `function X(){` (or, from 2.1.304, `function X(e){` with one plain
+    parameter) + `let`/`let{`/`let[` to a pinned name over `[^;{}]`
     characters **or balanced `{...}` groups**, plus one optional trailing **unclosed** `{…` so the
     pin may sit inside a destructuring pattern — that admits the destructuring and the `??{}` while
     still making it impossible to consume the enclosing function's closing brace, which would need
@@ -394,7 +395,8 @@ relocates the Bun section and strands its old copy; that is independent of the r
   minifier emits" is measurably false: the walk reads `/` as division, so an unescaped `{` or `}`
   inside a regex literal mis-tallies it, and that is ordinary — each 2.1.260 build holds 90 such
   literals, and the walk disagrees with a real parser on 3-4 of the named `function X(){` bodies
-  this anchor can open, per bundle, in all 27. A review built a silent wrong
+  this anchor can open, per bundle, in all 27. One-parameter bodies, admitted since 2.1.304, were
+  not counted. A review built a silent wrong
   bind from it (a decoy carrying `/[{]/`, an arrow-function builder carrying `/[}]/`, phantom braces
   cancelling so `bound` lands on 0) that emits a builder reading `_clodexChildEnv` without declaring
   it — every child command would throw. It reproduces on the pre-2.1.260 anchor too, so it belongs
@@ -469,6 +471,19 @@ relocates the Bun section and strands its old copy; that is independent of the r
   from a nested block refuses loudly even when a later one would bind — no measured build does
   that. `.claude/harnesses/cc290-patch10-execute-real-builder` executes the patched builder from all
   eight 2.1.290 bundles on both sides of the new settings-env branch.
+- **And the signature.** Claude Code 2.1.304 gave the child-env builder an optional parameter, a
+  base env that the parent's `process.env` is spread over
+  (`function is(e){…i={...e,...process.env}…`), and made the passthrough require it to be absent
+  (`if(e===void 0&&…)return process.env`). The head admitted only a zero-arg `function X(){` and
+  the body check required a literal `{...process.env`, so `clodex patch` refused the release. The
+  head now admits one plain parameter and the body check asks only that the body spread
+  `...process.env`. The only caller measured passing the parameter (`is(this.#r)`, the shell
+  snapshot's exports, in all eight builds) reads just `Object.keys` of the result, so the restore
+  still decides which network values a child sees. That is a measurement, not something the
+  transform enforces: if a later build passes a base env whose VALUES reach a child, a key clodex
+  removes (original `null`) would show the base's value through. Output over 2.1.296–2.1.303 is byte-identical to version 15's.
+  `.claude/harnesses/cc304-patch10-execute-real-builder` executes the patched builder from all
+  eight 2.1.304 bundles with and without the parameter.
 - **Calibrate a patch-anchor weakness by corpus reachability and by which direction it fails, not
   by whether an attack can be constructed** — one always can, against every site we ship.
   PATCH 5's surviving hole needs upstream to make two coordinated changes at once (respell its own

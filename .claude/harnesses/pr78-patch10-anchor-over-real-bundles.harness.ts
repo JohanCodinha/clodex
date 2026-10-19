@@ -12,7 +12,7 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { applyClodexPatches } from '../src/patch-transforms.js';
+import { applyClodexPatches } from '../../src/patch-transforms.js';
 
 const BUNDLE_DIR = join(process.env['REVIEW_BUNDLE_DIR'] ?? '', '');
 const MARKER = '/*ccpatch:child-network-env*/';
@@ -29,7 +29,7 @@ function bundles(): string[] {
 
 /** Pull the PATCH 10 regex literal straight out of the source so it cannot drift. */
 function anchorRegex(flags: string): RegExp {
-  const src = readFileSync(join(import.meta.dirname, '..', 'src', 'patch-transforms.ts'), 'utf8');
+  const src = readFileSync(join(import.meta.dirname, '..', '..', 'src', 'patch-transforms.ts'), 'utf8');
   const idx = src.indexOf('PATCH 10: child network environment');
   expect(idx, 'PATCH 10 site present').toBeGreaterThan(-1);
   const after = src.slice(idx);
@@ -44,8 +44,8 @@ function boundFunction(patched: string): { name: string; declStart: number } {
   const at = patched.indexOf(MARKER);
   expect(at, 'marker present').toBeGreaterThan(-1);
   const before = patched.slice(0, at);
-  const m = before.match(/function ([\w$]+)\(\)\{$/);
-  expect(m, 'marker sits immediately inside a zero-arg function').toBeTruthy();
+  const m = before.match(/function ([\w$]+)\([\w$]*\)\{$/);
+  expect(m, 'marker sits immediately inside a zero- or one-parameter function').toBeTruthy();
   return { name: m![1]!, declStart: before.length - m![0]!.length };
 }
 
