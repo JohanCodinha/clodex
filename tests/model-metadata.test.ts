@@ -7,6 +7,7 @@ const SOL: ModelMetadata = {
   providerId: 'openai-oauth',
   modelId: 'gpt-5.6-sol',
   alias: 'sol',
+  aliases: ['sol'],
   displayName: 'GPT-5.6 Sol',
   context: {
     stop: 'standard',

@@ -627,9 +627,9 @@ ${pc.bold('Behavior:')}
   standard (the provider's tuned default), max (its ceiling), default (clear a
   saved choice), or a token count such as 500k. Applies to this run only unless
   --save is given. The model is a saved alias or clodex:<provider-id>:<model-id>.
-  --json prints the resolved metadata for saved favorites as JSON: ids,
-  aliases, context stop and windows, output limit, pricing boundary, and effort
-  levels. Diagnostics go to stderr so stdout stays parseable.
+  --json prints the resolved metadata for saved favorites as JSON: ids, every
+  saved alias, context stop and windows, output limit, pricing boundary, and
+  effort levels. Diagnostics go to stderr so stdout stays parseable.
 
 ${pc.bold('How it works:')}
   claude and server use the global favorites list.

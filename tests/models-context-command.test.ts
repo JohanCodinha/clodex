@@ -92,10 +92,42 @@ describe('models --json', () => {
     expect(parsed).toHaveLength(1);
     expect(parsed[0]!['id']).toBe('clodex:openai-oauth:gpt-5.6-sol');
     expect(parsed[0]!['alias']).toBe('sol');
+    expect(parsed[0]!['aliases']).toEqual(['sol']);
     const context = parsed[0]!['context'] as Record<string, unknown>;
     expect(context['effective']).toBe(272_000);
     expect(context['max']).toBe(872_000);
     expect(parsed[0]!['pricingBoundary']).toBe(272_000);
+  });
+
+  // Several saved aliases can name one model — a follow-latest name and a pin that
+  // currently agree — and Claude Code is patched to accept every one of them. The
+  // scalar `alias` can carry only one, so `aliases` lists them all.
+  it('lists every saved alias of a model in saved order, and none for an unaliased model', async () => {
+    savePreferences({
+      favoriteModels: [
+        { providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' },
+        { providerId: 'openai-oauth', modelId: 'zz-house-model-9000' },
+      ],
+    });
+    // Saved through the real command, after `sol`. `gpt56` sorts before `sol`, so a
+    // list that came back sorted rather than in saved order would put it first.
+    expect(await main(['models', '--alias', 'gpt56=clodex:openai-oauth:gpt-5.6-sol'])).toBe(0);
+
+    const cap = captureJson();
+    try {
+      expect(await main(['models', '--json'])).toBe(0);
+    } finally {
+      cap.restore();
+    }
+    const parsed = JSON.parse(cap.stdout.join('')) as Array<Record<string, unknown>>;
+    const sol = parsed.find(m => m['id'] === 'clodex:openai-oauth:gpt-5.6-sol');
+    expect(sol!['aliases']).toEqual(['sol', 'gpt56']);
+    // The scalar keeps naming the first saved alias, for consumers that read one name.
+    expect(sol!['alias']).toBe('sol');
+    const house = parsed.find(m => m['id'] === 'clodex:openai-oauth:zz-house-model-9000');
+    expect(house).toBeDefined();
+    expect(house).not.toHaveProperty('alias');
+    expect(house).not.toHaveProperty('aliases');
   });
 
   // Two output surfaces of one command, in one process, must not disagree: stdout

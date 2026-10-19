@@ -156,7 +156,7 @@ describe('buildPatchModelConfig', () => {
 
   // `sol` and `sol-fast` name the same model; the second used to overwrite the first, so only
   // one of them reached the picker and the Agent tool.
-  it('gives every alias of one model its own entry, the first on the canonical id', () => {
+  it('keeps every alias of one model on its canonical entry', () => {
     const favorite = { providerId: 'openai-oauth', modelId: 'gpt-5.6-sol' };
     const { config, metaById, unknownWindows } = buildPatchModelConfig(
       [favorite],
@@ -169,11 +169,10 @@ describe('buildPatchModelConfig', () => {
       effort: { levels: ['low', 'medium', 'high', 'xhigh', 'max'], defaultLevel: 'high' },
     };
     expect(config).toEqual({
-      'clodex:openai-oauth:gpt-5.6-sol': { alias: 'sol', ...shared },
-      'sol-fast': { alias: 'sol-fast', ...shared },
+      'clodex:openai-oauth:gpt-5.6-sol': { alias: 'sol', moreAliases: ['sol-fast'], ...shared },
     });
-    expect(Object.keys(config)).toEqual(['clodex:openai-oauth:gpt-5.6-sol', 'sol-fast']);
-    expect(metaById['sol-fast']).toBe(metaById['clodex:openai-oauth:gpt-5.6-sol']);
+    expect(Object.keys(config)).toEqual(['clodex:openai-oauth:gpt-5.6-sol']);
+    expect(Object.keys(metaById)).toEqual(['clodex:openai-oauth:gpt-5.6-sol']);
     expect(unknownWindows).toEqual([]);
   });
 
@@ -714,8 +713,8 @@ describe('PATCH_TRANSFORMS_VERSION', () => {
       .join('\n');
     const digest = createHash('sha256').update(source).digest('hex');
     expect({ version: PATCH_TRANSFORMS_VERSION, digest }).toEqual({
-      version: 14,
-      digest: '1ddec6f36b84fce97388f75a7aae913f894fe7a86e30713df5a9c8d5ccc899ea',
+      version: 15,
+      digest: '5c44e60d902c72b7dfca3869f21d7dd51f7734d8935f80170a26829f7e5c1d90',
     });
   });
 });
@@ -2094,6 +2093,7 @@ function executeChildEnv(
   source: string,
   env: NodeJS.ProcessEnv,
   extraEnv: NodeJS.ProcessEnv = {},
+  settingsEnvForChildren: NodeJS.ProcessEnv = {},
 ): NodeJS.ProcessEnv {
   const declaration = source
     .split('\n')
@@ -2118,7 +2118,13 @@ function executeChildEnv(
     () => extraEnv,
     () => false,
     () => ({}),
-    { settingsColorEnv: {}, getExtra: () => extraEnv, getAgentProxyEnv: () => extraEnv },
+    {
+      settingsColorEnv: {},
+      // 2.1.290's settings env for children, laid over the base copy before the passthrough.
+      settingsEnvForChildren,
+      getExtra: () => extraEnv,
+      getAgentProxyEnv: () => extraEnv,
+    },
     {},
   ) as () => NodeJS.ProcessEnv;
   return childEnv();
@@ -2487,6 +2493,31 @@ describe('patch script identity naming', () => {
     + 't=Object.keys(e).length>0,n=Object.keys(c).length>0,',
   );
 
+  // Claude Code 2.1.290 restructured the TAIL of the same builder. Through 2.1.289 the
+  // statement after the passthrough early-out declared the merged copy first and the
+  // builder returned it (`let E={...process.env,...s,...r,...d},…return E}`). 2.1.290
+  // lays the settings env for children over a base copy BEFORE the passthrough, then
+  // declares an overlay first and the copy second (`let Z={...r,...m},E={...i};…return E}`),
+  // so the back-referenced tail looked for `return Z}`, found none, and `clodex patch`
+  // refused all eight published builds.
+  const CLAUDE_FIXTURE_290 = CLAUDE_FIXTURE_260
+    .replace(
+      '{settingsColorEnv:c}=h,n=Object.keys(c).length>0,'
+      + 'g=accessor.CLAUDE_CODE_REMOTE===!0,s=g?remote():{};',
+      '{settingsEnvForChildren:c}=h,n=Object.keys(c).length>0,i=process.env;'
+      + 'if(n){i={...process.env};for(let[p,A]of Object.entries(c))i[p]=A}'
+      + 'let g=accessor.CLAUDE_CODE_REMOTE===!0,s=g?remote():{};',
+    )
+    .replace('let v={...process.env,...e,...s};', 'let z={...e,...s},v={...i};Object.assign(v,z);');
+
+  // The copy is preferred FIRST, so every builder through 2.1.289 binds exactly as before.
+  // Here the second declarator is also returned — from a nested block — so taking it first
+  // would end the match on that nested `return z}` and the brace walk would refuse.
+  const CLAUDE_FIXTURE_290_FIRST_DECLARATOR = CLAUDE_FIXTURE_260.replace(
+    'let v={...process.env,...e,...s};',
+    'let v={...process.env,...e,...s},z={};if(!u.length){return z}',
+  );
+
   // The tolerated run admits `[^;{}]` characters or one balanced `{...}` group,
   // so it cannot reach out of the `let` statement it starts in — consuming the
   // enclosing function's closing brace would need an UNMATCHED one. Widen it to
@@ -2625,6 +2656,154 @@ describe('patch script identity naming', () => {
     });
     expect(env['NODE_EXTRA_CA_CERTS']).toBeUndefined();
     expect(env[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
+  });
+
+  it('patches a child builder that returns a copy declared after an overlay', () => {
+    expect(CLAUDE_FIXTURE_290, 'fixture drifted from the shape this test mutates')
+      .not.toBe(CLAUDE_FIXTURE_260);
+    expect(CLAUDE_FIXTURE_290, 'the 2.1.290 tail must declare the overlay first')
+      .toContain('return process.env;let z={...e,...s},v={...i};');
+
+    const result = applyClodexPatches(CLAUDE_FIXTURE_290, config);
+
+    expect(result.results.at(-1)).toEqual({
+      status: 'OK',
+      name: 'PATCH 10: child network environment',
+    });
+    expect(result.content.match(/\/\*ccpatch:child-network-env\*\//g)).toHaveLength(1);
+    expect(result.content).toContain('function childEnv(){/*ccpatch:child-network-env*/');
+    // Both sides of the settings branch read the restored env, and the tail is intact.
+    expect(result.content).toContain('i=_clodexChildEnv;if(n){i={..._clodexChildEnv};');
+    expect(result.content).toContain('return _clodexChildEnv;let z={...e,...s},v={...i};');
+  });
+
+  describe('through the 2.1.290-shaped builder', () => {
+    const contract = JSON.stringify({
+      version: 1,
+      original: {
+        HTTPS_PROXY: 'http://corp-proxy.example:8080',
+        NODE_EXTRA_CA_CERTS: null,
+      },
+      injected: {
+        HTTPS_PROXY: 'http://127.0.0.1:3457',
+        NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
+      },
+    });
+    const injectedEnv = (): NodeJS.ProcessEnv => ({
+      PATH: '/usr/bin',
+      HTTPS_PROXY: 'http://127.0.0.1:3457',
+      NODE_EXTRA_CA_CERTS: '/tmp/local-ca.pem',
+      [NETWORK_ENV_CONTRACT_VAR]: contract,
+    });
+
+    it('restores the original network environment when no settings env is set', () => {
+      const env = executeChildEnv(runPatchScript(config, CLAUDE_FIXTURE_290), injectedEnv());
+
+      expect(env).toMatchObject({ PATH: '/usr/bin', HTTPS_PROXY: 'http://corp-proxy.example:8080' });
+      expect(env['NODE_EXTRA_CA_CERTS']).toBeUndefined();
+      expect(env[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
+    });
+
+    it('restores it on the settings-env branch and still lays the settings on top', () => {
+      const parent = injectedEnv();
+      const env = executeChildEnv(
+        runPatchScript(config, CLAUDE_FIXTURE_290),
+        parent,
+        {},
+        { FROM_SETTINGS: 'yes' },
+      );
+
+      expect(env).toMatchObject({
+        PATH: '/usr/bin',
+        HTTPS_PROXY: 'http://corp-proxy.example:8080',
+        FROM_SETTINGS: 'yes',
+      });
+      expect(env['NODE_EXTRA_CA_CERTS']).toBeUndefined();
+      expect(env[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
+      expect(parent, 'the parent environment is never mutated').toEqual(injectedEnv());
+    });
+
+    it('keeps a settings-level proxy authoritative over the restore', () => {
+      const env = executeChildEnv(
+        runPatchScript(config, CLAUDE_FIXTURE_290),
+        injectedEnv(),
+        {},
+        { HTTPS_PROXY: 'http://settings-level.example:9999' },
+      );
+
+      expect(env['HTTPS_PROXY']).toBe('http://settings-level.example:9999');
+      expect(env['NODE_EXTRA_CA_CERTS']).toBeUndefined();
+    });
+  });
+
+  it('ties the tail to the FIRST declarator after the passthrough when it is the one returned', () => {
+    expect(CLAUDE_FIXTURE_290_FIRST_DECLARATOR, 'fixture drifted from the shape this test mutates')
+      .not.toBe(CLAUDE_FIXTURE_260);
+
+    const result = applyClodexPatches(CLAUDE_FIXTURE_290_FIRST_DECLARATOR, config);
+
+    expect(result.results.at(-1)).toEqual({
+      status: 'OK',
+      name: 'PATCH 10: child network environment',
+    });
+    expect(result.content).toContain(
+      'let v={..._clodexChildEnv,...e,...s},z={};if(!u.length){return z}',
+    );
+  });
+
+  // The count and the tail must accept the same passthroughs. Here the overlay is built by a
+  // call rather than an object literal, which the tail can skip; a count still requiring the
+  // FIRST declarator to be `={` sees zero sites and refuses a builder the anchor binds.
+  it('patches a builder whose first declarator after the passthrough is a call', () => {
+    const source = CLAUDE_FIXTURE_290.replace(
+      'let z={...e,...s},v={...i};',
+      'let z=Object.assign({},e,s),v={...i};',
+    );
+    expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_290);
+
+    const result = applyClodexPatches(source, config);
+
+    expect(result.results.at(-1)).toEqual({
+      status: 'OK',
+      name: 'PATCH 10: child network environment',
+    });
+    expect(result.content).toContain('return _clodexChildEnv;let z=Object.assign({},e,s),v={...i};');
+  });
+
+  // And the converse: a second passthrough the tail could bind must be COUNTED, so it refuses
+  // as ambiguous instead of being bound when the real builder's own tail stops matching.
+  it('counts a second passthrough whose first declarator is a call', () => {
+    const twin = 'function twinEnv(){let e=settings.getAgentProxyEnv?.()??{};if(cond)return process.env;'
+      + 'let n=extra(),w={...process.env,...n};delete w.CLAUDE_CODE_OAUTH_TOKEN;return w}';
+    const source = CLAUDE_FIXTURE_290
+      .replace('let z={...e,...s},v={...i};', 'let z={...e,...s};let v={...i};')
+      .replace('function mcpAllow(){', twin + 'function mcpAllow(){');
+    expect(source, 'fixture drifted from the shape this test mutates').toContain(twin);
+
+    let thrown: unknown;
+    try {
+      applyClodexPatches(source, config);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(PatchApplyError);
+    expect((thrown as PatchApplyError).results.at(-1)).toEqual({
+      status: 'FAIL',
+      name: 'PATCH 10: child network environment',
+      extra: 'child env passthrough appears 2 times (expected 1)',
+    });
+  });
+
+  it('refuses a returned copy declared outside the statement after the passthrough', () => {
+    const source = CLAUDE_FIXTURE_290.replace(
+      'let z={...e,...s},v={...i};',
+      'let z={...e,...s};let w=0,v={...i};',
+    );
+    expect(source, 'fixture drifted from the shape this test mutates').not.toBe(CLAUDE_FIXTURE_290);
+
+    expect(() => runPatchScript(config, source)).toThrow(
+      'clodex patch: required patch failed: PATCH 10: child network environment',
+    );
   });
 
   it('restores the original network environment through the destructuring builder', () => {
@@ -3881,5 +4060,144 @@ describe('patch script identity naming', () => {
       'clodex:openai-oauth:gpt-5.6-sol[1m]',
       'medium',
     )).toBe('medium');
+  });
+});
+
+describe('several saved aliases naming one model', () => {
+  const aliases = [
+    { name: 'sol', providerId: 'openai-oauth', modelId: 'gpt-6.1-sol' },
+    { name: 'sol61', providerId: 'openai-oauth', modelId: 'gpt-6.1-sol' },
+  ];
+  const favorites = [{ providerId: 'openai-oauth', modelId: 'gpt-6.1-sol' }];
+  const meta = () => ({ contextWindow: 872_000 });
+
+  it('keeps every alias, the first saved one as the primary', () => {
+    const { config } = buildPatchModelConfig(favorites, aliases, meta);
+    expect(config['clodex:openai-oauth:gpt-6.1-sol']).toEqual({
+      alias: 'sol',
+      moreAliases: ['sol61'],
+      context: 872_000,
+    });
+  });
+
+  it('gives each alias the context window and resolution, not only the last one', () => {
+    const { config } = buildPatchModelConfig(favorites, aliases, meta);
+    const out = applyClodexPatches(CLAUDE_FIXTURE, config).content;
+    expect(out).toContain('"sol":872000');
+    expect(out).toContain('"sol61":872000');
+    expect(out).toContain('case"sol":return "sol";');
+    expect(out).toContain('case"sol61":return "sol61";');
+  });
+
+  it('leaves the config hash of a one-alias-per-model config unchanged', () => {
+    const single = { 'clodex:openai-oauth:gpt-6.1-sol': { alias: 'sol', context: 872_000 } };
+    const withEmpty = { 'clodex:openai-oauth:gpt-6.1-sol': { alias: 'sol', context: 872_000, moreAliases: undefined } };
+    expect(computePatchConfigHash(withEmpty)).toBe(computePatchConfigHash(single));
+    const multi = buildPatchModelConfig(favorites, aliases, meta).config;
+    expect(computePatchConfigHash(multi)).not.toBe(computePatchConfigHash(single));
+  });
+
+  // Each table below is fed by its own loop over a model's aliases, so each can drop the second
+  // alias on its own while the context window and resolver above stay intact. These run the
+  // patched functions for every alias rather than reading the emitted text.
+  describe('every table the patch writes', () => {
+    const SOL_LABEL = 'GPT-6.1 Sol (OpenAI (ChatGPT))';
+    const PLAIN_LABEL = 'Plain (OpenAI)';
+    // A reasoning model and a model without effort controls, each saved under two names.
+    const twoModels = [
+      { providerId: 'openai-oauth', modelId: 'gpt-6.1-sol' },
+      { providerId: 'openai', modelId: 'plain' },
+    ];
+    const fourAliases = [
+      { name: 'sol', providerId: 'openai-oauth', modelId: 'gpt-6.1-sol' },
+      { name: 'sol61', providerId: 'openai-oauth', modelId: 'gpt-6.1-sol' },
+      { name: 'plain', providerId: 'openai', modelId: 'plain' },
+      { name: 'plain2', providerId: 'openai', modelId: 'plain' },
+    ];
+    const config = () => buildPatchModelConfig(twoModels, fourAliases, (_provider, model) => (
+      model === 'gpt-6.1-sol'
+        ? {
+            contextWindow: 872_000,
+            displayName: SOL_LABEL,
+            effort: { levels: ['low', 'medium', 'high', 'xhigh', 'max'], defaultLevel: 'medium' },
+          }
+        : { contextWindow: 128_000, displayName: PLAIN_LABEL }
+    )).config;
+
+    /** The values the patched Agent-tool `model` enum is built from, by running its expression. */
+    function agentToolModels(source: string): string[] {
+      const line = source.split('\n').find(candidate => candidate.startsWith('.enum('));
+      expect(line).toBeDefined();
+      let values: string[] = [];
+      const schema = { optional: () => schema, describe: () => schema };
+      Function('z', 'hint', `return z${line};`)(
+        { enum: (members: string[]) => { values = members; return schema; } },
+        () => false,
+      );
+      return values;
+    }
+
+    /** The patched known-model list, by running its declaration. */
+    function knownModels(source: string): string[] {
+      const line = source.split('\n').find(candidate => candidate.startsWith('var KNOWN='));
+      expect(line).toBeDefined();
+      return Function(`${line};return KNOWN;`)() as string[];
+    }
+
+    it('gives every alias its model\'s effort levels and default, with or without [1m]', () => {
+      const out = runPatchScript(config(), CLAUDE_PROXY_EFFORT_FIXTURE);
+      for (const name of ['sol', 'sol61', 'sol[1m]', 'sol61[1m]']) {
+        // A native answer of false, so only the baked verdict can say true.
+        expect(
+          CAPABILITY_GATES.map(({ functionName }) => executeCapability(out, functionName, name, false)),
+          name,
+        ).toEqual([true, true, true]);
+        // A native default that disagrees, so only the baked default answers high.
+        expect(executeDefaultEffort(out, name, 'medium'), name).toBe('high');
+      }
+      // A model without effort controls is still a configured model under every name: the native
+      // answer of true must not leak through for its second alias either.
+      for (const name of ['plain', 'plain2', 'plain2[1m]']) {
+        expect(
+          CAPABILITY_GATES.map(({ functionName }) => executeCapability(out, functionName, name, true)),
+          name,
+        ).toEqual([false, false, false]);
+        expect(executeDefaultEffort(out, name, 'medium'), name).toBe('medium');
+      }
+      // Under-scope: a name nobody saved still gets the native answer.
+      expect(executeCapability(out, 'OI', 'unconfigured', true)).toBe(true);
+    });
+
+    it('accepts every alias as an Agent-tool model and a known model, and describes each', () => {
+      const out = runPatchScript(config(), CLAUDE_PROXY_EFFORT_FIXTURE);
+      const agentModels = agentToolModels(out);
+      const known = knownModels(out);
+      for (const name of ['sol', 'sol61', 'plain', 'plain2']) {
+        expect(agentModels.filter(model => model === name), name).toHaveLength(1);
+        expect(known.filter(model => model === name), name).toHaveLength(1);
+      }
+      expect(agentModels).not.toContain('unconfigured');
+      expect(known).not.toContain('unconfigured');
+      // An aliased model is known by its aliases, never its canonical id.
+      expect(agentModels).not.toContain('clodex:openai-oauth:gpt-6.1-sol');
+      expect(out).toContain(
+        `Additional custom models: sol = ${SOL_LABEL}; sol61 = ${SOL_LABEL}; `
+        + `plain = ${PLAIN_LABEL}; plain2 = ${PLAIN_LABEL}.`,
+      );
+    });
+
+    // Local patches are checked against these proofs. A local edit that redirects only the
+    // second alias leaves its case label in place, so re-running the resolver patch is a no-op
+    // and cannot notice it: the proof of that alias's own case is what does.
+    it('protects each alias\'s resolver case on its own before local patches run', () => {
+      const desired = config();
+      const patched = applyClodexPatches(CLAUDE_FIXTURE, desired);
+      const proofs = captureBuiltInPatchProofs(patched.content, desired, patched.results);
+      expect(builtInPatchProofsChanged(patched.content, proofs)).toBe(false);
+      expect(builtInPatchProofsChanged(
+        patched.content.replace('case"sol61":return "sol61";', 'case"sol61":return "sol";'),
+        proofs,
+      )).toBe(true);
+    });
   });
 });

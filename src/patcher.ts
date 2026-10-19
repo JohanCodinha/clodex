@@ -188,8 +188,9 @@ export interface PatchModelMeta {
 /**
  * Build the patch model config from favorites + aliases.
  * Keys are the bare `clodex:<provider>:<model>` ids (no [1m] suffix — the
- * context patch and the suffix are mutually exclusive). When an entry has an
- * alias, that alias becomes the model's identity inside the patched binary.
+ * context patch and the suffix are mutually exclusive). Each saved alias of a
+ * model becomes one of its identities inside the patched binary: the first
+ * saved is the entry's `alias`, any others are `moreAliases`.
  */
 export function buildPatchModelConfig(
   favorites: Array<{ providerId: string; modelId: string }>,
@@ -211,11 +212,16 @@ export function buildPatchModelConfig(
       alias: source,
       reason: 'target-not-favorite',
     })));
+  // Several saved aliases can name one model (a follow-latest name and a pin that
+  // currently agree). Each must be patched: a Map keyed by target kept only the last,
+  // so the others got no context window and Claude Code fell back to its 200K default.
   const aliasesByFavorite = new Map<string, string[]>();
   for (const alias of normalizedAliases.aliases) {
-    const target = `${alias.providerId}:${alias.modelId}`;
-    if (!favoriteTargets.has(target)) continue;
-    aliasesByFavorite.set(target, [...(aliasesByFavorite.get(target) ?? []), alias.name]);
+    const key = `${alias.providerId}:${alias.modelId}`;
+    if (!favoriteTargets.has(key)) continue;
+    const names = aliasesByFavorite.get(key) ?? [];
+    names.push(alias.name);
+    aliasesByFavorite.set(key, names);
   }
 
   for (const favorite of favorites) {
@@ -226,6 +232,7 @@ export function buildPatchModelConfig(
     const [alias, ...moreAliases] = aliasesByFavorite.get(`${favorite.providerId}:${favorite.modelId}`) ?? [];
     const entry: PatchScriptModelConfig[string] = {};
     if (alias) entry.alias = alias;
+    if (moreAliases.length > 0) entry.moreAliases = moreAliases;
     // An absent window and an explicit 200_000 must keep producing the SAME entry: both
     // omit `context`, so `computePatchConfigHash` cannot tell them apart. That equality is
     // what lets a model stop persisting the invented default without marking every patched
@@ -238,13 +245,6 @@ export function buildPatchModelConfig(
     if (effort) entry.effort = effort;
     config[id] = entry;
     if (meta) metaById[id] = meta;
-    // Each further alias of the same model (`sol` beside `sol-fast`) is an identity
-    // of its own in the binary, so it gets its own entry, keyed by its name. That
-    // key cannot collide with a canonical id: alias names never contain `:`.
-    for (const name of moreAliases) {
-      config[name] = { ...entry, alias: name };
-      if (meta) metaById[name] = meta;
-    }
   }
   return {
     config,
@@ -287,6 +287,8 @@ export function computePatchConfigHash(
       entry.display ?? null,
       entry.effort?.levels ?? null,
       entry.effort?.defaultLevel ?? null,
+      // Appended only when present, so a config with one alias per model keeps its hash.
+      ...(entry.moreAliases ? [entry.moreAliases] : []),
     ];
   });
   const payload: unknown[] = [transformsVersion, canonical];
@@ -1211,7 +1213,8 @@ export async function applyPatch(
   writePatchManifest(manifest);
 
   const modelCount = Object.keys(desired.config).length;
-  const aliasCount = Object.values(desired.config).filter(entry => entry.alias).length;
+  const aliasCount = Object.values(desired.config)
+    .reduce((n, entry) => n + (entry.alias ? 1 : 0) + (entry.moreAliases?.length ?? 0), 0);
   const windowCount = Object.values(desired.config).filter(entry => entry.context).length;
   return {
     ok: true,

@@ -1118,6 +1118,68 @@ describe('runPatchCommand local patches', () => {
   });
 });
 
+describe('runPatchCommand with several saved aliases for one model', () => {
+  /** A follow-latest name and a pin that currently agree, beside an unrelated aliased model. */
+  function saveTwoAliasesForOneModel(): void {
+    writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({
+      favoriteModels: [
+        { providerId: 'openai-oauth', modelId: 'gpt-6.1-sol' },
+        { providerId: 'openai-oauth', modelId: 'gpt-6-luna' },
+      ],
+      modelAliases: [
+        { name: 'sol', providerId: 'openai-oauth', modelId: 'gpt-6.1-sol' },
+        { name: 'sol61', providerId: 'openai-oauth', modelId: 'gpt-6.1-sol' },
+        { name: 'luna', providerId: 'openai-oauth', modelId: 'gpt-6-luna' },
+      ],
+    }));
+  }
+
+  it('patches and counts every alias, and still publishes a harmless local patch', async () => {
+    const real = installClaude('2.1.220');
+    saveTwoAliasesForOneModel();
+    writeFileSync(join(clodexHome, 'local-patches.mjs'), `
+      export default [{
+        id: 'harmless',
+        apply(source, { marker }) { return source + '\\n' + marker + 'harmless-change'; },
+      }];
+    `);
+
+    expect(await runPatchCommand({ localPatches: true })).toBe(0);
+    const published = bundleOf(real);
+    for (const name of ['sol', 'sol61', 'luna']) {
+      expect(published).toContain(`case"${name}":return "${name}";`);
+    }
+    expect(published).toContain('/*clodex-local:harmless*/harmless-change');
+    expect(logs.join('\n')).not.toMatch(/FAIL\s+LOCAL PATCH SET/);
+    expect(logs).toContainEqual(
+      expect.stringMatching(/^success: Patched claude 2\.1\.220: 2 models, 3 aliases, /),
+    );
+  });
+
+  // The edit keeps `case"sol61":` in place, so re-running the resolver patch over the local
+  // output is a no-op and cannot catch it. Only a proof of that alias's own case can.
+  it('rolls back a local patch that redirects only the second alias of a model', async () => {
+    const real = installClaude('2.1.220');
+    saveTwoAliasesForOneModel();
+    writeFileSync(join(clodexHome, 'local-patches.mjs'), `
+      export default [{
+        id: 'redirects-sol61',
+        apply(source, { marker }) {
+          return source.replace('case"sol61":return "sol61";', 'case"sol61":return "sol";')
+            + '\\n' + marker;
+        },
+      }];
+    `);
+
+    expect(await runPatchCommand({ localPatches: true })).toBe(0);
+    const published = bundleOf(real);
+    expect(published).toContain('case"sol61":return "sol61";');
+    expect(published).not.toContain('case"sol61":return "sol";');
+    expect(published).not.toContain('/*clodex-local:redirects-sol61*/');
+    expect(logs.join('\n')).toMatch(/FAIL\s+LOCAL PATCH SET.*changed built-in patch sites/);
+  });
+});
+
 describe('runPatchCommand pristine backup safety', () => {
   it('re-patches from the pristine backup instead of patching on top of a patch', async () => {
     const real = installClaude('2.1.220');

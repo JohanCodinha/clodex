@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.18.10](https://github.com/bman654/clodex/compare/v2.18.9...v2.18.10) (2026-10-06)
+
+
+### Bug Fixes
+
+* **patch:** make clodex patch work on Claude Code 2.1.290 instead of refusing every platform ([#314](https://github.com/bman654/clodex/issues/314)) ([eda1854](https://github.com/bman654/clodex/commit/eda185455738cae47f64999f62c41d8cd007eceb))
+
+## [2.18.9](https://github.com/bman654/clodex/compare/v2.18.8...v2.18.9) (2026-10-05)
+
+
+### Bug Fixes
+
+* **proxy:** let Python 3.13+ tools connect to Anthropic through the clodex proxy ([#312](https://github.com/bman654/clodex/issues/312)) ([27808ba](https://github.com/bman654/clodex/commit/27808bac70faacea674949fb3101243ba6f69ac3))
+
+## [2.18.8](https://github.com/bman654/clodex/compare/v2.18.7...v2.18.8) (2026-10-05)
+
+
+### Bug Fixes
+
+* **models:** stop extra aliases of a model falling back to a 200K context window ([#309](https://github.com/bman654/clodex/issues/309)) ([7ad8ae6](https://github.com/bman654/clodex/commit/7ad8ae652795c612b6d8d8cef60b2c654339f467))
+* **opencode-go:** make DeepSeek V4.1 Flash answer again via the endpoint OpenCode documents ([#310](https://github.com/bman654/clodex/issues/310)) ([14eee0d](https://github.com/bman654/clodex/commit/14eee0dc561b09bf86e3575d97bd021e5d3e94bb))
+
 ## [2.18.7](https://github.com/bman654/clodex/compare/v2.18.6...v2.18.7) (2026-09-30)
 
 

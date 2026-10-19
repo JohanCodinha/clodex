@@ -95,6 +95,22 @@ describe('PATCH 11: catalog picker options', () => {
     });
   });
 
+  // A model saved under two names — a follow-latest alias and a pin — gets a row for each, both
+  // carrying the model's label, on the served path and on the legacy one.
+  it('lists every alias of one model on both paths, each labelled with the model', () => {
+    const label = 'GPT-6.1 Sol (OpenAI (ChatGPT))';
+    const source = applyClodexPatches(CLAUDE_FIXTURE, {
+      'clodex:openai-oauth:gpt-6.1-sol': { alias: 'sol', moreAliases: ['sol61'], display: label },
+    }).content;
+    const rows = [
+      { value: 'sol', label: 'Sol', description: label },
+      { value: 'sol61', label: 'Sol61', description: label },
+    ];
+
+    expect(runPicker(source, SERVED)).toEqual({ rows: [...SERVED, ...rows], legacyCalls: 0 });
+    expect(runPicker(source, null)).toEqual({ rows: [{ value: 'opus' }, ...rows], legacyCalls: 1 });
+  });
+
   it('keeps a served row whose value is an alias instead of adding a second one', () => {
     const serverSol = { value: 'sol', label: 'Server Sol', description: 'From the catalog' };
     expect(runPicker(patched, [...SERVED, serverSol]).rows)
@@ -177,6 +193,8 @@ describe('PATCH 11: catalog picker options', () => {
     it('offers both to the Agent tool and gives both the model\'s context window', () => {
       const agentEnum = JSON.parse(/\.enum\((\[[^\]]*\])\)\.optional\(\)/.exec(patched.content)![1]!) as string[];
       expect(agentEnum).toEqual(expect.arrayContaining(['gpt-6.1-sol', 'gpt-6.1-sol-fast']));
+      expect(agentEnum.filter(name => name === 'gpt-6.1-sol')).toHaveLength(1);
+      expect(agentEnum.filter(name => name === 'gpt-6.1-sol-fast')).toHaveLength(1);
       const windows = JSON.parse(/\/\*ccpatch:ctx\*\/var _ccw=\((\{[^}]*\})\)/.exec(patched.content)![1]!) as Record<string, number>;
       expect(windows).toMatchObject({ 'gpt-6.1-sol': 272_000, 'gpt-6.1-sol-fast': 272_000 });
     });
