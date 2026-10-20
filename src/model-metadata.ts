@@ -32,7 +32,16 @@ export interface ModelMetadata {
   id: string;
   providerId?: string;
   modelId?: string;
+  /**
+   * The model's first saved alias — the same name as `aliases[0]`. Kept for consumers that read
+   * one name; it cannot represent a model saved under several.
+   */
   alias?: string;
+  /**
+   * Every saved alias of the model, in the order they were saved; each one selects this model.
+   * Present only when the model has at least one alias.
+   */
+  aliases?: string[];
   displayName?: string;
   context: ModelContextMetadata;
   maxOutputTokens?: number;
@@ -58,14 +67,14 @@ function effortFor(meta: PatchModelMeta): ModelEffortMetadata | undefined {
   };
 }
 
-function metadataFor(id: string, meta: PatchModelMeta, alias?: string): ModelMetadata {
+function metadataFor(id: string, meta: PatchModelMeta, aliases: string[]): ModelMetadata {
   const effective = positive(meta.contextWindow);
   const effort = effortFor(meta);
   return {
     id,
     ...(meta.providerId ? { providerId: meta.providerId } : {}),
     ...(meta.modelId ? { modelId: meta.modelId } : {}),
-    ...(alias ? { alias } : {}),
+    ...(aliases.length > 0 ? { alias: aliases[0], aliases } : {}),
     ...(meta.displayName?.trim() ? { displayName: meta.displayName.trim() } : {}),
     context: {
       stop: meta.contextStop ?? 'standard',
@@ -97,7 +106,11 @@ function metadataFor(id: string, meta: PatchModelMeta, alias?: string): ModelMet
 export function buildModelMetadata(): ModelMetadata[] {
   const desired = buildDesiredPatchConfig({ sessionStops: true });
   return Object.entries(desired.config).map(([id, entry]) =>
-    metadataFor(id, desired.metaById[id] ?? {}, entry.alias),
+    metadataFor(
+      id,
+      desired.metaById[id] ?? {},
+      entry.alias === undefined ? [] : [entry.alias, ...(entry.moreAliases ?? [])],
+    ),
   );
 }
 
