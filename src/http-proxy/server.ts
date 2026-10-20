@@ -2,6 +2,7 @@ import * as http from 'node:http';
 import * as https from 'node:https';
 import * as net from 'node:net';
 import type { AddressInfo, Socket } from 'node:net';
+import { PassThrough, type Duplex } from 'node:stream';
 import { randomUUID } from 'node:crypto';
 import { URL } from 'node:url';
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib';
@@ -693,6 +694,13 @@ function forwardToAdapter(
         ...(typeof req.headers['x-claude-code-session-id'] === 'string'
           ? { 'x-claude-code-session-id': req.headers['x-claude-code-session-id'] }
           : {}),
+        // Subagent identity: the relay partitions ChatGPT WebSocket heads by it.
+        ...(typeof req.headers['x-claude-code-agent-id'] === 'string'
+          ? { 'x-claude-code-agent-id': req.headers['x-claude-code-agent-id'] }
+          : {}),
+        ...(typeof req.headers['x-claude-code-parent-agent-id'] === 'string'
+          ? { 'x-claude-code-parent-agent-id': req.headers['x-claude-code-parent-agent-id'] }
+          : {}),
         ...(lifecycle ? { 'x-relay-request-id': lifecycle.requestId } : {}),
       },
     }, upstreamRes => {
@@ -775,6 +783,116 @@ function forwardToAdapter(
     });
     upstream.end(rawBody);
   });
+}
+
+function forwardAnthropicUpgrade(
+  req: http.IncomingMessage,
+  clientSocket: Duplex,
+  head: Buffer,
+  origin: URL,
+  rejectUnauthorized: boolean,
+  agent: https.Agent | undefined,
+  sockets: Set<Socket>,
+): void {
+  // A pipelined request can still own the socket through an unfinished response.
+  // Sharing it would interleave the relay's bytes with that response, and
+  // assignSocket would throw, so drop the connection instead.
+  if ((clientSocket as Socket & { _httpMessage?: unknown })._httpMessage) {
+    clientSocket.destroy();
+    return;
+  }
+  // A paused socket hides EOF while the upstream handshake is pending. Keep
+  // reading into a bounded buffer without dropping early client frames.
+  const clientData = new PassThrough();
+  clientSocket.pipe(clientData);
+  let responseStarted = false;
+  let upgradedSocket: Socket | undefined;
+  const upstream = https.request({
+    protocol: 'https:',
+    hostname: origin.hostname,
+    port: origin.port || 443,
+    method: req.method,
+    path: req.url,
+    headers: requestHeadersWithoutProxyHeaders(req),
+    servername: net.isIP(origin.hostname) ? undefined : origin.hostname,
+    rejectUnauthorized,
+    agent,
+  });
+  const fail = (): void => {
+    if (clientSocket.destroyed) return;
+    if (responseStarted) {
+      clientSocket.destroy();
+      return;
+    }
+    responseStarted = true;
+    clientSocket.end(
+      'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n',
+      () => clientSocket.destroy(),
+    );
+  };
+  clientSocket.once('error', () => clientSocket.destroy());
+  clientSocket.once('end', () => {
+    if (!responseStarted) clientSocket.destroy();
+  });
+  clientSocket.once('close', () => {
+    clientData.destroy();
+    upstream.destroy();
+    upgradedSocket?.destroy();
+  });
+  upstream.once('socket', socket => {
+    if (clientSocket.destroyed) socket.destroy();
+  });
+  upstream.once('error', fail);
+  upstream.once('close', () => {
+    if (!responseStarted) fail();
+  });
+  upstream.once('response', upstreamRes => {
+    if (clientSocket.destroyed) {
+      upstreamRes.destroy();
+      return;
+    }
+    responseStarted = true;
+    // A rejected upgrade is still HTTP; ServerResponse restores chunk framing
+    // after IncomingMessage decodes it, instead of sending an invalid raw body.
+    const response = new http.ServerResponse(req);
+    response.shouldKeepAlive = false;
+    response.assignSocket(clientSocket as Socket);
+    // Node removes its own drain forwarder from a socket it hands to 'upgrade',
+    // so a body larger than the write buffer would stall without this relay.
+    clientSocket.on('drain', () => response.emit('drain'));
+    response.once('error', () => clientSocket.destroy());
+    response.once('finish', () => clientSocket.end(() => clientSocket.destroy()));
+    copyResponse(upstreamRes, response);
+  });
+  upstream.once('upgrade', (upstreamRes, socket, upstreamHead) => {
+    if (clientSocket.destroyed) {
+      socket.destroy();
+      return;
+    }
+    responseStarted = true;
+    // Only upgraded sockets leave request ownership. An HTTP rejection can
+    // return its socket to the agent for another request before this client closes.
+    upgradedSocket = socket;
+    sockets.add(socket);
+    socket.once('error', () => clientSocket.destroy());
+    socket.once('close', () => {
+      sockets.delete(socket);
+      clientSocket.destroy();
+    });
+    const headers = [
+      `HTTP/${upstreamRes.httpVersion} ${upstreamRes.statusCode} ${upstreamRes.statusMessage}`,
+    ];
+    for (let i = 0; i < upstreamRes.rawHeaders.length; i += 2) {
+      headers.push(`${upstreamRes.rawHeaders[i]}: ${upstreamRes.rawHeaders[i + 1]}`);
+    }
+    clientSocket.write(Buffer.from(`${headers.join('\r\n')}\r\n\r\n`, 'latin1'));
+    // Either HTTP parser can read beyond the handshake into the first frame.
+    if (upstreamHead.length > 0) clientSocket.write(upstreamHead);
+    if (head.length > 0) socket.write(head);
+    clientData.pipe(socket);
+    socket.pipe(clientSocket);
+  });
+  upstream.end();
 }
 
 function forwardPlainHttp(req: http.IncomingMessage, res: http.ServerResponse): void {
@@ -960,9 +1078,9 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
         // The adapter resolves alias names itself and must echo the client's
         // requested model id in response messages. Encoded bodies are decoded
         // for this local hop, but their JSON model value is not rewritten.
-        // Claude Code resolves context windows from the response model field, so
-        // substituting the canonical route id here breaks its window lookup for
-        // patched/alias model ids (wrong auto-compact threshold → agent death).
+        // Substituting the canonical route id here broke patched/alias ids in the
+        // field. The window lookup does not read the response body in 2.1.261 (see
+        // `.claude/docs/claude-code-internals.md`); the echo is about identity.
         await forwardToAdapter(
           req,
           res,
@@ -1039,6 +1157,17 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
   });
 
   const sockets = new Set<Socket>();
+  mitmServer.on('upgrade', (req, socket, head) => {
+    forwardAnthropicUpgrade(
+      req,
+      socket,
+      head,
+      anthropicOrigin,
+      options.anthropicRejectUnauthorized ?? true,
+      anthropicAgent,
+      sockets,
+    );
+  });
   const proxyServer = http.createServer(forwardPlainHttp);
   proxyServer.on('connection', socket => {
     sockets.add(socket);
@@ -1052,6 +1181,10 @@ export async function startHttpProxy(options: HttpProxyOptions): Promise<HttpPro
       return;
     }
 
+    // Node's http server drops its own 'error' listener once it hands the
+    // socket to 'connect'. Without a replacement a client reset -- or an EPIPE
+    // on the 400 write below -- surfaces as an uncaughtException (issue #233).
+    clientSocket.once('error', () => clientSocket.destroy());
     const target = authorityParts(req.url ?? '');
     if (!target) {
       clientSocket.end('HTTP/1.1 400 Bad Request\r\n\r\n');

@@ -17,6 +17,7 @@ import {
   getTemplateById,
 } from './provider-templates.js';
 import { addProviderFromTemplate } from './registry/add-template.js';
+import { runCustomEndpointAddFlow } from './providers-custom-add.js';
 import {
   removeProviderFromRegistry,
   setActiveOAuthAccount,
@@ -180,7 +181,8 @@ ${pc.bold('Usage:')}
 
 ${pc.bold('Subcommands:')}
   (none)      Provider hub wizard
-  add         Add a built-in provider or sign in with ChatGPT
+  add         Add a built-in provider, a custom OpenAI-compatible server, or sign in with
+              ChatGPT or GitHub Copilot
   auth        Sign in with ChatGPT/Codex-plan OAuth (device code, or --browser)
   list        Show configured providers
   remove      Remove a provider by id
@@ -668,10 +670,11 @@ async function runProvidersAddWithCleanupState(
     });
   }
 
-  if (options.length === 0) {
-    p.log.info('All built-in providers are already configured.');
-    return 0;
-  }
+  options.push({
+    value: 'custom',
+    label: 'Custom OpenAI-compatible server',
+    hint: 'OpenRouter, Together, LM Studio, vLLM — any base URL',
+  });
 
   const choice = await p.select({
     message: 'Add a provider',
@@ -687,6 +690,14 @@ async function runProvidersAddWithCleanupState(
     const method = await promptOAuthMethod(providerId);
     if (method === null) return 0;
     return runProvidersAuthWithCleanupState(providerId, method, cleanupState);
+  }
+  if (choice === 'custom') {
+    return runCustomEndpointAddFlow(result =>
+      reportCredentialCleanup(
+        result.credentialCleanupPending === true,
+        cleanupState,
+        result.credentialCleanupReconciled === true,
+      ));
   }
   if (typeof choice === 'string' && choice.startsWith('api:')) {
     return runTemplateAddFlow(choice.slice('api:'.length), cleanupState);

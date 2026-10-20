@@ -17,13 +17,16 @@ import {
   streamOpenAiResponse,
   type OpenAiRequest,
 } from '../openai-adapter.js';
-import { sendJson, readBody } from '../http-utils.js';
+import { sendJson, readBody, watchClientDisconnect, clientDisconnected } from '../http-utils.js';
 import { providerDynamicHeaders } from '../github-copilot.js';
 import {
   anthropicSchemaRepairsFor,
   applyFastModeVariant,
+  isThreadContinuation,
   relayAnthropicMessages,
   resolveOAuthRetryReplacement,
+  THREAD_UNSUPPORTED_BODY,
+  upstreamHoldsThreads,
 } from '../upstream-forward.js';
 import {
   anthropicPromptTooLongMessage,
@@ -62,12 +65,14 @@ import {
   generateAnthropicResponse,
   silenceSdkWarnings,
   anthropicEffortFromRequest,
+  extractClaudeAgentIds,
   extractClaudeSessionId,
   isOpenAiOAuthRoute,
   resolveServiceTier,
   type AnthropicRequest,
 } from '../sdk-adapter.js';
 import { withResponsesWebSocketDiagnosticContext } from '../oauth/responses-websocket.js';
+import { openCodeGoSessionHeaders } from '../data/opencode-go-models.js';
 import { listenTcpServer, tcpListenerUrlHost } from '../listener-ready.js';
 
 export interface ServerOptions {
@@ -282,6 +287,7 @@ async function handleAnthropicMessages(
   modelCache: LanguageModelCache,
   plog: PLog,
 ): Promise<void> {
+  const clientAbort = watchClientDisconnect(res);
   const body = await readJson(req);
   if (!body) {
     sendJson(res, 400, { error: { message: 'Invalid JSON body' } });
@@ -298,6 +304,7 @@ async function handleAnthropicMessages(
     ? req.headers['x-claude-code-session-id'][0]
     : req.headers['x-claude-code-session-id'];
   const claudeSessionId = extractClaudeSessionId(body as AnthropicRequest, claudeSessionIdHeader);
+  const claudeAgentIds = extractClaudeAgentIds(req.headers);
   if (options.webSocketDiagnosticsLogPath) {
     writeWebSocketDiagnosticRequestLog(options.webSocketDiagnosticsLogPath, {
       requestId,
@@ -321,6 +328,19 @@ async function handleAnthropicMessages(
       return;
     }
     const messagesUrl = `${model.baseUrl}/v1/messages`;
+    // Same rule the proxy applies, for the same reason: a thread continuation
+    // carries only the messages after Claude Code's anchor, and only Anthropic's
+    // own API holds the rest. Endpoint mode reaches this branch for every
+    // Anthropic-format route the registry has — a Copilot Claude model, a custom
+    // Anthropic-compatible endpoint — and relaying the delta to one of those
+    // answers a truncated conversation as if it were whole.
+    const holdsThreads = upstreamHoldsThreads(messagesUrl);
+    if (!holdsThreads && isThreadContinuation(body as Record<string, unknown>)) {
+      plog(() => `thread continuation refused: model=${model.id} upstream does not hold threads`);
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(THREAD_UNSUPPORTED_BODY);
+      return;
+    }
     let apiKey: string;
     try {
       apiKey = await resolveModelApiKey(model, options.apiKey);
@@ -339,6 +359,7 @@ async function handleAnthropicMessages(
     );
     const authType = model.authType ?? 'api';
     const isOAuth = authType === 'oauth';
+    const goSessionHeaders = openCodeGoSessionHeaders(model, claudeSessionId);
 
     auditInference(options, {
       requestId,
@@ -369,35 +390,50 @@ async function handleAnthropicMessages(
       : undefined;
 
     plog(() => `anthropic-passthrough → ${messagesUrl} oauth=${isOAuth} stream=${clientWantsStream}`);
-    await relayAnthropicMessages(res, messagesUrl, forwardBody, apiKey, clientWantsStream, {
-      inboundBeta: effectiveBeta,
-      authType,
-      log: message => plog(message),
-      claudeCodeSessionId,
-      extraHeaders: { ...model.headers, ...providerDynamicHeaders(model.providerId, forwardBody) },
-      repairs: anthropicSchemaRepairsFor(
-        `${model.providerId ?? 'anthropic'}:${upstreamModelId(model)}`,
-        model.compatibility,
-      ),
-      refreshToken,
-      onTokenRefreshed: refreshed => { model.apiKey = refreshed; },
-      // Echo the exact requested id when it differs from the upstream id, so
-      // clients that key context windows on the response model still resolve.
-      responseModelOverride:
-        typeof body.model === 'string' && body.model !== upstreamModelId(model)
-          ? body.model
+    try {
+      await relayAnthropicMessages(res, messagesUrl, forwardBody, apiKey, clientWantsStream, {
+        inboundBeta: effectiveBeta,
+        authType,
+        log: message => plog(message),
+        claudeCodeSessionId,
+        extraHeaders: {
+          ...model.headers,
+          ...goSessionHeaders,
+          ...providerDynamicHeaders(model.providerId, forwardBody),
+        },
+        repairs: anthropicSchemaRepairsFor(
+          `${model.providerId ?? 'anthropic'}:${upstreamModelId(model)}`,
+          model.compatibility,
+        ),
+        refreshToken,
+        onTokenRefreshed: refreshed => { model.apiKey = refreshed; },
+        signal: clientAbort.signal,
+        // Echo the exact requested id when it differs from the upstream id, so
+        // clients that key context windows on the response model still resolve.
+        responseModelOverride:
+          typeof body.model === 'string' && body.model !== upstreamModelId(model)
+            ? body.model
+            : undefined,
+        // An upstream that holds no threads must not hand Claude Code an id it
+        // would anchor the next request on.
+        anchorSafeMessageIds: !holdsThreads,
+        onUpstreamError: options.inferenceLogPath
+          ? (statusCode, errorContent) => writeInferenceResponseErrorLog(options.inferenceLogPath!, {
+              requestId,
+              modelId: body.model,
+              provider: inferenceProvider(model),
+              route: 'passthrough',
+              statusCode,
+              errorContent,
+            })
           : undefined,
-      onUpstreamError: options.inferenceLogPath
-        ? (statusCode, errorContent) => writeInferenceResponseErrorLog(options.inferenceLogPath!, {
-            requestId,
-            modelId: body.model,
-            provider: inferenceProvider(model),
-            route: 'passthrough',
-            statusCode,
-            errorContent,
-          })
-        : undefined,
-    });
+      });
+    } catch (err) {
+      // Cancellation is not a failure to report: the client that would read the
+      // error is the one that left. Proxy mode makes the same choice.
+      if (clientDisconnected(clientAbort.signal)) return;
+      throw err;
+    }
     return;
   }
 
@@ -454,7 +490,10 @@ async function handleAnthropicMessages(
       },
       maxTools: npmMaxTools,
       maxOutputTokens: model.maxOutputTokens,
+      log: plog,
     });
+    const goSdkSessionHeaders = openCodeGoSessionHeaders(model, claudeSessionId);
+    if (goSdkSessionHeaders) params.headers = { ...params.headers, ...goSdkSessionHeaders };
     const clientWantsStream = Boolean(body.stream);
     // Use the display name in the response model field when masking is on — Claude
     // Desktop shows the response model field in its status bar chip, so this surfaces
@@ -486,8 +525,9 @@ async function handleAnthropicMessages(
             res.write(chunk);
           };
           await withResponsesWebSocketDiagnosticContext(
-            { requestId, claudeSessionId },
+            { requestId, claudeSessionId, ...claudeAgentIds },
             () => streamAnthropicResponse(languageModel, params, responseModelId, writeStreamChunk, undefined, {
+              abortSignal: clientAbort.signal,
               initialInputTokens: estimateAnthropicInputTokens(body),
               onPromptTokens: total => reportPricingBoundaryCrossing({
                 modelKey: model.id,
@@ -504,9 +544,10 @@ async function handleAnthropicMessages(
           // returns text/event-stream unconditionally), so stream internally and
           // collect the result instead of issuing a non-streaming SDK request.
           const anthropicResponse = await withResponsesWebSocketDiagnosticContext(
-            { requestId, claudeSessionId },
+            { requestId, claudeSessionId, ...claudeAgentIds },
             () => generateAnthropicResponse(languageModel, params, responseModelId, {
               forceStream: openAiOAuth,
+              abortSignal: clientAbort.signal,
               onPromptTokens: total => reportPricingBoundaryCrossing({
                 modelKey: model.id,
                 modelLabel: model.name || model.id,
@@ -519,6 +560,9 @@ async function handleAnthropicMessages(
         }
         break;
       } catch (err) {
+        // A cancelled request has no client left to answer, and the abort is
+        // not an upstream failure worth recording as one.
+        if (clientDisconnected(clientAbort.signal)) break;
         const message = formatUpstreamError(err);
         const details = sdkUpstreamErrorDetails(err);
         const candidateStatus = details?.statusCode ?? upstreamHttpStatus(err, message);
@@ -558,7 +602,7 @@ async function handleAnthropicMessages(
             sendJson(res, status === 500 ? 502 : status, { error: { message: clientMessage } });
           }
         } else {
-          const errorType = anthropicErrorType(status);
+          const errorType = anthropicErrorType(status, details?.transportCode);
           res.write(`event: error\ndata: ${JSON.stringify({
             type: 'error',
             error: { type: errorType, message: clientMessage },
@@ -595,6 +639,7 @@ async function handleAnthropicCountTokens(
   options: ServerOptions,
   plog: PLog,
 ): Promise<void> {
+  const clientAbort = watchClientDisconnect(res);
   const body = await readJson(req);
   if (!body) {
     sendJson(res, 400, { error: { message: 'Invalid JSON body' } });
@@ -656,14 +701,20 @@ async function handleAnthropicCountTokens(
 
   const countTokensUrl = `${model.baseUrl}/v1/messages/count_tokens`;
   plog(() => `anthropic-count-tokens → ${countTokensUrl} oauth=${isOAuth}`);
-  await relayAnthropicMessages(res, countTokensUrl, forwardBody, apiKey, false, {
-    inboundBeta,
-    authType,
-    log: message => plog(message),
-    extraHeaders: model.headers,
-    refreshToken,
-    onTokenRefreshed: refreshed => { model.apiKey = refreshed; },
-  });
+  try {
+    await relayAnthropicMessages(res, countTokensUrl, forwardBody, apiKey, false, {
+      inboundBeta,
+      authType,
+      log: message => plog(message),
+      extraHeaders: model.headers,
+      refreshToken,
+      onTokenRefreshed: refreshed => { model.apiKey = refreshed; },
+      signal: clientAbort.signal,
+    });
+  } catch (err) {
+    if (clientDisconnected(clientAbort.signal)) return;
+    throw err;
+  }
 }
 
 async function handleOpenAIChatCompletions(
@@ -673,6 +724,7 @@ async function handleOpenAIChatCompletions(
   modelCache: LanguageModelCache,
   plog: PLog,
 ): Promise<void> {
+  const clientAbort = watchClientDisconnect(res);
   const body = await readJson(req);
   if (!body) {
     sendJson(res, 400, { error: { message: 'Invalid JSON body' } });
@@ -681,6 +733,15 @@ async function handleOpenAIChatCompletions(
 
   const model = lookupModel(res, options.catalog, body.model);
   if (!model) return;
+
+  // An OpenAI-format body carries no Claude metadata block, so the session id can
+  // only come from the header Claude Code sends. Absent one, openCodeGoSessionHeaders
+  // falls back to its stable per-process id — Go rejects a request with no session
+  // header at all, on this route exactly as on /v1/messages.
+  const openAiSessionIdHeader = Array.isArray(req.headers['x-claude-code-session-id'])
+    ? req.headers['x-claude-code-session-id'][0]
+    : req.headers['x-claude-code-session-id'];
+  const goSessionHeaders = openCodeGoSessionHeaders(model, openAiSessionIdHeader);
 
   if (supportsDirectOpenAIChatCompletions(model)) {
     if (model.completionsUrl && !/^https?:\/\//i.test(model.completionsUrl)) {
@@ -719,21 +780,27 @@ async function handleOpenAIChatCompletions(
           rejectedAccessToken,
         )
       : undefined;
-    await relayAnthropicMessages(res, completionsUrl, forwardBody, apiKey, Boolean(body.stream), {
-      authType: model.authType ?? 'api',
-      extraHeaders: model.headers,
-      refreshToken,
-      onTokenRefreshed: refreshed => { model.apiKey = refreshed; },
-      onUpstreamError: options.inferenceLogPath
-        ? (statusCode, errorContent) => writeInferenceResponseErrorLog(options.inferenceLogPath!, {
-            modelId: body.model,
-            provider: inferenceProvider(model),
-            route: 'passthrough',
-            statusCode,
-            errorContent,
-          })
-        : undefined,
-    });
+    try {
+      await relayAnthropicMessages(res, completionsUrl, forwardBody, apiKey, Boolean(body.stream), {
+        authType: model.authType ?? 'api',
+        extraHeaders: { ...model.headers, ...goSessionHeaders },
+        refreshToken,
+        onTokenRefreshed: refreshed => { model.apiKey = refreshed; },
+        signal: clientAbort.signal,
+        onUpstreamError: options.inferenceLogPath
+          ? (statusCode, errorContent) => writeInferenceResponseErrorLog(options.inferenceLogPath!, {
+              modelId: body.model,
+              provider: inferenceProvider(model),
+              route: 'passthrough',
+              statusCode,
+              errorContent,
+            })
+          : undefined,
+      });
+    } catch (err) {
+      if (clientDisconnected(clientAbort.signal)) return;
+      throw err;
+    }
     return;
   }
 
@@ -768,6 +835,7 @@ async function handleOpenAIChatCompletions(
     openAiOAuth,
     serviceTier: openAiServiceTier,
   });
+  if (goSessionHeaders) params.headers = { ...params.headers, ...goSessionHeaders };
   const clientWantsStream = Boolean(body.stream);
   const responseModelId = getResponseModelId(body.model, model, options);
 
@@ -794,18 +862,24 @@ async function handleOpenAIChatCompletions(
           }
           res.write(chunk);
         };
-        await streamOpenAiResponse(languageModel, params, responseModelId, writeStreamChunk);
+        await streamOpenAiResponse(languageModel, params, responseModelId, writeStreamChunk, {
+          abortSignal: clientAbort.signal,
+        });
         if (!res.headersSent) writeStreamChunk('');
         res.end();
       } else {
         // ChatGPT/Codex OAuth routes only ever answer as SSE (the WebSocket fetch
         // returns text/event-stream unconditionally), so stream internally and
         // collect the result instead of issuing a non-streaming SDK request.
-        const response = await generateOpenAiResponse(languageModel, params, responseModelId, { forceStream: openAiOAuth });
+        const response = await generateOpenAiResponse(languageModel, params, responseModelId, {
+          forceStream: openAiOAuth,
+          abortSignal: clientAbort.signal,
+        });
         sendJson(res, 200, response);
       }
       break;
     } catch (err) {
+      if (clientDisconnected(clientAbort.signal)) break;
       const message = formatUpstreamError(err);
       const details = sdkUpstreamErrorDetails(err);
       const candidateStatus = details?.statusCode ?? upstreamHttpStatus(err, message);
@@ -892,10 +966,9 @@ async function getOrInitLanguageModel(
 }
 
 function getResponseModelId(bodyModel: unknown, model: ServerModelInfo, options: ServerOptions): string {
-  // Echo invariant: a saved short alias is echoed back verbatim even when
-  // masking is on — Claude Code resolves context windows from the response
-  // `model` field but preflights with the request alias, so rewriting it here
-  // would break auto-compaction (see CLAUDE.md).
+  // Echo invariant: a saved short alias is echoed back verbatim even when masking
+  // is on, so the id a client sees back is the id it sent. The window lookup itself
+  // does not read the response body — see `.claude/docs/claude-code-internals.md`.
   if (typeof bodyModel === 'string' && options.aliasNames?.has(bodyModel)) return bodyModel;
   return options.gateway?.maskGatewayIds
     ? gatewayDisplayName(model, options.gateway)

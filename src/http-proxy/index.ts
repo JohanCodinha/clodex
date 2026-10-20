@@ -243,6 +243,7 @@ export async function runHttpProxyServerCommand(
   if (handle.webSocketDiagnosticsLogPath) {
     console.log(`  WebSocket diagnostics: ${handle.webSocketDiagnosticsLogPath}`);
     console.log(pc.yellow('  Diagnostic mode records request headers and metadata; credential headers are redacted.'));
+    console.log(pc.yellow('  It also records OpenAI usage-limit reports verbatim, including account credits and promotions.'));
   }
   console.log('');
   printHttpProxyModels(loaded.routes, loaded.aliases);

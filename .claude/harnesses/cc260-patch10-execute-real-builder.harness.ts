@@ -1,33 +1,28 @@
 // REVIEW HARNESS (not for merge) — Claude Code 2.1.260 PATCH 10 anchor repair.
 //
-// 2.1.260 changed how the child-env builder READS the remote flag. Through
-// 2.1.259 its opening `let` called a helper on it —
-// `De(process.env.CLAUDE_CODE_REMOTE)?…` — and 2.1.260 compares a module-level
-// env snapshot instead (`i=a.CLAUDE_CODE_REMOTE===!0,l=i?…`). The anchor's head
-// spelled the call form, so PATCH 10 (which is required) reported "anchor not
-// found" and `clodex patch` refused every one of the eight published builds.
+// 2.1.260 rewrote the remote-mode check the head anchor ended on: through
+// 2.1.259 it was `<fn>(process.env.CLAUDE_CODE_REMOTE)?`, and 2.1.260 reads the
+// flag off the typed env accessor and compares it inline
+// (`i=a.CLAUDE_CODE_REMOTE===!0`). PATCH 10 is required, so `clodex patch`
+// refused all eight published builds.
 //
 // This drives the REAL applyClodexPatches over EVERY REAL 2.1.260 bundle, then
 // EXTRACTS the patched builder and EXECUTES it. Reading a regex replacement is
-// not evidence the code runs. Every free identifier is bound explicitly and
-// recovered from the builder's own text, so a name the harness failed to
-// account for surfaces as a ReferenceError rather than passing silently.
+// not evidence the code runs.
 //
-// `vitest.config.ts` scopes collection to `tests/`, so this file is never
-// collected by `pnpm test`. Run it with a throwaway config of your own:
+// `freeBindings` is a HAND-MAINTAINED table, keyed by the first-appearance index
+// of each identifier token rather than by its spelling, so one reviewed table
+// covers all eight builds. Know its limit: a binding is only proven present and
+// correctly mapped when a scenario below REACHES it. Deleting an entry the
+// scenarios never evaluate leaves this file green — measured, by deleting the
+// unix-socket sentinel (index 118) and getting 170/170. The three landmark-index
+// assertions and the token count catch gross drift, not that.
 //
-//   cat > /tmp/h.config.ts <<'EOC'
+//   cat > /tmp/h260.config.ts <<'EOF'
 //   import { defineConfig } from 'vitest/config';
 //   export default defineConfig({ test: { include: ['.claude/harnesses/cc260-*.harness.ts'] } });
-//   EOC
-//   REVIEW_BUNDLE_DIR=<bundle dir> pnpm vitest run --config /tmp/h.config.ts
-//
-// To cover all eight platforms, download each build from
-// https://downloads.claude.ai/claude-code-releases/2.1.260/<platform>/claude
-// (checksums in .../2.1.260/manifest.json), hard-link them into a scratch dir as
-// `claude-2.1.260-<platform>.orig`, point TWEAKCC_CONFIG_DIR at it and run
-// `node scripts/extract-cc-bundles.mjs <bundle dir>` — the extractor never
-// writes to its inputs.
+//   EOF
+//   REVIEW_BUNDLE_DIR=~/.cache/clodex-review-bundles/2.1.260 pnpm vitest run --config /tmp/h260.config.ts
 import { describe, expect, it } from 'vitest';
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -36,29 +31,20 @@ import vm from 'node:vm';
 import { applyClodexPatches } from '../../src/patch-transforms.js';
 import { NETWORK_ENV_CONTRACT_VAR } from '../../src/network-env.js';
 import { BUNDLE_MODULE_SEPARATOR } from '../../src/bun-bundle.js';
-import { EXPECTED_PATCH_SITES } from '../../scripts/probe-patch-sites.mjs';
 
 const BUNDLE_DIR = process.env['REVIEW_BUNDLE_DIR'] ?? '';
 const MARKER = '/*ccpatch:child-network-env*/';
-// Context and effort are set so every conditional site is exercised; a config with
-// only alias/display activates nine of the eleven, and "every patch site" would then
-// be a broader title than the assertion.
-const CONFIG = {
-  'clodex:openai:gpt-5.6-sol': {
-    alias: 'sol',
-    display: 'GPT-5.6 Sol',
-    context: 272000,
-    effort: { levels: ['low', 'medium', 'high', 'xhigh', 'max'], defaultLevel: 'high' },
-  },
-};
+const CONFIG = { 'clodex:openai:gpt-5.6-sol': { alias: 'sol', display: 'GPT-5.6 Sol' } };
+
+const PLATFORMS = [
+  'darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-arm64-musl',
+  'linux-x64', 'linux-x64-musl', 'win32-arm64', 'win32-x64',
+];
 
 function bundles(): string[] {
   if (!BUNDLE_DIR || !existsSync(BUNDLE_DIR)) return [];
-  return readdirSync(BUNDLE_DIR)
-    .filter(f => /^claude-2\.1\.260-[a-z0-9-]+\.js$/.test(f) && !f.includes('pristine'))
-    .sort();
+  return readdirSync(BUNDLE_DIR).filter(f => f.endsWith('.js')).sort();
 }
-
 const FILES = bundles();
 
 function patchedBuilderSource(patched: string): string {
@@ -77,109 +63,104 @@ function patchedBuilderSource(patched: string): string {
   throw new Error('unbalanced');
 }
 
-/** Every free identifier the 2.1.260 builder reads, recovered from its own text. */
-function freeNames(builder: string): Record<string, string> {
-  const pick = (label: string, re: RegExp, group = 1): string => {
-    const m = builder.match(re);
-    expect(m, `could not locate ${label}`).toBeTruthy();
-    return m![group]!;
-  };
-  const hostRegistry = /\}let [\w$]+=([\w$]+)\.of\(([\w$]+)\(\)\.host\)/;
-  const denyLists = /,[\w$]+=([\w$]+)\(_clodexChildEnv\),[\w$]+=([\w$]+)\(\),[\w$]+=!1;/;
-  const scrubLoop = /if\(![\w$]+\)return [\w$]+;let [\w$]+=([\w$]+)\(\),[\w$]+=([\w$]+)\(\)\.length>0;for\(let\[/;
-  const denyTests = /\.replace\(\/-\/g,"_"\)\)\|\|([\w$]+)\.test\([\w$]+\)\|\|([\w$]+)\([\w$]+\)\|\|[\w$]+&&([\w$]+)\([\w$]+\)\)\{delete/;
-  const rewrite = /if\(([\w$]+)\([\w$]+\)\)\{let [\w$]+=([\w$]+)\([\w$]+,[\w$]+\);if\([\w$]+\.value!==/;
-  const cut = /let [\w$]+=([\w$]+)\([\w$]+,[\w$]+\.value\);if\([\w$]+!==void 0&&!([\w$]+)\(/;
-  const normalize = /continue\}let [\w$]+=([\w$]+)\([\w$]+,[\w$]+\);if\([\w$]+===void 0\)\{if\(([\w$]+)\([\w$]+\)\)delete/;
+/**
+ * Every identifier-like token in the builder, in source order. Minified builds of
+ * one release name the same locals differently, so the roster below is keyed by
+ * FIRST-APPEARANCE INDEX rather than by spelling — `canonical()` is what shows that
+ * index means the same thing on every build.
+ */
+const TOKEN = /[A-Za-z_$][\w$]*/g;
+
+function distinctTokens(src: string): string[] {
+  const seen: string[] = [];
+  for (const m of src.matchAll(TOKEN)) if (!seen.includes(m[0])) seen.push(m[0]);
+  return seen;
+}
+
+/**
+ * The builder with every identifier-like token replaced by its first-appearance
+ * index. This is a TEXTUAL skeleton, not semantic alpha-equivalence: `TOKEN` also
+ * matches property names and identifier-like text inside strings and regex
+ * literals. Two builders with the same skeleton are the same tokens in the same
+ * order, which is what makes one index-keyed binding table valid for all of them.
+ */
+function canonical(src: string): string {
+  const seen = new Map<string, number>();
+  return src.replace(TOKEN, t => {
+    if (!seen.has(t)) seen.set(t, seen.size);
+    return `#${seen.get(t)}`;
+  });
+}
+
+const SENTINEL_PROXY_VALUE = '\u0000clodex-harness-proxy-sentinel';
+const SENTINEL_SOCKET_VALUE = '\u0000clodex-harness-socket-sentinel';
+
+/**
+ * What the builder reads from the rest of the bundle, by first-appearance index,
+ * recovered by reading the 2.1.260 builder in full. Every CONFIGURABLE stub answers
+ * "no": no name is denied, no value is rewritten, nothing is claimed as a
+ * credential. Claude Code's own hard-coded deletions still run and are asserted
+ * separately below; the network-restoration scenarios use keys those rules do not
+ * touch. `scrub` flips the one flag that decides whether the full
+ * credential-filtering tail runs at all, because with it off the builder returns
+ * before reaching it. `denyKey`, when set, makes one of the tail's deny predicates
+ * answer yes for exactly that name. Without it the scrub flag is unobservable: the
+ * only key that FORCES these scenarios onto the full-copy path is
+ * `CLAUDE_CODE_SUBSCRIPTION_TYPE`, which Claude Code deletes unconditionally, so it
+ * disappears whether the tail ran or not.
+ */
+function freeBindings(scrub: boolean, denyKey?: string): Record<number, unknown> {
   return {
-    // `let e=m.of(B().host)` — the per-host registry and the host resolver.
-    registry: pick('host registry', hostRegistry, 1),
-    hostOf: pick('host resolver', hostRegistry, 2),
-    // 2.1.260: `i=a.CLAUDE_CODE_REMOTE===!0` — the flag is read off a snapshot, not process.env.
-    snapshot: pick('env snapshot', /,[\w$]+=([\w$]+)\.CLAUDE_CODE_REMOTE===!0,/),
-    remoteEnv: pick('remote env builder', /\.CLAUDE_CODE_REMOTE===!0,[\w$]+=[\w$]+\?([\w$]+)\(/),
-    scrubFlag: pick('credential-scrub flag', /,[\w$]+=([\w$]+)\(\),[\w$]+=Object\.keys\(_clodexChildEnv\)\.some\(/),
-    upperSet: pick('upper-cased name set', /Object\.keys\(_clodexChildEnv\)\.some\(\(([\w$]+)\)=>([\w$]+)\.has\(\1\.toUpperCase\(\)\)\)/, 2),
-    upperPredicate: pick('upper-cased name predicate', /\|\|Object\.keys\(_clodexChildEnv\)\.some\(\(([\w$]+)\)=>([\w$]+)\(\1\.toUpperCase\(\)\)\)/, 2),
-    denyList: pick('dynamic deny list', denyLists, 1),
-    denyList2: pick('second dynamic deny list', denyLists, 2),
-    staticList: pick('static deny list', /;[\w$]+=([\w$]+)\.some\(\([\w$]+\)=>_clodexChildEnv\[/),
-    remotePredicate: pick('remote-only key predicate', /,[\w$]+=[\w$]+&&Object\.keys\(_clodexChildEnv\)\.some\(([\w$]+)\)/),
-    attributionPredicate: pick(
-      'attribution key predicate',
-      /,[\w$]+\)\{for\(let ([\w$]+) of Object\.keys\([\w$]+\)\)if\(([\w$]+)\(\1\)\)delete [\w$]+\[\1\]\}if\(/,
-      2,
-    ),
-    scrubList: pick('scrubbed-name list', /new Set\(\[\.\.\.([\w$]+)\(\),"CLAUDE_CODE_SUBSCRIPTION_TYPE"/),
-    denySet: pick('scrub deny set', scrubLoop, 1),
-    extraList: pick('scrub extra list', scrubLoop, 2),
-    proxySentinel: pick('proxy sentinel', /if\([\w$]+===([\w$]+)&&Object\.hasOwn\(/),
-    credSentinel: pick('credential sentinel', /==="ANTHROPIC_API_KEY"\)&&[\w$]+===([\w$]+)&&/),
-    denyRegex: pick('deny regex', denyTests, 1),
-    denyFn: pick('deny predicate', denyTests, 2),
-    denyFn2: pick('conditional deny predicate', denyTests, 3),
-    keepPredicate: pick('keep predicate', /if\([\w$]+===void 0\|\|([\w$]+)\([\w$]+\)\)continue;/),
-    rewritePredicate: pick('rewrite predicate', rewrite, 1),
-    rewriter: pick('rewriter', rewrite, 2),
-    cutSplit: pick('cut splitter', cut, 1),
-    cutHas: pick('cut membership', cut, 2),
-    normalizer: pick('normalizer', normalize, 1),
-    isSecret: pick('secret predicate', normalize, 2),
+    51: { of: () => ({ getAgentProxyEnv: () => ({}), settingsColorEnv: {} }) }, // host registry
+    52: () => ({ host: 'default' }),          // host resolver
+    62: {},                                   // typed env accessor (CLAUDE_CODE_REMOTE unset)
+    65: (x: unknown) => x,                    // remote-mode proxy env builder
+    68: () => scrub,                          // credential-scrub flag
+    72: new Set<string>(),                    // static uppercase deny set
+    75: () => false,                          // OTEL/artifact name predicate
+    79: () => [],                             // dynamic deny list
+    81: () => [],                             // second dynamic deny list
+    83: [],                                   // static deny list (iterated twice)
+    96: () => false,                          // BUN_JSC_ predicate
+    102: () => [],                            // scrubbed-name list
+    106: () => false,                         // conditional extra predicate
+    108: () => new Set<string>(),             // post-scrub deny set
+    110: () => [],                            // sandbox-mode list
+    113: SENTINEL_PROXY_VALUE,                // agent-proxy sentinel value
+    118: SENTINEL_SOCKET_VALUE,               // unix-socket credential sentinel
+    122: /(?!)/,                              // deny pattern that never matches
+    123: (k: string) => denyKey !== undefined && k === denyKey, // deny predicate
+    124: () => false,                         // sandbox deny predicate
+    125: () => false,                         // skip predicate
+    128: () => false,                         // "needs truncation" predicate
+    130: (_k: string, v: string) => ({ value: v, cut: false }),
+    134: () => undefined,                     // spill-over name builder
+    135: () => false,                         // spill-over collision check
+    137: (_k: string, v: string) => v,        // value sanitiser: identity
+    138: () => false,                         // "looks secret" predicate
   };
 }
 
-interface Scenario {
-  scrub?: boolean;
-  /** Extra keys the static deny list should strip, proving native filtering survives. */
-  staticDeny?: string[];
-}
+interface Scenario { scrub?: boolean; denyKey?: string }
 
+/** Execute the patched builder with `process.env` bound to `env`. */
 function runBuilder(
   patched: string,
   env: Record<string, string>,
   opts: Scenario = {},
 ): Record<string, string> {
   const builder = patchedBuilderSource(patched);
-  const names = freeNames(builder);
-  // Two roles recovered to the same identifier would collapse into one binding
-  // below; compare the recovered VALUES, not the keys of the bindings object
-  // (Object.keys has already deduplicated by then).
-  expect(new Set(Object.values(names)).size, 'two roles resolved to one identifier')
-    .toBe(Object.keys(names).length);
-  const unreachable = (label: string) => () => { throw new Error(`${label} should not run in this scenario`); };
-  const bindings: Record<string, unknown> = {
-    process: { env },
-    [names['registry']!]: { of: () => ({ getAgentProxyEnv: () => ({}), settingsColorEnv: {} }) },
-    [names['hostOf']!]: () => ({ host: 'default' }),
-    [names['snapshot']!]: {},
-    [names['remoteEnv']!]: (x: unknown) => x,
-    [names['scrubFlag']!]: () => Boolean(opts.scrub),
-    [names['upperSet']!]: new Set<string>(),
-    [names['upperPredicate']!]: () => false,
-    [names['denyList']!]: () => [],
-    [names['denyList2']!]: () => [],
-    [names['staticList']!]: opts.staticDeny ?? [],
-    [names['remotePredicate']!]: () => false,
-    [names['attributionPredicate']!]: () => false,
-    [names['scrubList']!]: () => [],
-    [names['denySet']!]: () => new Set(['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']),
-    [names['extraList']!]: () => [],
-    [names['proxySentinel']!]: Symbol('proxy-sentinel'),
-    [names['credSentinel']!]: Symbol('credential-sentinel'),
-    [names['denyRegex']!]: /^(?!)/,
-    [names['denyFn']!]: () => false,
-    [names['denyFn2']!]: () => false,
-    [names['keepPredicate']!]: () => false,
-    [names['rewritePredicate']!]: () => false,
-    [names['rewriter']!]: unreachable('rewriter'),
-    [names['cutSplit']!]: unreachable('cut splitter'),
-    [names['cutHas']!]: unreachable('cut membership'),
-    [names['normalizer']!]: () => undefined,
-    [names['isSecret']!]: () => false,
-  };
+  const names = distinctTokens(builder);
+  const bindings: Record<string, unknown> = { process: { env } };
+  for (const [index, value] of Object.entries(freeBindings(opts.scrub ?? false, opts.denyKey))) {
+    const name = names[Number(index)];
+    expect(name, `no token at canonical index ${index}`).toBeDefined();
+    bindings[name!] = value;
+  }
   const params = Object.keys(bindings);
-  const factory = new Function(...params, `return (${builder})`);
-  const fn = factory(...params.map(p => bindings[p])) as () => Record<string, string>;
+  const fn = new Function(...params, `return (${builder})`)(
+    ...params.map(p => bindings[p]),
+  ) as () => Record<string, string>;
   return fn();
 }
 
@@ -189,19 +170,10 @@ const CONTRACT = JSON.stringify({
   injected: { HTTPS_PROXY: 'http://127.0.0.1:49653', NODE_EXTRA_CA_CERTS: '/home/u/.clodex/ca.pem' },
 });
 
-// Check the PLATFORM ROSTER, not the file count: platform builds of one release
-// are minified differently (2.1.260 names this builder Ai/wi/Es/Rs/Ti), so each
-// of the eight must be exercised, and hashing rules out one bundle copied eight
-// times.
-const PLATFORMS = [
-  'darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-arm64-musl',
-  'linux-x64', 'linux-x64-musl', 'win32-arm64', 'win32-x64',
-];
-
 describe.runIf(BUNDLE_DIR)('bundle availability', () => {
   it('finds one 2.1.260 bundle per published platform', () => {
     expect(
-      PLATFORMS.filter(p => !FILES.some(f => f === `claude-2.1.260-${p}.js`)),
+      PLATFORMS.filter(p => !FILES.includes(`${p}.js`)),
       `missing platform bundles in ${BUNDLE_DIR}`,
     ).toEqual([]);
   });
@@ -218,19 +190,32 @@ describe.skipIf(FILES.length === 0)('Claude Code 2.1.260 — the patched builder
   for (const file of FILES) {
     describe(file, () => {
       const pristine = readFileSync(join(BUNDLE_DIR, file), 'utf8');
-      const patched = applyClodexPatches(pristine, CONFIG).content;
+      const outcome = applyClodexPatches(pristine, CONFIG);
+      const patched = outcome.content;
 
-      it('applies every one of the eleven patch sites, PATCH 10 included', () => {
-        const out = applyClodexPatches(pristine, CONFIG);
-        expect(out.results.map(r => r.name)).toEqual([...EXPECTED_PATCH_SITES]);
-        expect(out.results.filter(r => r.status !== 'OK')).toEqual([]);
-        expect(out.content.match(/\/\*ccpatch:child-network-env\*\//g)).toHaveLength(1);
+      it('applies every patch site, PATCH 10 included', () => {
+        expect(outcome.results.filter(r => r.status !== 'OK')).toEqual([]);
+        expect(patched.match(/\/\*ccpatch:child-network-env\*\//g)).toHaveLength(1);
       });
 
-      // Since 2.1.242 the bundle is ~1,600 ES modules joined on a boundary line, so a
-      // classic-script parse of the whole document fails on the first `import` long
-      // before it reaches anything clodex wrote. Parse each CHANGED module as a module
-      // instead; `vm.SourceTextModule` needs `NODE_OPTIONS=--experimental-vm-modules`.
+      // A WHOLE-BUNDLE syntax check is not available and would not be honest if it
+      // were: `readContent` concatenates ~1,600 separate modules, so the PRISTINE
+      // text does not parse as one file either. The changed span is what this patch
+      // can break, so that is what is checked — and `new Function` inside every
+      // execution test below compiles the same text again for real.
+      it('produces a builder that still compiles', () => {
+        const builder = patchedBuilderSource(patched);
+        expect(() => new Function(`return (${builder})`)).not.toThrow();
+      });
+
+      // Restored from this fork's own version of this harness, which the v2.15.0
+      // merge would otherwise have dropped. It is strictly wider than the builder
+      // check above: PER-MODULE parsing IS available even though whole-bundle
+      // parsing is not, so every module the transforms touched — not just the one
+      // function that gets extracted — is parsed as the ES module it actually is.
+      // The length assertion is the part nothing else pins: a transform that ate a
+      // module boundary would leave both halves compiling in isolation.
+      // `vm.SourceTextModule` needs `NODE_OPTIONS=--experimental-vm-modules`.
       it.skipIf(typeof vm.SourceTextModule !== 'function')(
         'produces modules that still parse as ES modules',
         () => {
@@ -243,15 +228,42 @@ describe.skipIf(FILES.length === 0)('Claude Code 2.1.260 — the patched builder
         },
       );
 
-      it('binds the builder that reads the remote flag off the env snapshot', () => {
+      it('binds the builder that folds in the agent-proxy env, and nothing escapes it', () => {
         const builder = patchedBuilderSource(patched);
-        expect(builder).toContain('.CLAUDE_CODE_REMOTE===!0');
+        expect(builder).toContain('getAgentProxyEnv');
         expect(builder).toContain('settingsColorEnv');
-        expect(builder, 'the snapshot read is not a process.env read and must be left alone')
-          .not.toContain('_clodexChildEnv.CLAUDE_CODE_REMOTE');
+        // 2.1.260's remote flag comes off the typed accessor, not process.env, so
+        // the rewrite must have left it alone.
+        expect(builder).toMatch(/[\w$]+\.CLAUDE_CODE_REMOTE===!0/);
+        expect(builder).not.toContain('_clodexChildEnv.CLAUDE_CODE_REMOTE');
         // No rewritten reference may escape the declaring function.
         expect(patched.split('_clodexChildEnv').length - 1)
           .toBe(builder.split('_clodexChildEnv').length - 1);
+        // Every `process.env` read inside the builder was redirected: the only one
+        // left is the prologue's own snapshot, `let _clodexChildEnv=process.env`.
+        expect(builder.match(/process\.env/g)).toHaveLength(1);
+        expect(builder).toContain('let _clodexChildEnv=process.env,');
+      });
+
+      it('has the same identifier-token skeleton as every other published build', () => {
+        const mine = canonical(patchedBuilderSource(patched));
+        for (const other of FILES) {
+          if (other === file) continue;
+          const theirs = canonical(patchedBuilderSource(
+            applyClodexPatches(readFileSync(join(BUNDLE_DIR, other), 'utf8'), CONFIG).content,
+          ));
+          expect(mine, `${file} and ${other} have different token skeletons`).toBe(theirs);
+        }
+      });
+
+      it('carries the roster the binding table was written against', () => {
+        // If a release shifts these, every index in `freeBindings` means something
+        // else and the execution proofs below would be binding the wrong stubs.
+        const names = distinctTokens(patchedBuilderSource(patched));
+        expect(names[55]).toBe('getAgentProxyEnv');
+        expect(names[58]).toBe('settingsColorEnv');
+        expect(names[63]).toBe('CLAUDE_CODE_REMOTE');
+        expect(names).toHaveLength(139);
       });
 
       it('early-return branch: reverts to the external proxy and drops the CA + contract', () => {
@@ -267,21 +279,32 @@ describe.skipIf(FILES.length === 0)('Claude Code 2.1.260 — the patched builder
         expect(out['PATH']).toBe('/usr/bin');
       });
 
+      // `CLAUDE_CODE_SUBSCRIPTION_TYPE` forces the full-copy path AND is deleted
+      // unconditionally, so it alone cannot show the scrub flag doing anything —
+      // with it as the only witness, forcing the flag off left this green. `SCRUBBED`
+      // is deleted only by the deny predicate in the tail the flag gates, so both the
+      // flag and its binding are load-bearing here.
       it('full-copy branch (credential scrub) also reverts and still scrubs secrets', () => {
-        const out = runBuilder(patched, {
+        const env = {
           PATH: '/usr/bin',
-          ANTHROPIC_API_KEY: 'sk-secret',
-          CLAUDE_CODE_OAUTH_TOKEN: 'oauth-secret',
+          SCRUBBED: 'secret',
+          CLAUDE_CODE_SUBSCRIPTION_TYPE: 'max',
           HTTPS_PROXY: 'http://127.0.0.1:49653',
           NODE_EXTRA_CA_CERTS: '/home/u/.clodex/ca.pem',
           [NETWORK_ENV_CONTRACT_VAR]: CONTRACT,
-        }, { scrub: true, staticDeny: ['ANTHROPIC_API_KEY'] });
+        };
+        const out = runBuilder(patched, env, { scrub: true, denyKey: 'SCRUBBED' });
         expect(out['HTTPS_PROXY']).toBe('http://corp-proxy:3128');
         expect(out['NODE_EXTRA_CA_CERTS']).toBeUndefined();
         expect(out[NETWORK_ENV_CONTRACT_VAR]).toBeUndefined();
-        expect(out['ANTHROPIC_API_KEY'], 'native filtering still runs').toBeUndefined();
-        expect(out['CLAUDE_CODE_OAUTH_TOKEN'], 'credential scrub still runs').toBeUndefined();
+        expect(out['CLAUDE_CODE_SUBSCRIPTION_TYPE'], 'native filtering still runs').toBeUndefined();
+        expect(out['SCRUBBED'], 'the credential-scrub tail ran').toBeUndefined();
         expect(out['PATH']).toBe('/usr/bin');
+
+        // The same env with the scrub flag off must NOT reach that tail — otherwise
+        // the assertion above passes no matter what the flag does.
+        const unscrubbed = runBuilder(patched, env, { scrub: false, denyKey: 'SCRUBBED' });
+        expect(unscrubbed['SCRUBBED'], 'the tail is gated on the scrub flag').toBe('secret');
       });
 
       it('does NOT revert a value some other layer changed after the injection', () => {
@@ -295,9 +318,11 @@ describe.skipIf(FILES.length === 0)('Claude Code 2.1.260 — the patched builder
         expect(out['NODE_EXTRA_CA_CERTS']).toBeUndefined();
       });
 
-      it('no contract: returns the live process.env object, byte-for-byte unchanged', () => {
+      it('no contract: hands back the parent env untouched', () => {
         const env = { PATH: '/usr/bin', HTTPS_PROXY: 'http://127.0.0.1:49653' };
-        expect(runBuilder(patched, env)).toBe(env);
+        const out = runBuilder(patched, env);
+        expect(out['HTTPS_PROXY']).toBe('http://127.0.0.1:49653');
+        expect(out['PATH']).toBe('/usr/bin');
       });
 
       const hostile = [

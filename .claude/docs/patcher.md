@@ -1,11 +1,12 @@
 <!-- Read when changing src/patcher.ts, patch-transforms.ts, patch-backup.ts, local-patches.ts,
-     built-in-patch-proofs.ts, bun-entry-module.ts, bun-bundle.ts, or anything about
-     `clodex patch`. -->
+     built-in-patch-proofs.ts, bun-entry-module.ts, bun-bundle.ts, npm-shim.ts,
+     claude-native-placeholder.ts, or anything about `clodex patch`. -->
 
 # Patcher
 
 `src/patcher.ts` + `src/patch-transforms.ts` + `src/built-in-patch-proofs.ts` +
-`src/local-patches.ts` + `src/patch-backup.ts` + `src/bun-entry-module.ts` + `src/bun-bundle.ts`.
+`src/local-patches.ts` + `src/patch-backup.ts` + `src/bun-entry-module.ts` + `src/bun-bundle.ts` +
+`src/npm-shim.ts` + `src/claude-native-placeholder.ts`.
 
 `clodex patch` uses tweakcc's programmatic API — an exact-pinned, declared runtime dependency
 (externalized in `tsup.config.ts`; it brings `node-lief` for native repacking and `ink`/`react` for
@@ -340,25 +341,33 @@ tweakcc's own repack reads back as an ordinary module name.
   back carrying what was written.
 
   **It also applies every patch site to that build's own bundle** (`scripts/probe-patch-sites.mjs`,
-  which calls the real `applyClodexPatches` with a synthetic config that activates all of them),
-  fails on any `FAIL`, `SKIP`, missing or duplicated site, and publishes **what the transforms
-  produced** rather than the pristine bytes — so the byte-for-byte readback also proves clodex's own
-  emitted patch survives the PE/ELF/Mach-O round trip. Read that precisely: since the write stopped
-  rebuilding the blob, the patched bytes never enter tweakcc's repack, so what the readback proves
-  is that the container RESIZE works on this format and that clodex's own publish round-trips. What
-  pins the sizing arithmetic against the real repack is the probe's `blob-sized-as-planned` check. Anchors were assumed platform-independent
-  until Claude Code 2.1.238, where `PATCH 5: model picker options` matched five builds and missed
-  `linux-arm64`, `linux-arm64-musl` and `win32-arm64`.
+  which calls the real `applyClodexPatches` with a synthetic config that activates all of them), and
+  checks that the exact Claude Code compaction markers used by the runtime text-only guard still
+  occur in that platform's extracted JavaScript. Both consumers import the same marker module. The
+  hourly canary runs this probe against every downloaded platform build before any stronger host or
+  container execution check. The probe fails on a missing marker or any `FAIL`, `SKIP`, missing or
+  duplicated patch site, and publishes **what the transforms produced** rather than the pristine
+  bytes — so the byte-for-byte readback also proves clodex's own emitted patch survives the
+  PE/ELF/Mach-O round trip. Read that precisely: since the write stopped rebuilding the blob, the
+  patched bytes never enter tweakcc's repack, so what the readback proves is that the container
+  RESIZE works on this format and that clodex's own publish round-trips. The
+  `blob-sized-as-planned` check pins the sizing arithmetic against the real repack. Anchors were
+  assumed platform-independent until Claude Code 2.1.238, where `PATCH 5: model picker options`
+  matched five builds and missed `linux-arm64`, `linux-arm64-musl` and `win32-arm64`.
 
   Two things it still cannot tell you: **that the patched binary runs**, and **that an anchor bound
   to the function it was aimed at** rather than a lookalike that also emits valid JavaScript. Only a
   host or containerised `clodex patch` answers the first. `clodex patch` resolves the version by
   executing the binary (`getClaudeVersionForBinary`), which is exactly why a foreign binary can go
-  through the probe and not through the real command.
+  through the probe and not through the real command. A `compact-prompt-markers` failure is not a
+  broken patch site. On a complete extraction it means Claude Code changed the prompt wording and
+  the text-only guard stopped matching; first confirm the bundle reader still exposes both builders,
+  then update `src/claude-code-compact-prompt.ts` from their extracted wording. Presence catches
+  removal or in-place rewording of today's strings, not a new builder that leaves both old strings.
 
   `tests/probe-patch-sites.test.ts` pins the probe's synthetic config and its expected-site list
   against the real transform set — so a new or renamed `PATCH` site reddens `pnpm test` rather than
-  failing five platforms in the hourly canary. Revisit it whenever you bump
+  failing the hourly canary on every downloaded platform build. Revisit it whenever you bump
   `PATCH_TRANSFORMS_VERSION`.
 
 ## Patcher invariants
@@ -391,10 +400,10 @@ tweakcc's own repack reads back as an ordinary module name.
   because the twin was inserted into exactly that gap. Note what the replacement does and does not
   prove: it validates the appender the builder loops through, so a different caller of the genuine
   appender would inherit that evidence; it rejects the realistic impostor, which brings its own.
-  Verify with the real-bundle
-  harness over **every platform's** bundle (`scripts/extract-cc-bundles.mjs` reads a foreign binary
-  fine), not just this Mac's: the canary's probe legs exercise zero patch sites, so win32-arm64
-  recorded a `pass` for the release this broke.
+  Verify with the real-bundle harness over **every downloaded platform's** bundle
+  (`scripts/extract-cc-bundles.mjs` reads a foreign binary fine), not just this Mac's. This is why the
+  canary now applies the patch sites to every bundle it downloads: before that check existed,
+  win32-arm64 recorded a `pass` for the release this broke.
 - **An anchor that spells out a statement upstream can delete is a required patch waiting to fail.**
   Claude Code 2.1.239 moved BOTH ends of PATCH 10's child-env builder in a single release — the
   opening `let` gained an optional call and a *destructuring* declarator (`{settingsColorEnv:n}=e`,
@@ -403,28 +412,23 @@ tweakcc's own repack reads back as an ordinary module name.
   published builds refused to patch at all. Neither end was load-bearing for the replacement: what
   the transform needs is the function's opening brace, its body, and its closing brace. Describe
   each end by what the builder MEANS and let back-references tie the repeats:
-  * the head runs from `function X(){let ` to the `.CLAUDE_CODE_REMOTE` read over `[^;{}]`
-    characters **or one balanced `{...}` group** — that admits the destructuring and the `??{}`
-    while still making it impossible to consume the enclosing function's closing brace, which
-    would need an *unmatched* one;
+  * the head runs from `function X(){` + `let`/`let{`/`let[` to a pinned name over `[^;{}]`
+    characters **or balanced `{...}` groups**, plus one optional trailing **unclosed** `{…` so the
+    pin may sit inside a destructuring pattern — that admits the destructuring and the `??{}` while
+    still making it impossible to consume the enclosing function's closing brace, which would need
+    an *unmatched closing* one;
   * the tail is `return <copy>}` where `<copy>` is **back-referenced** from the merged copy the
-    builder declares (`let <copy>={...process.env,...}`), so it moves with any upstream rename and
-    steps over a nested return of some *other* variable. It does NOT prove the match stopped on
+    builder declares (`let <copy>={...process.env,...}`), so it survives a rename of that copy and
+    steps over a nested return of some *other* variable. It is rename-resistant, not
+    refactor-proof. It does NOT prove the match stopped on
     the function's own brace — the walk below does that.
   Identity is carried by the passthrough early-out — `)return process.env;let <copy>={` —
   counted across the WHOLE bundle before the anchor runs, the same discipline PATCH 5 uses. Over
   29 real bundles (2.1.208 through all eight 2.1.239 builds) it occurs exactly once and exactly one
-  `<fn>(process.env.CLAUDE_CODE_REMOTE)?` ternary precedes it; on the 21 pre-2.1.239 bundles the
-  widened anchor's matched span is **byte-identical** to the one it replaces, which is what shows
-  this is a widening and not a rebinding. Claude Code 2.1.260 then stopped spelling that ternary:
-  the opening `let` reads the flag off a module-level env snapshot (`i=a.CLAUDE_CODE_REMOTE===!0,
-  l=i?…`) and never touches `process.env.CLAUDE_CODE_REMOTE`, so the call form read all eight
-  published builds as "anchor not found". The head now requires only that the builder's opening
-  `let` mention `.CLAUDE_CODE_REMOTE` — whatever object it is read from and however the result is
-  consumed. Measured: the further-widened anchor binds exactly once on every 2.1.260 build (the
-  builder is `Ai`/`wi`/`Es`/`Rs`/`Ti` depending on the build) and its span and capture groups
-  are byte-identical to the previous anchor's on 2.1.251 and 2.1.259;
-  `cc260-patch10-execute-real-builder` executes the patched builder from all eight. The last line is a postcondition: walk the real block
+  head candidate precedes it; on the 21 pre-2.1.239 bundles the widened anchor's matched span is
+  **byte-identical** to the one it replaces, which is what shows this is a widening and not a
+  rebinding.
+  The last line is a postcondition: walk the real block
   from the function's own `{` and require that it ends exactly where the anchor ended. A lazily
   found tail can stop in the wrong place in **either** direction and both are silent without it.
   Short: a nested `return <copy>}` ends the match inside the function, so only part of it is
@@ -443,13 +447,60 @@ tweakcc's own repack reads back as an ordinary module name.
   built `…if(x){var re=/}/;return <copy>}…;return <copy>}`, where the unbalanced `}` inside the
   regex literal moves the walk's zero-crossing onto the nested return: the truncated match agrees
   with it and PATCH 10 reports `OK` with a live `process.env` read stranded past the rewritten
-  span. Left as-is deliberately — zero instances across the 29 real bundles, it needs a regex
-  literal no minifier emits here, and closing it means parsing JavaScript. Calibrate it the way
-  this file calibrates PATCH 5's surviving hole: every wrong bind reachable from a shape a real
-  build could emit fails loud.
+  span. Left as-is deliberately, because closing it means parsing JavaScript. **But the reason it
+  is unreachable is not the one that used to be written here.** "Zero instances; a regex literal no
+  minifier emits" is measurably false: the walk reads `/` as division, so an unescaped `{` or `}`
+  inside a regex literal mis-tallies it, and that is ordinary — each 2.1.260 build holds 90 such
+  literals, and the walk disagrees with a real parser on 3-4 of the named `function X(){` bodies
+  this anchor can open, per bundle, in all 27. A review built a silent wrong
+  bind from it (a decoy carrying `/[{]/`, an arrow-function builder carrying `/[}]/`, phantom braces
+  cancelling so `bound` lands on 0) that emits a builder reading `_clodexChildEnv` without declaring
+  it — every child command would throw. It reproduces on the pre-2.1.260 anchor too, so it belongs
+  to the walk, not to any one head. What makes it unreachable is that a mis-tallied function must
+  still REACH the passthrough, and in all 27 bundles the builder is immediately preceded by
+  `}function ` — a 0-byte window the body run will not cross. Watch that window, not the literal
+  count.
   Count the discriminator against the **original source**, not the partly-patched buffer: PATCH 4
   and PATCH 5 splice user-supplied model display text into the bundle, so counting afterwards lets
   a model label that happens to contain the signal refuse a patch that would otherwise succeed.
+- **The same lesson again, on the value the head ends at.** Claude Code 2.1.260 left every other anchor
+  landmark in the child-env builder intact and rewrote how it asks whether it is running remote: in
+  every measured pre-2.1.260 builder that was a call wrapping a `process.env` read whose result fed a ternary
+  (`<fn>(process.env.CLAUDE_CODE_REMOTE)?`), and 2.1.260 reads the flag off the typed env accessor
+  and compares it inline (`i=a.CLAUDE_CODE_REMOTE===!0`). (It was not the only change — 2.1.260 also
+  added `CLAUDE_CODE_QUESTION_EXTENDED` handling and a remote `BUN_JSC_` scrub, growing the builder
+  1942 → 2104 bytes — but it is the change that invalidated the head.) Neither the call nor the
+  `process.env.` prefix survives, PATCH 10 is required, and `clodex patch` refused all eight
+  published builds — the same failure as 2.1.239, one release after the anchor had already been
+  widened once. **A value the builder happens to COMPUTE is only as durable as the expression that
+  computes it.** The head now ends at either that ternary or **`getAgentProxyEnv`**, the agent-proxy
+  env this builder folds into the child's environment — the thing PATCH 10 exists to correct, rather
+  than a flag check that can be rewritten again. `getAgentProxyEnv` is a cross-module property and
+  export name and stayed unminified, spelled identically, in all 27 measured bundles; that is an
+  observation, not a guarantee, and **rename-proof is not the same as spelled in the builder**.
+  Keep BOTH alternatives for exactly that reason: the name is not new — it occurs 6 times in the
+  real 2.1.238 bundle, including its own `__export` map entry — but that builder reaches the env
+  through a helper, `function JP(){let e=NDt(),…` where `NDt` is
+  `return <mod>.getAgentProxyEnv?.()??{}`, so the builder spells it nowhere. Every measured builder
+  from 2.1.246 on spells it inline. Dropping the ternary would have refused 2.1.238 (measured on its
+  darwin-arm64 build, the only one on disk) and presumably everything older, which is not measured.
+  The head run also tolerates the pin sitting inside a destructuring pattern, and an opening `let{`
+  or `let[` with no space — 2.1.239 already made that move on the sibling property of the same
+  registry entry, a minifier drops the space for a pattern of either kind (4784 `let{` and 2246
+  `let[` in each measured Darwin 2.1.260 bundle; the Linux and Windows builds are within a few
+  dozen), and a run that can only consume a `{...}` group WHOLE could never
+  stop inside one. Measured over
+  27 real bundles (2.1.238, 2.1.246, 2.1.252, 2.1.257, 2.1.259 and all eight 2.1.260 builds) the
+  head matches exactly once per bundle, as does the whole anchor; on the 19 predating 2.1.260 the
+  **whole anchor's** matched span — not the head prefix, which ends earlier on 18 of the 19;
+  2.1.238 has no inline `getAgentProxyEnv`, so its head is unchanged — and the whole
+  `applyClodexPatches` output are byte-identical to what the old anchor produced. Relaxing to a bare
+  `CLAUDE_CODE_REMOTE` instead was measured and rejected: four head candidates on 2.1.238, five on
+  each 2.1.246 build, six from 2.1.252 on, leaving identity resting entirely on the passthrough
+  count. **A patched builder is not the same claim as a correct one** —
+  `.claude/harnesses/cc260-patch10-execute-real-builder` extracts the patched builder from each of
+  the eight bundles, checks that their first-occurrence identifier-token skeletons are identical,
+  and executes each one; copy it when a release moves the builder again.
 - **Calibrate a patch-anchor weakness by corpus reachability and by which direction it fails, not
   by whether an attack can be constructed** — one always can, against every site we ship.
   PATCH 5's surviving hole needs upstream to make two coordinated changes at once (respell its own
@@ -563,7 +614,37 @@ tweakcc's own repack reads back as an ordinary module name.
   the version probed from the binary being patched, its hash must match its own name, and a legacy
   `claude-<ver>.orig` (no hash in the name, possibly mislabeled by an older clodex) must
   additionally report that version when executed (`verifyPristineSource`). Conflicting or
-  unverifiable backups produce a loud error, never a copy. This gate covers both consumers —
+  unverifiable backups produce a loud error, never a copy. **A matching version tag is not install
+  provenance**: the npm platform package and the native installer ship different files under the same
+  Claude Code version, and both are supported, so one machine can hold two same-version installs whose
+  bytes differ. The manifest holds **one** install — so it can confirm a backup but can never rule one
+  in by elimination (the per-backup sidecar below is what does that). Two states therefore refuse
+  outright rather than fall through to version-tag selection (issue #199, reproduced
+  on real 2.1.266 binaries in issue #199, and again on real 2.1.263 bytes with a byte-differing
+  second copy standing in for the second install; the published 2.1.263 npm and native artifacts are
+  independently known to differ in both size and hash):
+  - the manifest records a **different** `binaryPath` than the resolved target — it vouches for
+    nothing in the backup directory, and the error names the install it does belong to (unless a
+    per-backup sidecar records this one; see below);
+  - the manifest records **this** target but the pristine bytes it named are gone or corrupt — its own
+    testimony says the same-version backups still on disk were made for some other install.
+
+  A manifest speaks only for the `claudeVersion` it was written for. After an upgrade it records a
+  backup of the OLD version, which is not among the new version's candidates at all — so neither
+  refusal fires across a version change, and a restore that was never in danger is not rejected.
+
+  Disqualifying only the backup the manifest names is NOT sufficient and was rejected during review:
+  the manifest holds one install, so every earlier install's backup is an unrecorded orphan carrying
+  the same version tag, and "restore the one it did not name" hands a third install's bytes to the
+  target — turning a `conflicting pristine backups` refusal into a destructive copy.
+
+  Path identity is plain string equality, so a manifest written under a different spelling of the
+  same path reads as another install and refuses — safe, but a false refusal, and it blocks
+  `clodex patch` as well as `--restore`. **This is not Windows-only**: APFS is case-insensitive and
+  the `fs.realpathSync` clodex uses preserves caller-supplied case (only `.native` corrects it), so a
+  hand-typed `TWEAKCC_CC_INSTALLATION_PATH` reaches it on macOS. `evaluatePatchState` compares the
+  same way. The message names the recorded path, so following its own
+  `TWEAKCC_CC_INSTALLATION_PATH=` advice recovers. This gate covers both consumers —
   `applyPatch` seeds its candidate from those bytes, and **`clodex patch --restore` copies straight
   over the live binary** (nothing to publish atomically), so an unverified backup would be a silent
   downgrade either way. An already-patched binary is never snapshotted as pristine. Legacy backups
@@ -574,23 +655,242 @@ tweakcc's own repack reads back as an ordinary module name.
   interrupted ~250 MB `copyFileSync` would leave a truncated file under a name asserting its content
   hash — the one corruption content-addressing cannot notice without re-hashing.
   `~/.tweakcc/native-binary.backup` is still mirrored from the pristine bytes for `tweakcc
-  --restore`.
+  --restore`. That mirror is a SINGLE slot holding whichever install clodex patched last, so on a
+  machine with two same-version installs `tweakcc --restore` performs exactly the copy the rules
+  above refuse. clodex writes the file but does not control that command.
+- **Each backup records which installs it was made for, in one file per install beside it** —
+  `claude-<ver>-<sha>.orig.for-<hash of install path>.json`, holding
+  `{"install": "<path>", "assumed": <bool>}` (issue #204). The manifest could not carry this: it holds
+  **one** install and a successful `--restore` **deletes** it, so a backup routinely outlives the only
+  record of what it belonged to. patch A → restore A → have the target resolve to a different
+  same-version install B → restore again published A's pristine bytes over B with nothing but a
+  warning, and **no files were lost anywhere in that sequence**. (`~/.clodex` wiped or a different
+  `CLODEX_HOME` reach the same state.) A user who answered the `conflicting pristine backups` refusal
+  by deleting one file could also launder the wrong bytes into a manifest every later restore then
+  trusted on sight.
+
+  **One file per install, never a shared list.** A single list would have to be read, merged and
+  rewritten, and the patch lock lives under `CLODEX_HOME` while the backup directory is shared — two
+  concurrent patches under different `CLODEX_HOME`s would lose an entry. A create-once file per
+  install has nothing to merge. Multiple installs is the normal case, not an edge: backups are
+  content-addressed, so two installs whose pristine bytes are identical legitimately share one backup
+  and it is correct for either. The install path is hashed only to keep the file name safe and
+  fixed-length; selection reads the path from inside the file, and a record whose name does not agree
+  with the install it holds is treated as damaged rather than trusted.
+
+  Consequences:
+  - a backup recorded for some OTHER install is refused, exactly like a manifest that records one;
+  - a record naming THIS install outranks a manifest that records a different one — it is direct
+    evidence, where the manifest was only evidence about the directory;
+  - a two-install machine now **works** instead of refusing: each install's own backup names it, so
+    `Found conflicting pristine backups` is no longer the outcome of the ordinary two-install case;
+  - restoring one install therefore must NOT clear the manifest belonging to another — `--restore`
+    clears the manifest only when it records the install being restored;
+  - a manifest that disagrees with an established record for the same install refuses — **but only
+    when the manifest does not describe the live bytes**. That state is reachable both ways round:
+    one install path rewritten in place with a different build of one claude version (the manifest is
+    then stale), or one install legitimately snapshotted twice, which `tweakcc` theming produces and
+    the snapshot path keeps both files for on purpose. What separates them is
+    `manifest.patchedSha256 === liveSha256`: when it holds, clodex provably wrote those bytes last, so
+    the manifest is current and its backup is the right source. Refusing there instead made every
+    later patch AND restore of an ordinary single-install machine fail permanently, with a message
+    telling the user to reinstall — which does not clear a record. Where neither claim can be dated,
+    the refusal stands, and both it and the two-records-disagree refusal now **name the record files**,
+    because deleting the stale one is the way out;
+  - a record that exists but **cannot be read** refuses rather than falling back to the version tag.
+    That includes a record that is unopenable rather than malformed (a directory, a dangling link,
+    mode 000): its name came out of the same directory listing, so "absent" is not an available
+    reading. Damaged positive evidence is not the same as no evidence — something claimed those
+    bytes. The message names the file, and deleting it opts back into the fallback;
+  - the version-tag fallback is refused for an install these bytes were **already guessed onto**. The
+    first guess proves nothing about ownership, which is why it neither selects nor establishes, but
+    running the same fallback again is how one install's bytes reach two. A guess recorded for THIS
+    install does not refuse — that is the same decision being repeated, and the single-install machine
+    depends on it.
+
+  **ESTABLISHED vs ASSUMED, and what may promote.** A record's `assumed` flag says whether the
+  association was proven or matched on a version tag, and the distinction has to survive every path
+  that could re-derive it:
+  - a guess is recorded AS a guess rather than skipped. Skipping was not enough: after a warned
+    version-tag restore the live bytes match the backup *because the guess put them there*, so the
+    next patch took the `reuse` path and recorded it as established;
+  - the manifest carries `pristineProvenance: 'assumed'` when the run that wrote it guessed, so the
+    next run cannot read a guessing run's own manifest as independent proof. Absent is read as
+    established, which is not a proof — a manifest written before the field existed may record a run
+    that guessed and is indistinguishable from one that did not. It is accepted because those
+    manifests are the migration path for every existing install;
+  - **every** plan **inherits** the confidence already recorded for those bytes. Confidence belongs to
+    the CONTENT, not to a filename: asking only about the name a plan chose left a third name carrying
+    the guess — restore B from a legacy backup by version tag, patch A so that backup is adopted under
+    its content address, then patch B, which picks the canonical name, finds no record of B beside it,
+    and established what the legacy name still called a guess. So every alias holding these exact bytes
+    is consulted, and the content address and the legacy name are read directly, because the scan finds
+    records only beside an existing `.orig` and a record outlives its backup. `reuse` matches bytes a guess may have put there, and
+    canonicalizing a legacy backup would otherwise launder a guess through a filename change. A
+    `snapshot` is no exception, even though it inspected the live bytes itself: if a guess restored
+    those very bytes onto this install, "the install holds them" is a fact the guess created, and
+    establishing on it would hand the bytes' true owner a refusal. **Nothing promotes a guess.** The
+    protection a promotion looked like it was buying is already provided by refusing the fallback for
+    an install these bytes were guessed onto, and an install whose record stays a guess is not
+    stranded — its own restores still work, with the note;
+  - an established record is never downgraded. Callers ask for what their run can prove, and a run
+    that can prove less must not erase what an earlier one knew.
+
+  **Both migration sites cover a manifest for another VERSION at this same path**, not only one for
+  another install: its backup is still on disk and clearing the manifest would leave it unattributed.
+
+  **`--restore` records before it writes, and before it clears.** Before the copy, because the guess
+  changes the live bytes to the backup's — after that, "the live bytes match this backup" is no longer
+  independent evidence, so the record saying it was a guess must already be on disk. If it cannot be
+  written, the guess is **refused** and the binary is untouched: it is the optional compatibility
+  path. Before the manifest is cleared, because the manifest may be the only thing attributing that
+  backup, and the manifest is dropped **only once an established record stands in its place** — a
+  manifest is stronger than a guess, so trading it for one destroys testimony instead of migrating it.
+  When the write fails on an established restore, the rescue still happens and the manifest is kept.
+
+  **`clodex patch` migrates the manifest it is about to replace**, when that manifest records a
+  different install or a different claude version. The manifest holds one install, so patching a
+  second one used to strip the first's only attribution.
+
+  **No pristine backup is published before its record** — not the fresh snapshot, and not the
+  canonical name a legacy backup is adopted into. A published `.orig` with no record beside it is
+  precisely the unattributed same-version file this exists to prevent, and a crash or a full disk
+  between the two writes would leave one for good. The reverse order is safe: a record whose backup
+  never appeared is inert, because scanning starts from the `.orig` files, and it stays true if those
+  bytes ever land at that address again.
+
+  **What remains is a backup written before records existed**: nothing attributes it, so selection
+  falls back to the version tag and the plan carries a loud note saying exactly that. Refusing would
+  strand every backup an earlier clodex wrote, including on the single-install machine where the guess
+  is always right. It self-heals — `--restore` and `clodex patch` both migrate a manifest's evidence,
+  and any patch of that install writes a record. Three narrower gaps stay open and are not closed
+  here:
+  - **Path identity is still plain string equality** (see below), so a case-only respelling of an
+    install path on APFS reads as another install: the restore is refused rather than falling back —
+    safe, and the message names the recorded spelling to use — and a manifest for the same install
+    under the other spelling survives a restore rather than being cleared. The fix is one
+    path-equivalence helper over `realpathSync.native`/inode, which invalidates the `binaryPath` in
+    every existing manifest and so needs a migration.
+  - **Replacing the executable at the SAME path with a different same-version artifact** leaves a
+    record pointing at a path whose bytes are no longer the ones it was written for. Two established
+    records now disagree and refuse, and a manifest disagreeing with a record refuses too, so the
+    destructive form is narrowed to the case where neither exists yet. Closing it entirely needs
+    `--restore` to read the live bundle for a `/*ccpatch:` marker first — issue #204's fix 1 — which
+    is Mach-O/ELF/PE-sensitive and needs the per-format probe.
+  - **A record's confidence is written with temp + rename, not compare-and-swap.** Two processes
+    recording the SAME install under different `CLODEX_HOME`s can race, and the last rename wins, so
+    an established record can be replaced by a guess. It needs a lock keyed by the backup directory
+    rather than by `CLODEX_HOME`; the same missing lock already lets `--restore` (which takes no lock
+    at all) interleave with a patch on `main`.
+
+  Two smaller consequences are accepted rather than fixed, both safe directions:
+  - an install whose only claim on a backup is a GUESS is refused when another install holds an
+    established record for those bytes, even though repeating its own guess used to work. The evidence
+    genuinely favours the other install; the message names it, and reinstalling clears it.
+  - the migration before a manifest is replaced checks `existsSync(manifest.backupPath)`, so a backup
+    that was manually MOVED to another same-version alias is not migrated to its new name. Finding the
+    bytes by hash instead would mean re-hashing every same-version backup (~250 MB each) on the
+    ordinary two-install patch, which is not worth it for a state only manual file movement reaches.
+
 - **`clodex patch --restore` must work on a binary that no longer runs** — that is what a pristine
   backup is *for*. It resolves the version from `claude --version` when it can, and otherwise falls
-  back to the manifest's `claudeVersion` when `manifest.binaryPath` matches the resolved install,
-  establishing provenance without executing anything. The patch path keeps the hard `version-unknown`
-  failure (patching is elective; restoring is the way out), and its error message names `--restore`
-  as the recovery.
+  back to the manifest's `claudeVersion` when `manifest.binaryPath` matches the resolved install and
+  the live bytes could still be what clodex last wrote, establishing provenance without executing
+  anything. An npm placeholder is the exception: it proves a package manager replaced the target, so
+  the old manifest is no longer authoritative for that path even though the wrapper's `package.json`
+  still reveals its version. The placeholder refusal preserves both manifest and backups. Generic
+  broken binaries retain manifest recovery. A successful restore drops the manifest **only when it
+  records the install that was restored**: selection can now succeed on a per-backup sidecar while the
+  manifest still holds a different install, and clearing it there would delete that install's only
+  rescue record. The patch
+  path keeps the hard `version-unknown` failure (patching is elective; restoring is the way out), and
+  its error message names `--restore` as the recovery.
+- **`CLODEX_CLAUDE_PATH` does not choose the patch target, and that is deliberate.** It selects the
+  claude that gets LAUNCHED; the patch target override is `TWEAKCC_CC_INSTALLATION_PATH`. Honouring
+  the launch override here would hand the patcher a wrapper shim whenever a user points it at one
+  for launching — `resolveThroughNpmShims` follows npm launchers, not arbitrary wrappers — which is
+  issue #193's "Unable to detect installation type", with the shim's older version then selecting
+  the wrong pristine backup. A committed end-to-end test pins that (`patches the resolved install
+  and never downgrades it to a PATH shim's version`), so an attempt to "fix" the precedence turns
+  red rather than shipping. Issue #217 asked for the precedence to change; what it was right about is
+  that the behaviour was undocumented and that the refusal advice named the variable that cannot
+  work. `clodex patch` now warns when a `CLODEX_CLAUDE_PATH` is set and something else decided the
+  target, and a `TWEAKCC_CC_INSTALLATION_PATH` naming a file that is gone is refused by name rather
+  than falling through to another install.
+
 - **Binary resolution bypasses PATH shims** (cmux installs a shim copy):
-  `TWEAKCC_CC_INSTALLATION_PATH` → `~/.local/bin/claude` → `findClaudeBinary()`. **The version is
+  `TWEAKCC_CC_INSTALLATION_PATH` → `~/.local/bin/claude` → `findClaudeBinary()`.
+  **`~/.local/bin/claude.exe`, which the Windows native installer writes, is deliberately NOT
+  probed.** Adding it as a last-resort fallback made an existing restore weakness reachable:
+  `findClaudeBinary()` returns the same null for "`CLODEX_CLAUDE_PATH` names a file that is gone" as
+  for "nothing found", so a stale explicit override silently became a DIFFERENT install, and
+  `--restore` copied the missing install's pristine bytes over it and deleted the manifest —
+  reproduced on real 2.1.266 binaries, with the fallback deletion as the control. The manifest half of that
+  weakness is fixed (see the provenance rule above), so the fallback can land — as its own change
+  carrying its own Windows evidence, not folded into the fix that unblocked it, and only once the
+  no-manifest case above is covered too. **The version is
   probed from that resolved binary** (`getClaudeVersionForBinary`), never from
   `getInstalledClaudeVersion()`, whose PATH lookup can land on a different install and whose
   `'2.1.183'` fallback is only safe for request metadata. The version names the backup that gets
   restored, so borrowing it from a shim silently downgraded the user's Claude Code.
   **An unprobeable binary is a hard error on the patch path** — patching is elective, so it refuses
-  rather than guessing. `resolveClaudeBinaryForPatch` returns `binary-not-found` vs
-  `version-unknown`; the launch-time
-  check stays non-fatal for both.
+  rather than guessing. `resolveClaudeBinaryForPatch` returns `binary-not-found`,
+  `version-unknown`, `native-binary-missing` or `launcher-unresolved`; the launch-time
+  check stays non-fatal for every reason (it prints one dim line for failures other than
+  `binary-not-found`).
+- **An npm placeholder is diagnosed before the version probe** (`claude-native-placeholder.ts`).
+  `@anthropic-ai/claude-code` publishes `bin/claude.exe` as a 500-byte text file which its
+  postinstall replaces with the platform-native binary. Skipped install scripts or omitted optional
+  dependencies leave that text in place, and executing it on Windows reports an invalid application
+  while the patcher otherwise collapses it into `version-unknown`. Detection reads content only
+  below a 64 KiB size ceiling and requires two independent signals from the shipped text; a real
+  binary is rejected by metadata without being read. Seven sampled native releases from 2.1.113
+  through 2.1.266 carry all three signals in byte-identical placeholders. Two-of-three is defensive
+  against a hypothetical future rewording, not a response to observed drift.
+
+  The detector derives the platform key with the same Android, musl and Rosetta rules as
+  Anthropic's `install.cjs`, then resolves that platform package from the wrapper package. When it
+  is present, `native-binary-missing` gives the absolute installer path. When it is absent,
+  `install.cjs` cannot download it, so the message recommends only a reinstall without the npm
+  omission flags. An unknown package layout names both options. Restore also names `--restore` as
+  the retry and the pristine-backup directory.
+
+  Patch and restore both refuse before any backup or candidate write, even when an old manifest
+  matches the path: the placeholder proves clodex was not the last writer, so the manifest fallback
+  is no longer authoritative. Generic unprobeable binaries retain manifest-based recovery.
+  Launch-time checking reports the incomplete install without blocking launch.
+- **An npm launcher is followed to the program it starts, on the patch path only** (`npm-shim.ts`).
+  **This is a Windows install shape**: npm's `bin-links` writes a symlink for a package bin on
+  POSIX and only calls `cmd-shim` on Windows, where it writes three launchers per bin —
+  extensionless `sh`, `.cmd`, `.ps1` — each naming its program relative to its OWN directory. The
+  parsing is platform-independent (which is what makes it testable off Windows), but the install
+  shape is not. `findBinaryOnPath` prefers `claude.cmd` on Windows **on purpose**, because
+  launching claude there needs a shell script, and `realpathSync` cannot see through a launcher
+  (there is no symlink), so the file is parsed with a port of npm's `read-cmd-shim` grammar. Both
+  bin shapes Claude Code has shipped must keep working: a native `bin/claude.exe`, which the
+  launcher runs directly, and a legacy `cli.js`, which it hands to a nearby node — the program
+  named LAST, before the argument forwarder, is the one to patch. `cmd-shim` 9 renamed the sh
+  launcher's base directory to `$basedir_win` for the legacy shape; both spellings are read.
+  A `cli.js` target is versioned by running it with clodex's own `process.execPath`, because it is
+  not an executable on Windows and need not carry the executable bit anywhere. **Do not move this
+  into `findClaudeBinary()`** — launch needs the launcher; only the patcher needs the program.
+  **Two rules read-cmd-shim does not have**, because clodex uses the answer to pick a file to
+  OVERWRITE rather than to report on a link: whole-line comments (`REM`, `::`, `#`) are skipped (the
+  grammar runs per line, so it also cannot stitch a target across two of them), and a launcher whose
+  remaining lines name two DIFFERENT programs is refused instead of resolved to whichever came
+  first — a review reproduced `clodex patch` reporting success against an install the shell never
+  starts. Repetition is normal (the real PowerShell launcher names one target four times);
+  disagreement is not. **Neither rule is shell analysis.** A line a shell would never reach — a dead
+  `if` branch, a heredoc body, a trailing inline comment — is still a candidate; the outcome there
+  is the refusal, not a wrong guess, and closing it properly would mean parsing three shells.
+  Resolution failure (a launcher whose program is gone, a `.cmd`/`.ps1` whose program cannot be
+  read, two programs named) is a refusal *before* any candidate, backup or manifest write, naming
+  `TWEAKCC_CC_INSTALLATION_PATH` as the way out — never a fallback to patching the launcher, which is what
+  produced issue #193's
+  "Unable to detect installation type from path ...\\.clodex-patch-XXXX\\claude.cmd". When the
+  program's path could be read but the file is gone, that path is what the failure carries, so a
+  manifest recorded against it still matches and `--restore` still works. That is a rescue path
+  with a dedicated end-to-end test; a mutation to the launcher path left the whole suite green.
 - Concurrency lock `~/.clodex/patch.lock` (pid + 10-min staleness + ESRCH liveness); the loser skips
   with a notice — never blocks, corrupts, or double-patches.
 - `runLaunchPatchCheck()` in `clodex claude`: interactive y/N offer when stale; non-TTY or

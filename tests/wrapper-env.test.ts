@@ -4,8 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   computeWrapperEnv,
+  wrapperSpawnShell,
   LOCAL_GATEWAY_API_KEY,
+  wrapperInvocationIsChat,
   wrapperRequiresServer,
+  wrapperSubstitutionEligible,
 } from '../src/wrapper-env.js';
 import {
   readLiveServerRuntimeState,
@@ -29,6 +32,50 @@ function networkContract(env: NodeJS.ProcessEnv): {
 } {
   return JSON.parse(env[NETWORK_ENV_CONTRACT_VAR]!);
 }
+
+describe('wrapperSubstitutionEligible', () => {
+  const proxyState: ServerRuntimeState = {
+    mode: 'proxy',
+    port: 17645,
+    pid: process.pid,
+    caPath: '/tmp/clodex-ca.pem',
+    startedAt: '2026-09-16T00:00:00.000Z',
+  };
+  const endpointState: ServerRuntimeState = {
+    ...proxyState,
+    mode: 'endpoint',
+  };
+  const topLevelEnv = { CLAUDE_CODE_ENTRYPOINT: 'claude-vscode' };
+  // No platform column: the gate no longer knows the platform. Windows is eligible like every
+  // other host; what Windows needs differently is the executable rule in wrapper-target.ts.
+  const cases: Array<{
+    label: string;
+    env: NodeJS.ProcessEnv;
+    state: ServerRuntimeState | null;
+    expected: boolean;
+  }> = [
+    { label: 'top-level VS Code chat with a proxy server', env: topLevelEnv, state: proxyState, expected: true },
+    { label: 'another entrypoint', env: { CLAUDE_CODE_ENTRYPOINT: 'cli' }, state: proxyState, expected: false },
+    { label: 'CLAUDECODE child', env: { ...topLevelEnv, CLAUDECODE: '1' }, state: proxyState, expected: false },
+    { label: 'child session', env: { ...topLevelEnv, CLAUDE_CODE_CHILD_SESSION: '1' }, state: proxyState, expected: false },
+    { label: 'endpoint server', env: topLevelEnv, state: endpointState, expected: false },
+    { label: 'no server', env: topLevelEnv, state: null, expected: false },
+  ];
+
+  it.each(cases)('returns $expected for $label', ({ env, state, expected }) => {
+    expect(wrapperSubstitutionEligible(env, state)).toBe(expected);
+  });
+});
+
+describe('wrapperInvocationIsChat', () => {
+  it.each([
+    ['persistent stream-json chat', ['--output-format', 'stream-json', '--input-format', 'stream-json'], true],
+    ['ordinary helper', ['auth', 'status', '--json'], false],
+    ['nonpersistent suggestions query', ['--output-format', 'stream-json', '--no-session-persistence'], false],
+  ] as const)('returns %s correctly', (_label, args, expected) => {
+    expect(wrapperInvocationIsChat(args)).toBe(expected);
+  });
+});
 
 describe('computeWrapperEnv', () => {
   it('proxy-mode server: injects proxy vars + CA and removes ANTHROPIC_BASE_URL', () => {
@@ -261,5 +308,21 @@ describe('computeWrapperEnv', () => {
     expect(wrapperRequiresServer({})).toBe(false);
     expect(wrapperRequiresServer({ CLODEX_REQUIRE_SERVER: '0' })).toBe(false);
     expect(wrapperRequiresServer({ CLODEX_REQUIRE_SERVER: '1' })).toBe(true);
+  });
+});
+
+describe('wrapperSpawnShell', () => {
+  it.each([
+    ['win32', 'C:\\nvm4w\\nodejs\\claude.cmd', true],
+    ['win32', 'C:\\nvm4w\\nodejs\\CLAUDE.CMD', true],
+    ['win32', 'C:\\tools\\claude.bat', true],
+    ['win32', 'C:\\Users\\jane\\.vscode\\extensions\\anthropic.claude-code-2.1.267-win32-x64\\resources\\native-binary\\claude.exe', false],
+    ['win32', 'C:\\nvm4w\\nodejs\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe', false],
+    ['win32', 'C:\\nvm4w\\nodejs\\claude', false],
+    ['win32', 'C:\\odd\\claude.cmd.exe', false],
+    ['darwin', '/usr/local/bin/claude.cmd', false],
+    ['linux', '/usr/local/bin/claude', false],
+  ] as const)('%s %s -> shell=%s', (platform, target, expected) => {
+    expect(wrapperSpawnShell(platform, target)).toBe(expected);
   });
 });

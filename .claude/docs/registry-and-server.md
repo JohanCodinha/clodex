@@ -15,6 +15,19 @@ picker whose Enter default is device code; the chosen method is forwarded to
 Materialization (`materialize.ts`) turns registry providers into `LocalProvider`s with per-model
 `npm`/`baseUrl`/`upstreamModelId`.
 
+A custom OpenAI-compatible server is not a template. `providers add` → *Custom OpenAI-compatible
+server* (`src/providers-custom-add.ts`) calls `addCustomEndpointProvider`
+(`src/registry/custom-endpoint.ts`), which runs the SSRF guard in `url-security.ts`, lists the
+server's models, stores the key, and saves a `templateId: 'custom-openai'` provider — with
+`authRef: 'none:anonymous'` when the key is empty. The same function accepts `kind: 'anthropic'`,
+but no command offers it. The server chooses the model ids, names and error text. Both list
+fetchers (`fetchTemplateModels`, `fetchAnthropicModels`) skip a model whose trimmed id or name
+contains a control character, so neither an add nor `refresh-models` stores one, and the flow prints
+the server's error text with control characters replaced by spaces (`server-text.ts`). The ChatGPT
+OAuth catalog parser (`parseOpenAiModelEntries` in `refresh-models.ts`) has no such check; its host
+is fixed. Custom providers are read by the same materialization and refresh code as template
+providers (`materialize.ts`, `model-source.ts`, `refresh-models.ts`).
+
 Provider templates can declare reusable controls for non-default behavior:
 
 - **`verifyCredential`** runs an optional template-owned probe before a credential is persisted. It
@@ -52,6 +65,17 @@ every slot credential for deletion.
 and `/openai/v1` (via `src/openai-adapter.ts`). Wizard/quick-start settings persist to config;
 network mode requires a password; default port 17645 (`--port` overrides).
 
+Every inference and count_tokens request builds a client-disconnect controller (`watchClientDisconnect`
+in `src/http-utils.ts`, shared with `src/proxy.ts`) and passes its signal to the upstream call — the
+raw relays' `fetch`, and the SDK adapters' `abortSignal`. The controller is aborted at end of life on
+every path, so consumer abort listeners run at a deterministic point rather than at the garbage
+collector's convenience; the abort reason says which path it was. A response `close` before the
+response finished writing is a real disconnect (mid-stream as well as before any output) and aborts
+with `Client disconnected`; a response that finished writing aborts with `ResponseCompleted` after its
+last byte. Ask `clientDisconnected(signal)`, never `signal.aborted`, when deciding whether an error is
+worth reporting — a cancelled request writes no error response, because the client that would read it
+is the one that left, while non-abort failures still answer the client.
+
 Endpoint-mode request model resolution (`createGatewayModelCatalog` in `server/models.ts`) accepts,
 in precedence order: exact catalog id (and its gateway-discovery id) → unmasked gateway id when
 `--mask-gateway-ids` is on (`vendor-mask.ts`) → canonical `clodex:{provider}:{model}` id → saved
@@ -62,8 +86,9 @@ exact `Map.get`, so a wrong-case endpoint alias does not resolve.
 Invalid, reserved, conflicting, unavailable, or catalog-colliding aliases remain preserved in config
 but are reported and kept out of routing. **Aliases and canonical ids are accepted INPUT only** —
 `/models` listings advertise exactly the canonical/masked ids. **Echo invariant:** an aliased
-request's response `model` field echoes the alias verbatim (even under masking) so a patched Claude
-Code's context-window lookup keys match (`aliasNames` in `ServerOptions`).
+request's response `model` field echoes the alias verbatim (even under masking), so the id a client
+sees back is the one it sent (`aliasNames` in `ServerOptions`). Note the window lookup itself does
+not read the response body — see `.claude/docs/claude-code-internals.md`.
 
 **An alias can also carry a service tier.** A saved name ending in `-fast` requests Codex fast mode
 (`service_tier: priority`) for the requests addressed to it, so one agent can run fast without the

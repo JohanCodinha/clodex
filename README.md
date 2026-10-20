@@ -44,6 +44,7 @@ clodex claude                  # 5. launch Claude Code on an OpenAI model
 | OpenCode Go | API key | Community-supported — maintained by its contributor |
 | [GitHub Copilot](./docs/github-copilot.md) | OAuth | Community-supported — maintained by its contributor |
 | [OpenRouter](./docs/openrouter.md) | API key | Community-supported — maintained by its contributor |
+| Custom OpenAI-compatible server (vLLM, LM Studio, …) | API key, or none | Community-supported — maintained by its contributor |
 
 **Community-supported** means the maintainer holds no account for that service,
 so it cannot be exercised against the live API here or debugged when the vendor
@@ -108,6 +109,9 @@ flowchart LR
 > [!TIP]
 > Using Claude Code's agents view or background agents? Ask your Claude Code agent to read [docs/background-agents.md](docs/background-agents.md) and set it up for you — one global `clodex server --proxy` plus the `clodex-claude` wrapper bin bridges every claude process automatically.
 
+> [!TIP]
+> Using the Claude Code VS Code extension? `clodex-claude` launches your verified clodex-patched install in place of the extension's bundled binary, so clodex models appear in its model picker; follow the [VS Code setup](docs/background-agents.md#vs-code-model-picker). On Windows, `clodex install-vscode-launcher` first builds the `.exe` the extension needs to launch Claude Code through `clodex-claude`; see [docs/windows-setup.md](docs/windows-setup.md).
+
 ## CLI reference
 
 ### `clodex claude [options] [claude-flags]`
@@ -145,7 +149,7 @@ Common options (both modes):
 | `--save-mode` | With `--endpoint`/`--proxy`: save that mode as the `server` default |
 | `--port <1-65535>` | Listen port (default 17645) |
 | `--no-discovery` | Don't advertise this server in `~/.clodex/server-runtime.json` (`CLODEX_NO_DISCOVERY=1` also works). Use it for a standalone endpoint the `clodex-claude` wrapper should ignore. |
-| `--ws-diagnostics` | Log sanitized request envelopes and WebSocket head decisions |
+| `--ws-diagnostics` | Log sanitized request envelopes and WebSocket head decisions, plus the usage-limit reports the OpenAI socket sends, verbatim (they include account state such as credits) |
 | `--help`, `--version` | Help / version |
 
 Endpoint mode only (an error if combined with `--proxy`):
@@ -197,7 +201,9 @@ Patch the installed Claude Code binary so clodex favorites and aliases are first
 | `--disable-local-patches` | Disable local patches and rebuild from pristine bytes without them |
 | `--help` | Help |
 
-The patch map is built from your favorites and aliases; context windows come from provider metadata. A pristine per-version backup is kept, and a manifest (`~/.clodex/patch-state.json`) makes re-runs no-ops until your config or Claude Code version changes — then the binary is restored first and re-patched fresh. `clodex claude` checks patch freshness at launch and offers to re-patch (a non-blocking notice when not interactive). Re-run `clodex patch` after every `claude` update.
+On Windows, when Claude Code was installed with `npm install -g`, the `claude` on your PATH is a small launcher script (`claude.cmd`, `claude.ps1`, and an extensionless one) rather than the program itself; `clodex patch` follows it to the program and patches that. (On macOS and Linux npm makes a symlink instead, which always worked.) If the launcher cannot be followed — its program moved or removed, or it names two different programs — `clodex patch` stops without touching anything and tells you to set `TWEAKCC_CC_INSTALLATION_PATH` to the program directly.
+
+The patch map is built from your favorites and aliases; context windows come from provider metadata. A pristine per-version backup is kept — recorded against the install it was made for, so a machine with two installs of one Claude Code version restores each from its own bytes — and a manifest (`~/.clodex/patch-state.json`) makes re-runs no-ops until your config or Claude Code version changes — then the binary is restored first and re-patched fresh. `clodex claude` checks patch freshness at launch and offers to re-patch (a non-blocking notice when not interactive). Re-run `clodex patch` after every `claude` update.
 
 #### Local patches (trusted code)
 
@@ -279,11 +285,13 @@ Two further limits, both shared with `--fast`:
 
 #### Context stops and the pricing boundary
 
-A context window is a cost dial as much as a capacity number. OpenAI prices GPT-5.6
-prompts above **272,000 input tokens at 2x input and 1.5x output for the full
-request**, which is why the Codex catalog reports a 272,000 window rather than the
-model's ceiling. Clodex follows that: the default `standard` stop stays under the
-line, and a larger window is something you ask for.
+A context window is a cost dial as much as a capacity number. OpenAI prices GPT-5.5
+and later prompts above **272,000 input tokens at 2x input and 1.5x output for the
+full request**, which is why the Codex catalog reports a 272,000 window rather than
+the model's ceiling. Newer families inherit the same boundary, so a model released
+after this was written is covered without a clodex update. Clodex follows that: the
+default `standard` stop stays under the line, and a larger window is something you
+ask for.
 
 ```sh
 clodex models --context sol=max --save     # this model's default, with a cost warning
@@ -291,19 +299,21 @@ clodex claude --context sol=max            # this launch only, nothing saved
 clodex models --context sol=default --save # back to the provider's tuned window
 ```
 
-Each stop is reported with the numbers behind it: the raw window, the headroom
-percentage the Codex catalog uses, the effective window a client should fill, and the
-account ceiling a larger stop can reach. A stop above the ceiling is clamped and says
-so. When a request's own reported token count crosses the boundary, clodex warns once
-per model for the life of the process, because the client's token count and the
-provider's differ after translation and only the provider's settles it.
+Each stop is reported with the numbers behind it: the raw window, the effective
+window a client should fill, and the account ceiling a larger stop can reach. A stop
+above the ceiling is clamped and says so. When a request's own reported token count
+crosses the boundary, clodex warns once per model for the life of the process,
+because the client's token count and the provider's differ after translation and only
+the provider's settles it.
 
 Two things worth knowing about the numbers:
 
-- **ChatGPT/Codex OAuth models carry a 95% headroom convention**, matching the Codex
-  client. Their reported window is 5% below the raw catalog value: `gpt-5.6-sol`
-  reports 258,400 rather than 272,000. This applies to that provider only; API-key
-  and OpenCode Go models keep their full window.
+- **Clodex reports the window the provider actually gives, and holds nothing back.**
+  Deciding how much of a window to leave free is the client's job — Claude Code
+  already reserves a fixed amount below whatever window it is told, and shrinking the
+  number first only costs usable context. A provider that declares a share of its own
+  is still honoured; clodex just never invents one. Use `--context` if you want a
+  smaller window than the provider offers.
 - **The account ceiling moves.** It is server-side and per-account, and it has
   changed by more than 2x within a single day in the past. `max` reads whatever the
   catalog reports now and clamps to it, so a stale ceiling shrinks the stop rather
@@ -314,7 +324,7 @@ Two things worth knowing about the numbers:
 | Subcommand | Effect |
 | --- | --- |
 | *(none)* | Provider hub wizard |
-| `add` | Add OpenAI or OpenCode Go with an API key, or sign in with ChatGPT or GitHub Copilot |
+| `add` | Add OpenAI or OpenCode Go with an API key, add a custom OpenAI-compatible server by base URL, or sign in with ChatGPT or GitHub Copilot |
 | `auth openai` | Sign in with ChatGPT/Codex-plan OAuth (device code; `--browser` for workspaces that disable device codes) |
 | `auth github-copilot` | Sign in with your GitHub Copilot plan (device code at github.com/login/device) |
 | `list` | Show configured providers |
@@ -322,6 +332,12 @@ Two things worth knowing about the numbers:
 | `refresh-models [id]` | Update cached model lists |
 
 Providers supported: `openai` (API key, platform.openai.com), `openai-oauth` (ChatGPT/Codex plan), `opencode-go` (OpenCode Go API key), and `github-copilot` (GitHub Copilot plan). OpenCode Go exposes its Anthropic Messages and Chat Completions models; Responses-only entries are intentionally excluded. See [OpenCode Go provider](docs/opencode-go.md). GitHub Copilot exposes whichever chat models your plan entitles you to — Anthropic, OpenAI and Google alike — over one Chat Completions endpoint. See [GitHub Copilot provider](docs/github-copilot.md).
+
+A **custom OpenAI-compatible server** is any OpenAI-style API, given by its base URL (the part before `/chat/completions`), such as `https://openrouter.ai/api/v1`. `providers add` asks for a name, the base URL and an API key (leave it empty for a local server without auth), lists the server's models to check the connection, and saves the provider as `custom-<name>`. Its models then appear in `clodex models`; once saved as favorites they are addressed as `clodex:custom-<name>:<model>` and can be given a short alias with `clodex models --alias`. The base URL is checked before anything is saved: plain `http://` is accepted only after you confirm it, and only for loopback or private-network addresses, and an `https://` URL whose host is, or resolves to, a loopback (`127.0.0.0/8`, `::1`), private, link-local, unique-local, carrier-grade-NAT or well-known cloud-metadata address is refused. A model's id and name are stored with surrounding whitespace trimmed, and a model whose trimmed id or name still contains a control character is skipped, whether the list is fetched by `providers add` or by `providers refresh-models`, and error text from the server is shown with control characters replaced by spaces. Only the OpenAI-compatible kind is offered in the menu.
+
+### `clodex install-vscode-launcher`
+
+Windows only. Builds `%USERPROFILE%\.clodex\bin\clodex-claude.exe`, the executable the Claude Code VS Code extension can use as its `claudeCode.claudeProcessWrapper`, so chats in the editor launch Claude Code through `clodex-claude` (on Windows npm installs that wrapper as three script shims — extensionless, `.cmd`, `.ps1` — and no executable the extension can spawn). It compiles a short C# source shipped in the package with the compiler already inside the .NET Framework — nothing is downloaded — and prints the setting to paste; it never edits VS Code or Claude settings. The paths to `node.exe` and the clodex install are compiled in, so re-run it after switching Node versions or moving clodex. Setup guide: [docs/windows-setup.md](docs/windows-setup.md).
 
 ### Root
 
@@ -367,7 +383,10 @@ clodex --version    # version
   `CLODEX_CREDENTIAL_HELPER` to an absolute executable path to use an external
   secure store instead; see [credential helpers](docs/credential-helpers.md).
 - Proxied routes forward configured provider headers for API-key and OAuth authentication. Anonymous routes preserve non-credential headers while removing authorization, API-key, cookie, token, secret, and credential-bearing header names before dispatch.
-- `CLODEX_CLAUDE_PATH` overrides Claude Code binary discovery.
+- `CLODEX_CLAUDE_PATH` overrides which Claude Code gets **launched**. It does not choose what
+  `clodex patch` writes to — set `TWEAKCC_CC_INSTALLATION_PATH` for that, and `clodex patch`
+  says so when `CLODEX_CLAUDE_PATH` points somewhere else. The two are separate because a
+  `CLODEX_CLAUDE_PATH` aimed at a wrapper script is right for launching and wrong for patching.
 - **Codex service tier:** `CLODEX_SERVICE_TIER` accepts `fast` (normalized to
   `priority`), `priority`, `flex`, `auto`, or `default`. Clodex requests the
   resolved value only after selecting a ChatGPT/Codex OAuth route; OpenAI
@@ -380,22 +399,116 @@ clodex --version    # version
   SDK reports that it omitted the tier for a model, clodex warns once and the
   backend default remains in use.
 - **Outbound proxy:** when `HTTP_PROXY`/`HTTPS_PROXY` (and optionally `NO_PROXY`) are set in clodex's environment, all clodex-originated network calls honor them — OAuth sign-in and token refresh, model-list and models.dev refreshes, upstream OpenAI API calls, and the ChatGPT/Codex OAuth WebSocket transport (tunneled via HTTP CONNECT).
-- **Upstream retries:** set `CLODEX_UPSTREAM_MAX_RETRIES` to an integer from
-  `0` through `5` to override the SDK's default of two retries for retryable
-  provider failures. `0` disables retries. The SDK honors valid
-  `retry-after`/`retry-after-ms` headers and otherwise uses exponential
-  backoff. Larger integers clamp to `5` with a one-time warning because a sixth
-  retry cannot complete before the translated streaming paths' 120-second
-  no-data timeout. Unset, empty, or malformed values preserve the default. A
-  stream that fails after output begins cannot be replayed safely and still
-  terminates the request. The same setting covers requests passed straight
-  through to Anthropic, which replay once by default. Only a request that went
-  out on a pooled connection the far end had already closed, and that received
-  no part of a response, is replayed there; anything else is reported as it
-  happens. Setting Claude Code's own `CLAUDE_CODE_MAX_RETRIES=0` also disables
-  the passthrough replay, so telling the client never to resend a request is
-  not quietly undone one layer down. Recovered requests appear in the inference
-  log as `response_retried`.
+- **Provider timeouts:** `CLODEX_UPSTREAM_IDLE_TIMEOUT_MS` controls how long an
+  SDK-backed translated stream may produce no event (default `120000`; range
+  `10000`–`3600000` ms). `CLODEX_UPSTREAM_TOTAL_TIMEOUT_MS` limits each call
+  clodex makes to a configured provider, including non-streaming calls (default
+  `600000`; range `60000`–`21600000` ms). An authentication refresh can start a
+  new call with a fresh timer, so this is not an end-to-end route deadline. Set
+  both variables on the process serving the request: the embedded server
+  started by `clodex claude`, or a standalone `clodex server`. `clodex-claude`
+  only connects to an existing server, so setting them on that wrapper does not
+  reconfigure the server. Empty values use the defaults, malformed values are
+  ignored, and integers outside the supported ranges clamp to the nearest
+  bound. Clodex warns once for each malformed, clamped, or inconsistent setting
+  when a request first resolves it; `clodex claude` displays that parent notice
+  after Claude Code exits. The total timeout can never be shorter than the idle
+  timeout: increasing only the idle timeout raises the default total to match,
+  while an explicit shorter total lowers the idle timeout. The 10s/1m floors
+  avoid near-immediate termination; the 1h/6h ceilings allow deliberately long
+  calls without leaving stalls attached indefinitely. At either deadline,
+  clodex aborts the SDK call; cancellation is cooperative, so a provider
+  transport that ignores the abort signal can settle later. clodex also asks
+  the provider to stop as soon as the client that made the request goes away —
+  a Ctrl-C, a killed agent, or a closed browser — instead of waiting for a
+  deadline, whether the answer had started arriving or not. The same
+  cooperative limit applies: clodex stops relaying and requests cancellation,
+  but cannot guarantee the provider stops generating. These are
+  server-side limits, and callers may stop sooner. Claude Code currently
+  defaults to about 180s of downstream byte silence in proxy mode and 300s in
+  endpoint mode, with
+  a 30m byte-watchdog ceiling. In Claude Code's environment, `API_TIMEOUT_MS`
+  controls the pre-header deadline; `CLAUDE_STREAM_IDLE_TIMEOUT_MS` and
+  `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` control stream silence. Waits beyond 30m
+  also require `CLAUDE_ENABLE_BYTE_WATCHDOG=false`. With a standalone server,
+  set those client variables on the Claude Code process, not the server.
+- **Upstream retries:** clodex retries retryable failures on SDK-backed
+  provider calls up to `5` times by default. Set
+  `CLODEX_UPSTREAM_MAX_RETRIES` to a non-negative integer to override it; `0`
+  disables retries. The default and configuration ceiling
+  are derived from the resolved idle timeout and the SDK's fallback 2s, 4s, 8s,
+  … backoff, so a shorter idle timeout automatically lowers both. The ceiling
+  is `5` at the default timeout and can rise to `10` at the maximum. Larger
+  integers clamp with a one-time warning that names the active idle timeout.
+  Without a retry hint, five retries can add roughly 62s of fallback
+  backoff instead of the SDK default's roughly 6s, giving a transiently
+  unavailable provider more time to recover. When OpenAI explicitly states an
+  acceptable delay for a WebSocket throttle, clodex gives that value to the
+  SDK instead of its fallback schedule. Clodex's existing 5s default remains a
+  client-facing hint for upgrade 403s and WebSocket connection-limit errors
+  that state no delay; it does not replace the SDK's fallback. Other hintless
+  429s also retain the fallback schedule. Provider `retry-after` hints and time
+  spent in failed attempts can mean fewer retries start before a streaming idle
+  deadline; the shared abort signal still
+  interrupts backoff when that deadline fires. If a deadline interrupts a
+  retry delay, clodex preserves the provider failure that prompted the retry;
+  if a currently active call is silent, clodex reports the timeout instead.
+  Unset, empty, or malformed values preserve the clodex default. The SDK only
+  retries before model output is exposed downstream; a stream that fails after
+  partial output cannot be
+  replayed safely and still terminates the request. The same
+  retry setting also controls proxy mode's raw HTTP MITM path, which replays
+  once by default and retains an independent ceiling of `5`. Only a request
+  sent on a pooled connection the far end had already closed, with no response
+  received, is replayed there; other direct raw relays add no transport-failure
+  replay (an OAuth 401 refresh can still start a new authenticated call). The
+  timeout settings add no timers to any raw relay. A valid
+  `CLODEX_UPSTREAM_MAX_RETRIES` value takes precedence on the HTTP MITM path;
+  otherwise, Claude Code's own `CLAUDE_CODE_MAX_RETRIES=0` disables that replay
+  so telling the client never to resend a request is not quietly undone one
+  layer down.
+  Recovered requests appear in the inference log as `response_retried`.
+- **Connection pacing (ChatGPT/Codex plans):** when many agents run at once,
+  clodex spaces out the new connections it opens to OpenAI, which should make a
+  burst of parallel work less likely to trip OpenAI's own rate limit. (In the
+  traffic we sampled, the rejections clustered in the busiest minutes; that the
+  rate is what triggers them is a reasonable reading of that, not something we
+  can prove.) A follow-up turn that already has a connection it can reuse when
+  it arrives is never delayed by this;
+  what goes through the limiter is work that needs a *new* connection — a first
+  turn, a conversation that branched, or several agents running at once. If a
+  turn that is waiting its place in the queue finds, on being let through, that
+  a connection has freed up and is carrying exactly the conversation it is
+  continuing, it picks that one up instead of opening another. That is
+  uncommon — it needs another turn to finish inside the few seconds this one
+  spends waiting AND to have been on the same conversation history — so treat
+  it as an edge taken when it appears, not as agents routinely sharing
+  connections. The
+  default is 60 new connections a minute, with an allowance of 10 opened back
+  to back after a quiet spell.
+  **This is a real throughput ceiling, not a brief pause.** One new connection
+  per second means that if you run many agents at once and each needs its own
+  connection, they end up sharing that budget: roughly 20 agents settle at
+  about 20 seconds per turn instead of a few seconds. That is the trade — you
+  wait longer, in exchange for a lower chance of losing turns to rate-limit
+  errors. It reduces that risk rather than removing it: clodex cannot see
+  OpenAI's actual limit, and under a heavy enough fan-out pacing can itself
+  answer a turn with a rate-limit response. Work over the
+  rate is queued for a few seconds, and anything still over is answered with
+  the same "try again shortly" response OpenAI itself would return, which
+  clodex retries for you with backoff. Set
+  `CLODEX_WS_MAX_NEW_CONNECTIONS_PER_MIN` to another whole number between `1`
+  and `600` to change the rate, or to `0` to turn pacing off. Higher values
+  clamp to `600` with a one-time warning, and an unreadable value is reported
+  once and ignored. If you have turned retries off with
+  `CLODEX_UPSTREAM_MAX_RETRIES=0`, pacing never refuses a request — but it also
+  stops limiting once its initial allowance is used up, because there would be
+  nothing left to retry a refused request. The same applies at very low rates:
+  if clodex cannot retry a turned-away request for long enough to reach the
+  next free connection slot — which is the case around 1 or 2 connections a
+  minute at the default timeouts — it admits the excess late rather than
+  failing it, and says so once. Turning a rate that low into hard failures
+  would manufacture the errors this feature exists to reduce.
 
 ## Known limitations
 

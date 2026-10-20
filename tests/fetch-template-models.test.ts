@@ -158,6 +158,90 @@ describe('fetchTemplateModels', () => {
     });
   });
 
+  it('skips a listed model whose id or name carries a control character', async () => {
+    const ESC = String.fromCharCode(0x1b);
+    vi.mocked(fetch).mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        data: [
+          { id: `gpt-5${ESC}[2J${ESC}[H-free` },
+          { id: 'plain-id', name: `Nice${ESC}]0;PWNED` },
+          { id: `clean-name${ESC}[H`, name: 'A clean display name' },
+          { id: 'good-model', name: 'Good Model' },
+        ],
+      }),
+    } as Response);
+
+    const result = await fetchTemplateModels(openaiCompatTemplate, 'sk-test');
+
+    expect(result.error).toBeUndefined();
+    expect(result.models.map(model => model.id)).toEqual(['good-model']);
+  });
+
+  it('keeps a listed model whose name only has whitespace around it, stored trimmed', async () => {
+    const ESC = String.fromCharCode(0x1b);
+    vi.mocked(fetch).mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        data: [
+          { id: 'trailing-newline', name: 'Trailing Newline\n' },
+          { id: 'leading-tab', name: '\tLeading Tab' },
+          { id: 'crlf', name: '\r\nBoth Ends\r\n' },
+          { id: 'id-newline\n', name: 'Id Newline' },
+          { id: 'inner-newline', name: 'Two\nLines' },
+          { id: 'edge-escape', name: `${ESC}[2JEdge` },
+        ],
+      }),
+    } as Response);
+
+    const result = await fetchTemplateModels(openaiCompatTemplate, 'sk-test');
+
+    expect(result.models.map(model => [model.id, model.name])).toEqual([
+      ['trailing-newline', 'Trailing Newline'],
+      ['leading-tab', 'Leading Tab'],
+      ['crlf', 'Both Ends'],
+      ['id-newline', 'Id Newline'],
+    ]);
+  });
+
+  it('reports no models when every listed model carries a control character', async () => {
+    vi.mocked(fetch).mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ data: [{ id: `only${String.fromCharCode(0x1b)}[2J` }] }),
+    } as Response);
+
+    const result = await fetchTemplateModels(openaiCompatTemplate, 'sk-test');
+
+    expect(result.models).toEqual([]);
+    expect(result.error).toBe('Connected but no models were returned.');
+  });
+
+  it("stores a vLLM model's own max_model_len rather than the id-based estimate", async () => {
+    vi.mocked(fetch).mockResolvedValue({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({
+        data: [
+          // The id would be estimated at 131072; the server says otherwise.
+          { id: 'llama-3.2-3b-instruct', max_model_len: 8192 },
+          // Every key the chain already read still wins over max_model_len.
+          { id: 'server-explicit', context_length: 32768, max_model_len: 8192 },
+        ],
+      }),
+    } as Response);
+
+    const result = await fetchTemplateModels(openaiCompatTemplate, 'sk-test-key');
+
+    expect(result.error).toBeUndefined();
+    expect(result.models.map(m => [m.id, m.contextWindow])).toEqual([
+      ['llama-3.2-3b-instruct', 8192],
+      ['server-explicit', 32768],
+    ]);
+  });
+
   it('uses provider-specific modelsPath and omits Authorization for anonymous fetches', async () => {
     const anonymousTemplate = template({
       id: 'anon-free',

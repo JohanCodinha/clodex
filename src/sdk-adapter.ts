@@ -1,5 +1,5 @@
 // Anthropic /v1/messages ↔ Vercel AI SDK. One turn per request; Claude Code owns the tool loop.
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { streamText, generateText, tool, jsonSchema } from 'ai';
 import type { LanguageModel, ModelMessage } from 'ai';
 import {
@@ -19,14 +19,19 @@ import {
 } from './provider-factory.js';
 import { resolveUpstreamTools } from './tool-search.js';
 import { sanitizeToolInput } from './tool-input-sanitize.js';
+import { sanitizeToolSchema } from './tool-schema-sanitize.js';
+import { VERTEX_ANTHROPIC_NPM } from './constants.js';
 import type { AnthropicRequestMessage, AnthropicToolDefinition } from './proxy-types.js';
-import { anthropicErrorType, upstreamHttpStatus } from './upstream-error.js';
-import { upstreamMaxRetries } from './upstream-retry.js';
+import { anthropicErrorType, sdkUpstreamErrorDetails, upstreamHttpStatus } from './upstream-error.js';
+import { upstreamRequestBudget } from './upstream-retry.js';
+import { trackUpstreamAttempts } from './upstream-attempts.js';
 import { emitParentNotice } from './parent-notice.js';
+import { CLAUDE_CODE_COMPACT_PROMPT_MARKERS } from './claude-code-compact-prompt.js';
 import { CLAUDE_CODE_BILLING_HEADER_PREFIX } from './oauth/claude-identity.js';
 import { GITHUB_COPILOT_PROVIDER_ID } from './github-copilot.js';
 import { aliasRequestsFastTier } from './model-aliases.js';
 import { normalizeRouteLookupId } from './context-model-id.js';
+import { OpenAiThinkingBlock, openAiReasoningItemId, restoreOpenAiThinking } from './openai-thinking.js';
 
 export { silenceSdkWarnings };
 
@@ -107,6 +112,8 @@ export interface TranslateRequestOptions {
    * alias table behave exactly as before.
    */
   serviceTier?: string;
+  /** Immediate trace-log sink; diagnostics must call it before terminal-warning suppression. */
+  log?: (message: string) => void;
 }
 
 const CLAUDE_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -133,6 +140,27 @@ export function extractClaudeSessionId(
     }
   }
   return validClaudeSessionId(headerFallback);
+}
+
+const CLAUDE_AGENT_ID_RE = /^[A-Za-z0-9._-]{1,128}$/;
+
+/**
+ * Claude Code 2.1.268 marks every request from an in-process subagent with
+ * `x-claude-code-agent-id` (and its parent's id in `x-claude-code-parent-agent-id`);
+ * the main agent sends neither. The value is opaque, so only its shape is checked.
+ */
+export function extractClaudeAgentIds(
+  headers: Record<string, string | string[] | undefined>,
+): { claudeAgentId?: string; claudeParentAgentId?: string } {
+  const read = (name: string): string | undefined => {
+    const raw = headers[name];
+    const value = (Array.isArray(raw) ? raw[0] : raw)?.trim();
+    return value && CLAUDE_AGENT_ID_RE.test(value) ? value : undefined;
+  };
+  return {
+    claudeAgentId: read('x-claude-code-agent-id'),
+    claudeParentAgentId: read('x-claude-code-parent-agent-id'),
+  };
 }
 
 /** Opaque prompt-cache partition derived from a Claude session UUID. */
@@ -191,6 +219,8 @@ export interface SdkCallParams {
   maxOutputTokens?: number;
   temperature?: number;
   providerOptions?: Record<string, Record<string, unknown>>;
+  /** Per-request upstream headers; `streamText`/`generateText` take them as-is. */
+  headers?: Record<string, string>;
 }
 
 // ── system ───────────────────────────────────────────────────────────────────
@@ -409,8 +439,12 @@ export function translateMessages(
           // content, not prior assistant output_text items.
           parts.push({ type: 'text', text: b.text ?? '' });
         } else if (b.type === 'thinking') {
-          const part = thinkingToSdkPart(b, npm);
-          if (part) parts.push(part);
+          const restored = restoreOpenAiThinking(b.thinking ?? '', b.signature, npm);
+          if (restored) parts.push(...restored);
+          else {
+            const part = thinkingToSdkPart(b, npm);
+            if (part) parts.push(part);
+          }
         } else if (b.type === 'tool_use' && b.id) {
           const { rawId, thoughtSignature } = splitToolUseId(b.id);
           const part: Record<string, unknown> = {
@@ -464,12 +498,15 @@ function toolRequiredProps(tools?: SdkCallParams['tools']): Map<string, Readonly
 
 export function translateTools(anthropicTools?: AnthropicTool[], npm?: string): Record<string, ReturnType<typeof tool>> | undefined {
   if (!anthropicTools?.length) return undefined;
+  // Anthropic-format routes take Claude Code's ECMAScript patterns as written;
+  // every other provider validates them in a dialect that may not compile them.
+  const anthropicFormat = npm === '@ai-sdk/anthropic' || npm === VERTEX_ANTHROPIC_NPM;
   const tools: Record<string, ReturnType<typeof tool>> = {};
   for (const t of anthropicTools) {
     if (!t.name || !t.input_schema) continue;
     tools[t.name] = tool({
       description: t.description ?? '',
-      inputSchema: jsonSchema(t.input_schema),
+      inputSchema: jsonSchema(anthropicFormat ? t.input_schema : sanitizeToolSchema(t.input_schema)),
       strict: npm === '@ai-sdk/openai' ? false : undefined,
     });
   }
@@ -484,31 +521,128 @@ export function translateToolChoice(tc: AnthropicRequest['tool_choice']): SdkCal
   return undefined;
 }
 
-const COMPACT_TEXT_ONLY_START = 'CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.';
-const COMPACT_TEXT_ONLY_END = 'REMINDER: Do NOT call any tools. Respond with plain text only';
+const {
+  start: COMPACT_TEXT_ONLY_START,
+  end: COMPACT_TEXT_ONLY_END,
+} = CLAUDE_CODE_COMPACT_PROMPT_MARKERS;
 
 /**
- * Claude Code's structured-output agents inherit the terminal StructuredOutput
- * tool when they fork a reactive compaction turn, even though the compact prompt
- * requires plain text and rejects every tool call. OpenAI-family models tend to
- * call that highly salient tool, leaving Claude Code with an empty summary.
+ * Claude Code forks its reactive-compaction turn with the SAME tool definitions
+ * as an ordinary turn and relies on the prompt alone — "Respond with TEXT ONLY"
+ * — to stop the model calling them. OpenAI-family models ignore that and answer
+ * with whichever tool the conversation made salient: StructuredOutput in a
+ * schema-mode agent, but Bash after a shell-heavy session, and in principle any
+ * tool at all. The fork denies tool EXECUTION and allows one turn, so a call it
+ * emits buys nothing: it burns the turn and returns no summary text. The
+ * reactive path has no second chance at all; the manual path retries once
+ * outside the fork with a reduced tool set, and then gives up too. Claude
+ * Code discards the attempt, and three consecutive failures open a circuit
+ * breaker that short-circuits every later AUTOMATIC compaction — with no API
+ * call — until the counter is reset by a successful compaction or a fresh query
+ * invocation. A headless or subagent run is a single invocation, so there it
+ * never resets: the conversation grows until it dies on Claude Code's own
+ * "Prompt is too long" guard.
  *
- * Detect only the observed compact envelope. If Claude Code changes it, this
+ * So key on the compact envelope only — the marker text is what identifies this
+ * turn, never the tool list, which is why the earlier StructuredOutput
+ * precondition was too narrow. If Claude Code changes the envelope, this
  * deliberately fails open rather than stripping tools from an ordinary request.
+ *
+ * The envelope must OPEN a text block, not merely appear in one. Every builder
+ * puts the header first and appends the reminder to the same string, so an
+ * anchored match costs nothing; an unanchored one fires on any turn that merely
+ * quotes the envelope — a pasted prompt, a subagent's report, a read of this
+ * very file — and silently takes tools away from a turn that needed them.
  */
-function isClaudeCodeStructuredOutputCompactRequest(body: AnthropicRequest): boolean {
+function isClaudeCodeCompactRequest(body: AnthropicRequest): boolean {
   if (body.diagnostics !== undefined) return false;
-  if (!body.tools?.some(candidate => candidate.name === 'StructuredOutput')) return false;
 
   const finalMessage = body.messages.at(-1);
   if (!finalMessage || finalMessage.role !== 'user') return false;
-  const text = typeof finalMessage.content === 'string'
-    ? finalMessage.content
+  const texts = typeof finalMessage.content === 'string'
+    ? [finalMessage.content]
     : finalMessage.content
       .filter(block => block.type === 'text')
-      .map(block => block.text ?? '')
-      .join('\n');
-  return text.includes(COMPACT_TEXT_ONLY_START) && text.includes(COMPACT_TEXT_ONLY_END);
+      .map(block => block.text ?? '');
+  return texts.some(text =>
+    text.startsWith(COMPACT_TEXT_ONLY_START) && text.includes(COMPACT_TEXT_ONLY_END));
+}
+
+// This sentence is the reason the compaction fork needs a text-only response,
+// not decoration around it. It occurs in both prompt builders across 27 extracted
+// 2.1.238–2.1.260 bundles; all eight platforms are represented for 2.1.257 and
+// 2.1.260. The recognizer deliberately covers only rewordings that preserve this
+// anchor and a bounded opening grammar. The imperative must start at byte zero
+// (after an optional known severity label), so quoted copies with a preamble stay
+// out; a raw copy pasted with no preamble is indistinguishable from Claude Code's
+// own prompt. The START guard excludes known partial envelopes. A
+// START-intact/END-reworded prompt also stays invisible by design because it is
+// indistinguishable from a user quoting the header; the per-build release probe
+// catches removal or in-place rewording of either current marker.
+const COMPACT_DRIFT_ANCHOR = 'Tool calls will be REJECTED and will waste your only turn';
+const COMPACT_DRIFT_ANCHOR_LINE = new RegExp(
+  `(?:^|\\n)[-*•\\s]{0,4}${COMPACT_DRIFT_ANCHOR}`,
+);
+const COMPACT_DRIFT_OPENING = /^(?:(?:critical|important|warning|caution|urgent|notice):\s*)?(?:respond|return|answer|output|write|provide)\b(?=[^\n]{1,160}(?:\n|$))(?=[^\n]*\b(?:text\s+only|plain\s+text\s+only|only\s+(?:plain\s+)?text)\b)(?=[^\n]*\b(?:do not|don't|never|without)\b[^\n]{0,48}\btools?\b)/i;
+
+function looksLikeDriftedClaudeCodeCompactRequest(body: AnthropicRequest): boolean {
+  if (body.diagnostics !== undefined) return false;
+
+  const finalMessage = body.messages.at(-1);
+  if (!finalMessage || finalMessage.role !== 'user') return false;
+  const texts = typeof finalMessage.content === 'string'
+    ? [finalMessage.content]
+    : finalMessage.content
+      .filter(block => block.type === 'text')
+      .map(block => block.text ?? '');
+  return texts.some(text =>
+    !text.startsWith(COMPACT_TEXT_ONLY_START)
+    && COMPACT_DRIFT_OPENING.test(text)
+    && COMPACT_DRIFT_ANCHOR_LINE.test(text));
+}
+
+function claudeCodeVersionFromRequest(body: AnthropicRequest): string | undefined {
+  const texts = typeof body.system === 'string'
+    ? [body.system]
+    : (body.system ?? []).map(block => typeof block === 'string' ? block : block.text ?? '');
+  for (const text of texts) {
+    if (!text.startsWith(CLAUDE_CODE_BILLING_HEADER_PREFIX)) continue;
+    const match = text.match(/\bcc_version=([0-9A-Za-z][0-9A-Za-z._+-]{0,63})(?:;|\s|$)/);
+    if (match) return match[1];
+  }
+  return undefined;
+}
+
+const warnedCompactPromptDrifts = new Set<string>();
+const MAX_COMPACT_PROMPT_DRIFT_WARNINGS = 3;
+
+function reportClaudeCodeCompactPromptDrift(
+  body: AnthropicRequest,
+  log?: (message: string) => void,
+): void {
+  if (!looksLikeDriftedClaudeCodeCompactRequest(body)) return;
+  const version = claudeCodeVersionFromRequest(body);
+  const signature = version ?? 'unknown-version';
+  try { log?.(`possible Claude Code compact prompt drift: ${signature}`); } catch { /* ignore */ }
+  if (warnedCompactPromptDrifts.has(signature)) return;
+  if (warnedCompactPromptDrifts.size >= MAX_COMPACT_PROMPT_DRIFT_WARNINGS) return;
+  warnedCompactPromptDrifts.add(signature);
+  const versionText = version ? ` from Claude Code ${version}` : '';
+  // emitParentNotice, not a bare process.stderr.write: while `clodex claude` has
+  // Claude Code running, launch.ts mutes the parent's stderr to protect the TUI.
+  emitParentNotice(
+    `clodex: warning: a request${versionText} looks like a compaction turn, but its prompt no longer `
+      + "matches clodex's text-only guard. Tools were left enabled and compaction may fail. Please "
+      + 'report this at https://github.com/bman654/clodex/issues',
+  );
+  if (warnedCompactPromptDrifts.size === MAX_COMPACT_PROMPT_DRIFT_WARNINGS) {
+    emitParentNotice('clodex: warning: further compact-prompt drift warnings suppressed.');
+  }
+}
+
+/** Test seam: the warning cap is process-wide and would leak between cases. */
+export function resetCompactPromptDriftWarningsForTests(): void {
+  warnedCompactPromptDrifts.clear();
 }
 
 /**
@@ -548,7 +682,8 @@ export function translateRequest(
   // minimal request shapes, so cast at this boundary. Keep compact-request tool
   // definitions intact for prompt-cache prefix reuse; toolChoice='none' below
   // makes them unavailable at the provider API rather than by prompt compliance.
-  const compactRequest = isClaudeCodeStructuredOutputCompactRequest(body);
+  const compactRequest = isClaudeCodeCompactRequest(body);
+  if (!compactRequest) reportClaudeCodeCompactPromptDrift(body, options?.log);
   let upstreamTools = resolveUpstreamTools(
     body.tools as unknown as AnthropicToolDefinition[] | undefined,
     messages as unknown as AnthropicRequestMessage[],
@@ -808,9 +943,6 @@ export interface AnthropicStreamObserver {
   idleTimeoutMs?: number;
 }
 
-const SDK_STREAM_IDLE_TIMEOUT_MS = 120_000;
-const SDK_TOTAL_TIMEOUT_MS = 10 * 60_000;
-
 function streamAbortError(signal?: AbortSignal): Error {
   if (signal?.reason instanceof Error) return signal.reason;
   const error = new Error(
@@ -825,7 +957,7 @@ function streamAbortError(signal?: AbortSignal): Error {
  * an AbortSignal.any() composite. Node 24 retains source-aborted composite
  * signals in its internal gcPersistentSignals set when listeners remain.
  */
-function forwardAbortSignal(source: AbortSignal | undefined, target: AbortController): () => void {
+export function forwardAbortSignal(source: AbortSignal | undefined, target: AbortController): () => void {
   if (!source) return () => {};
   const forward = () => {
     if (!target.signal.aborted) target.abort(source.reason);
@@ -838,6 +970,27 @@ function forwardAbortSignal(source: AbortSignal | undefined, target: AbortContro
   return () => source.removeEventListener('abort', forward);
 }
 
+/**
+ * The id clodex gives a message it translated from another provider.
+ *
+ * It must NOT start with `msg_`. Claude Code (the gate is in every build from
+ * 2.1.268 on, and fires in proxy mode when its thread rollout is enabled)
+ * treats an assistant message as an anchor for server-side thread
+ * continuation when its id starts with `msg_`, or when the response carried a
+ * `request-id` header; translated responses never send that header, so the id
+ * alone decides. An anchored follow-up carries
+ * `thread:{type:"continue",previous_message_id}` and only the messages after
+ * the anchor, trusting the server to hold the rest. No translated upstream
+ * holds that state and clodex does not reconstruct it, so the delta reached
+ * the provider as a bare tool result (`No function call found for function
+ * call output`), and Claude Code retried each such request with the full
+ * history. An id outside the anchor prefix makes Claude Code send the full
+ * history in the first place, which is what these routes are built for.
+ */
+function translatedMessageId(): string {
+  return 'clodex_' + randomUUID().replace(/-/g, '');
+}
+
 export async function writeAnthropicStream(
   stream: AsyncIterable<FullStreamPart>,
   modelId: string,
@@ -846,12 +999,13 @@ export async function writeAnthropicStream(
   observer?: AnthropicStreamObserver,
   tools?: SdkCallParams['tools'],
 ): Promise<void> {
-  const messageId = 'msg_' + Date.now();
+  const messageId = translatedMessageId();
   const requiredProps = toolRequiredProps(tools);
   let blockIndex = -1;
   let started = false;
   let openType: 'text' | 'thinking' | 'tool' | null = null;
   let pendingThinkingSig: string | undefined;
+  let openAiThinking: OpenAiThinkingBlock | undefined;
   const idToBlock = new Map<string, number>();
   // Tool input deltas are buffered (not forwarded raw) so the complete input
   // can be sanitized once the SDK's parsed `tool-call` part arrives.
@@ -886,11 +1040,14 @@ export async function writeAnthropicStream(
   };
   const closeOpen = () => {
     if (openType === 'thinking') {
+      // Emit the complete signature once: Claude Code replaces, rather than
+      // appends, signature_delta values. Splitting an envelope would lose it.
       emit('content_block_delta', {
         type: 'content_block_delta', index: blockIndex,
-        delta: { type: 'signature_delta', signature: pendingThinkingSig ?? '' },
+        delta: { type: 'signature_delta', signature: openAiThinking?.signature() ?? pendingThinkingSig ?? '' },
       });
       pendingThinkingSig = undefined;
+      openAiThinking = undefined;
     }
     // Stream ended (or moved on) without a tool-call part for this block: emit
     // the buffered raw JSON so the deltas that did arrive are not lost.
@@ -930,18 +1087,32 @@ export async function writeAnthropicStream(
         throw streamAbortError(observer?.abortSignal);
 
       case 'reasoning-start':
-        openBlock('thinking', { type: 'thinking', thinking: '', signature: '' });
+        // Consecutive OpenAI summaries/items share a live block, so a thinking-only
+        // transport drop has no completed block to prevent Claude Code's retry.
+        // The signature records their identities and boundaries for lossless replay.
+        if (openAiReasoningItemId(part) && part.id) {
+          if (!openAiThinking) {
+            openBlock('thinking', { type: 'thinking', thinking: '', signature: '' });
+            openAiThinking = new OpenAiThinkingBlock();
+          }
+          openAiThinking.start(part);
+        } else {
+          openBlock('thinking', { type: 'thinking', thinking: '', signature: '' });
+        }
         break;
       case 'reasoning-delta':
         if (openType !== 'thinking') openBlock('thinking', { type: 'thinking', thinking: '', signature: '' });
         emit('content_block_delta', {
           type: 'content_block_delta', index: blockIndex,
-          delta: { type: 'thinking_delta', thinking: part.text ?? '' },
+          delta: { type: 'thinking_delta', thinking: openAiThinking ? openAiThinking.append(part) : part.text ?? '' },
         });
         break;
       case 'reasoning-end': {
-        const sig = grabRoundTripSignature(part);
-        if (sig) pendingThinkingSig = sig;
+        if (openAiThinking) openAiThinking.end(part);
+        else {
+          const sig = grabRoundTripSignature(part);
+          if (sig) pendingThinkingSig = sig;
+        }
         break;
       }
 
@@ -1035,9 +1206,17 @@ export async function writeAnthropicStream(
       case 'error': {
         const e = part.error as { data?: unknown; message?: string } | undefined;
         const errMsg = e?.message || (typeof part.error === 'string' ? part.error : JSON.stringify(e?.data ?? part.error));
-        const errorType = anthropicErrorType(upstreamHttpStatus(part.error, errMsg));
+        const transportCode = sdkUpstreamErrorDetails(part.error)?.transportCode;
+        const errorType = anthropicErrorType(upstreamHttpStatus(part.error, errMsg), transportCode);
         log?.(() => `sdk stream error (${errorType}): ${errMsg}`);
-        closeOpen();
+        // Claude Code retries a mid-stream failure only while no content block
+        // has completed. Closing a thinking block here would count as completed
+        // content and turn a recoverable transport drop into a dead turn, so
+        // leave it open; the client closes it itself when it retries. Text and
+        // tool blocks stay closed: once visible output exists the client
+        // finalizes the partial turn either way, and a tool block's buffered
+        // arguments must still be flushed.
+        if (!(transportCode === 'websocket_transport_error' && openType === 'thinking')) closeOpen();
         throw part.error instanceof Error || (part.error && typeof part.error === 'object')
           ? part.error
           : new Error(errMsg);
@@ -1066,46 +1245,48 @@ export async function streamAnthropicResponse(
   log?: LogFn,
   observer?: AnthropicStreamObserver,
 ): Promise<void> {
-  const idleTimeoutMs = observer?.idleTimeoutMs ?? SDK_STREAM_IDLE_TIMEOUT_MS;
+  const { idleTimeoutMs, totalTimeoutMs, maxRetries } = upstreamRequestBudget({
+    idleTimeoutMs: observer?.idleTimeoutMs,
+  });
+  const attempts = trackUpstreamAttempts(model);
   const idleAbort = new AbortController();
   const stopForwardingAbort = forwardAbortSignal(observer?.abortSignal, idleAbort);
   const abortSignal = idleAbort.signal;
-  let idleTimer = setTimeout(
-    () => idleAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`)),
-    idleTimeoutMs,
+  const idleError = () => attempts.deadlineError(
+    new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`),
   );
+  let idleTimer = setTimeout(() => idleAbort.abort(idleError()), idleTimeoutMs);
   const totalTimer = setTimeout(
-    () => idleAbort.abort(new Error(`provider stream exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`)),
-    SDK_TOTAL_TIMEOUT_MS,
+    () => idleAbort.abort(attempts.deadlineError(
+      new Error(`provider stream exceeded ${Math.round(totalTimeoutMs / 1000)}s`),
+    )),
+    totalTimeoutMs,
   );
   // Do not combine streamText's total/chunk timeout signals here. In AI SDK
   // 7.0.22 that composition retains completed StreamTextResult graphs. Relay
   // owns the timers and explicitly settles its controller after consumption.
-  const result = streamText({
-    model,
-    ...params,
-    maxRetries: upstreamMaxRetries(),
-    abortSignal,
-    onError: () => {},
-    onStepFinish: step => reportUnsupportedServiceTier(params, step.warnings),
-  } as Parameters<typeof streamText>[0]);
-
-  const watchedStream = (async function* () {
-    try {
-      for await (const part of result.stream as AsyncIterable<FullStreamPart>) {
-        clearTimeout(idleTimer);
-        idleTimer = setTimeout(
-          () => idleAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`)),
-          idleTimeoutMs,
-        );
-        yield part;
-      }
-    } finally {
-      clearTimeout(idleTimer);
-    }
-  })();
-
   try {
+    const result = streamText({
+      model: attempts.model,
+      ...params,
+      maxRetries,
+      abortSignal,
+      onError: () => {},
+      onStepFinish: step => reportUnsupportedServiceTier(params, step.warnings),
+    } as Parameters<typeof streamText>[0]);
+
+    const watchedStream = (async function* () {
+      try {
+        for await (const part of result.stream as AsyncIterable<FullStreamPart>) {
+          clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => idleAbort.abort(idleError()), idleTimeoutMs);
+          yield part;
+        }
+      } finally {
+        clearTimeout(idleTimer);
+      }
+    })();
+
     await writeAnthropicStream(watchedStream, modelId, write, log, { ...observer, abortSignal }, params.tools);
   } finally {
     stopForwardingAbort();
@@ -1135,6 +1316,10 @@ export async function generateAnthropicResponse(
   let finishReason: string;
   let usage: SdkUsage | undefined;
   let warnings: unknown;
+  const { idleTimeoutMs, totalTimeoutMs, maxRetries } = upstreamRequestBudget({
+    idleTimeoutMs: options?.forceStream ? options.idleTimeoutMs : undefined,
+  });
+  const attempts = trackUpstreamAttempts(model);
 
   if (options?.forceStream) {
     // Some upstreams (e.g. ChatGPT's Codex backend) reject non-streaming requests
@@ -1143,36 +1328,34 @@ export async function generateAnthropicResponse(
     const forceAbort = new AbortController();
     const stopForwardingAbort = forwardAbortSignal(options.abortSignal, forceAbort);
     const abortSignal = forceAbort.signal;
-    const idleTimeoutMs = options.idleTimeoutMs ?? SDK_STREAM_IDLE_TIMEOUT_MS;
-    let idleTimer = setTimeout(
-      () => forceAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`)),
-      idleTimeoutMs,
+    const idleError = () => attempts.deadlineError(
+      new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`),
     );
+    let idleTimer = setTimeout(() => forceAbort.abort(idleError()), idleTimeoutMs);
     const totalTimer = setTimeout(
-      () => forceAbort.abort(new Error(`provider stream exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`)),
-      SDK_TOTAL_TIMEOUT_MS,
+      () => forceAbort.abort(attempts.deadlineError(
+        new Error(`provider stream exceeded ${Math.round(totalTimeoutMs / 1000)}s`),
+      )),
+      totalTimeoutMs,
     );
     // See the streaming path above: Relay owns these timers and explicitly
     // settles its controller when the stream has been fully reduced.
-    const r = streamText({
-      model,
-      ...params,
-      maxRetries: upstreamMaxRetries(),
-      abortSignal,
-      onError: () => {},
-      onStepFinish: step => reportUnsupportedServiceTier(params, step.warnings),
-    } as Parameters<typeof streamText>[0]);
     const streamedText: string[] = [];
     const streamedToolCalls: Array<{ toolCallId: string; toolName: string; input: unknown }> = [];
     let streamedFinishReason = 'stop';
     let streamedUsage: SdkUsage | undefined;
     try {
+      const r = streamText({
+        model: attempts.model,
+        ...params,
+        maxRetries,
+        abortSignal,
+        onError: () => {},
+        onStepFinish: step => reportUnsupportedServiceTier(params, step.warnings),
+      } as Parameters<typeof streamText>[0]);
       for await (const part of r.stream as AsyncIterable<FullStreamPart>) {
         clearTimeout(idleTimer);
-        idleTimer = setTimeout(
-          () => forceAbort.abort(new Error(`no data received from provider for ${Math.round(idleTimeoutMs / 1000)}s`)),
-          idleTimeoutMs,
-        );
+        idleTimer = setTimeout(() => forceAbort.abort(idleError()), idleTimeoutMs);
         options.onPart?.(part.type);
         if (abortSignal.aborted || part.type === 'abort') {
           throw streamAbortError(abortSignal);
@@ -1208,20 +1391,27 @@ export async function generateAnthropicResponse(
     finishReason = streamedFinishReason;
     usage = streamedUsage;
   } else {
+    // generateText exposes no intermediate events that could reset an idle
+    // timer, so only the total provider-call deadline applies on this path.
     const generateAbort = new AbortController();
     const stopForwardingAbort = forwardAbortSignal(options?.abortSignal, generateAbort);
     const totalTimer = setTimeout(
-      () => generateAbort.abort(new Error(`provider request exceeded ${Math.round(SDK_TOTAL_TIMEOUT_MS / 1000)}s`)),
-      SDK_TOTAL_TIMEOUT_MS,
+      () => generateAbort.abort(attempts.deadlineError(
+        new Error(`provider request exceeded ${Math.round(totalTimeoutMs / 1000)}s`),
+      )),
+      totalTimeoutMs,
     );
     try {
       const r = await generateText({
-        model,
+        model: attempts.model,
         ...params,
-        maxRetries: upstreamMaxRetries(),
+        maxRetries,
         abortSignal: generateAbort.signal,
       } as Parameters<typeof generateText>[0]);
       ({ text, toolCalls, finishReason, usage, warnings } = r);
+    } catch (error) {
+      if (generateAbort.signal.aborted) throw streamAbortError(generateAbort.signal);
+      throw error;
     } finally {
       stopForwardingAbort();
       clearTimeout(totalTimer);
@@ -1233,7 +1423,7 @@ export async function generateAnthropicResponse(
   reportPromptTokens({ onPromptTokens: options?.onPromptTokens }, usage);
   const requiredProps = toolRequiredProps(params.tools);
   return {
-    id: 'msg_' + Date.now(), type: 'message', role: 'assistant', model: modelId,
+    id: translatedMessageId(), type: 'message', role: 'assistant', model: modelId,
     content: [
       ...(text ? [{ type: 'text', text }] : []),
       ...toolCalls.map(tc => ({

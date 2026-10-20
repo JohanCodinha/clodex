@@ -648,7 +648,7 @@ describe('copilot effort and fast mode from the catalog', () => {
     // A level the model does not offer is not sent rather than guessed.
     expect(effortProviderOptions('@ai-sdk/openai', 'max', 'grok-4.6', metadata)).toBeUndefined();
     // Without a catalog ladder the OpenAI rules are untouched.
-    expect(effortProviderOptions('@ai-sdk/openai', 'high', 'gpt-5.6-sol', { providerId: 'github-copilot' })).toEqual({ openai: { reasoningEffort: 'high' } });
+    expect(effortProviderOptions('@ai-sdk/openai', 'high', 'gpt-5.6-sol', { providerId: 'github-copilot' })).toEqual({ openai: { reasoningEffort: 'high', forceReasoning: true } });
     expect(effortProviderOptions('@ai-sdk/openai', 'high', 'grok-4.6', { providerId: 'github-copilot' })).toBeUndefined();
   });
 

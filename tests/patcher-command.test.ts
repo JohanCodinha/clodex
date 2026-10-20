@@ -20,11 +20,38 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
-import { runLaunchPatchCheck, runPatchCommand, readPatchManifest } from '../src/patcher.js';
+import { basename, dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  getPatchManifestPath,
+  runLaunchPatchCheck,
+  runPatchCommand,
+  readPatchManifest,
+  resolveClaudeBinaryForPatch,
+} from '../src/patcher.js';
+import { installProvenancePath, readInstallProvenance } from '../src/patch-backup.js';
+import { LEGACY_LAUNCHERS, NATIVE_LAUNCHERS } from './helpers/npm-launchers.js';
+
+const NATIVE_PLACEHOLDER_BYTES = readFileSync(fileURLToPath(
+  new URL('./fixtures/claude-native-placeholder-2.1.266.exe', import.meta.url),
+));
+
+const NATIVE_PACKAGE_NAMES = [
+  '@anthropic-ai/claude-code-darwin-arm64',
+  '@anthropic-ai/claude-code-darwin-x64',
+  '@anthropic-ai/claude-code-linux-x64',
+  '@anthropic-ai/claude-code-linux-arm64',
+  '@anthropic-ai/claude-code-linux-x64-musl',
+  '@anthropic-ai/claude-code-linux-arm64-musl',
+  '@anthropic-ai/claude-code-linux-arm64-android',
+  '@anthropic-ai/claude-code-linux-x64-android',
+  '@anthropic-ai/claude-code-win32-x64',
+  '@anthropic-ai/claude-code-win32-arm64',
+] as const;
 
 const hoisted = vi.hoisted(() => ({
   sentinel: '\n#__CLAUDE_BUNDLE__\n',
@@ -73,6 +100,12 @@ let clodexHome: string;
 let tweakccDir: string;
 let logs: string[];
 
+function writeNativePlaceholder(path: string): void {
+  mkdirSync(join(path, '..'), { recursive: true });
+  writeFileSync(path, NATIVE_PLACEHOLDER_BYTES, { mode: 0o755 });
+  chmodSync(path, 0o755);
+}
+
 function writeFakeClaude(path: string, version: string, bundle = PRISTINE_BUNDLE): void {
   mkdirSync(join(path, '..'), { recursive: true });
   writeFileSync(
@@ -93,6 +126,9 @@ const versionOf = (path: string) =>
 const sha256Of = (path: string) => createHash('sha256').update(readFileSync(path)).digest('hex');
 const sha256OfBuffer = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
 const backupFiles = () => (existsSync(tweakccDir) ? readdirSync(tweakccDir).sort() : []);
+/** What the backup's own provenance record says about one install, if anything. */
+const provenanceFor = (backup: string, install: string) =>
+  readInstallProvenance(installProvenancePath(backup, install));
 
 /** Install path a native claude uses: versioned file + stable ~/.local/bin symlink. */
 function installClaude(version: string, bundle = PRISTINE_BUNDLE): string {
@@ -103,6 +139,16 @@ function installClaude(version: string, bundle = PRISTINE_BUNDLE): string {
   if (existsSync(link)) rmSync(link);
   symlinkSync(real, link);
   // The patcher records the resolved path; on macOS /var is itself a symlink.
+  return realpathSync(real);
+}
+
+/**
+ * A SECOND same-version install with different bytes — the npm platform package
+ * beside a native install, which is the shape issue #199 turns destructive.
+ */
+function installOtherClaude(version: string, bundle = `${PRISTINE_BUNDLE}\n// npm platform build\n`): string {
+  const real = join(home, 'npm', 'lib', 'node_modules', '@anthropic-ai', 'claude-code', 'cli');
+  writeFakeClaude(real, version, bundle);
   return realpathSync(real);
 }
 
@@ -140,6 +186,61 @@ afterEach(() => {
   delete process.env.CLODEX_CLAUDE_PATH;
   delete process.env.TWEAKCC_CC_INSTALLATION_PATH;
   rmSync(home, { recursive: true, force: true });
+});
+
+describe('runPatchCommand patch-target overrides', () => {
+  // Issue #217. CLODEX_CLAUDE_PATH is documented as overriding binary discovery and
+  // does so for LAUNCH, but the patch target is TWEAKCC_CC_INSTALLATION_PATH — on
+  // purpose, because a CLODEX_CLAUDE_PATH aimed at a wrapper shim would have the
+  // patcher rewrite the wrapper. Undocumented, it reads as the override silently
+  // patching a different Claude Code than the one named, so say it out loud.
+  it('says so when CLODEX_CLAUDE_PATH is set but does not choose the patch target', async () => {
+    const real = installClaude('2.1.220');
+    const shim = join(home, 'shim', 'claude');
+    writeFakeClaude(shim, '2.1.215');
+    process.env.CLODEX_CLAUDE_PATH = shim;
+
+    expect(await runPatchCommand({})).toBe(0);
+
+    expect(readPatchManifest()?.binaryPath).toBe(real);
+    const output = logs.join('\n');
+    expect(output).toMatch(/CLODEX_CLAUDE_PATH is set to/);
+    expect(output).toContain(shim);
+    expect(output).toMatch(/set TWEAKCC_CC_INSTALLATION_PATH to patch a specific install/);
+  });
+
+  it('stays quiet when CLODEX_CLAUDE_PATH names the install being patched', async () => {
+    const real = installClaude('2.1.220');
+    // Through a SYMLINK, which is how a native install is normally named
+    // (`~/.local/bin/claude` is one). Comparing the raw value instead of the
+    // resolved program would warn here, on the common case, about nothing.
+    const link = join(home, 'link-to-claude');
+    symlinkSync(real, link);
+    process.env.CLODEX_CLAUDE_PATH = link;
+
+    expect(await runPatchCommand({})).toBe(0);
+
+    expect(readPatchManifest()?.binaryPath).toBe(real);
+    expect(logs.join('\n')).not.toMatch(/does not choose what gets patched/);
+  });
+
+  // A stale explicit target used to report that no Claude Code was found, while one
+  // was installed — and must never fall back to a different install, which is how
+  // #199's restore published one install's pristine bytes over another's.
+  it('refuses a TWEAKCC_CC_INSTALLATION_PATH that is gone instead of finding another install', async () => {
+    const real = installClaude('2.1.220');
+    const pristineBytes = readFileSync(real);
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = join(home, 'gone', 'claude');
+
+    expect(await runPatchCommand({})).toBe(1);
+    expect(await runPatchCommand({ restore: true })).toBe(1);
+
+    expect(readFileSync(real)).toEqual(pristineBytes);
+    expect(readPatchManifest()).toBeNull();
+    const output = logs.join('\n');
+    expect(output).toMatch(/TWEAKCC_CC_INSTALLATION_PATH is set to/);
+    expect(output).toMatch(/will not look for another Claude Code instead/);
+  });
 });
 
 describe('runPatchCommand version resolution', () => {
@@ -231,6 +332,440 @@ describe('runPatchCommand version resolution', () => {
 
     expect(stderr.mock.calls.join('\n')).toMatch(/Could not determine the version/);
     expect(readPatchManifest()).toBeNull();
+  });
+
+  it('reports an incomplete npm install for a directly selected placeholder before any write', async () => {
+    const program = join(home, 'npm-direct', 'bin', 'claude.exe');
+    writeNativePlaceholder(program);
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = program;
+    const before = readFileSync(program);
+    const inode = statSync(program).ino;
+
+    expect(await runPatchCommand({})).toBe(1);
+
+    const output = logs.join('\n');
+    expect(output).toMatch(/npm install is incomplete/);
+    expect(output).toMatch(/could not determine whether the platform-native package is installed/);
+    expect(output).toContain('node node_modules/@anthropic-ai/claude-code/install.cjs');
+    expect(output).toContain('reinstall Claude Code without `--ignore-scripts` / `--omit=optional`');
+    expect(output).toContain('Then run `clodex patch` again');
+    expect(output).toContain('set TWEAKCC_CC_INSTALLATION_PATH');
+    expect(output).not.toMatch(/Could not determine the version/);
+    expect(readFileSync(program)).toEqual(before);
+    expect(statSync(program).ino).toBe(inode);
+    expect(backupFiles()).toEqual([]);
+    expect(readPatchManifest()).toBeNull();
+    expect(readdirSync(dirname(program))).toEqual(['claude.exe']);
+    expect(hoisted.readContentCalls).toEqual([]);
+  });
+
+  it('detects an executable placeholder before running its version command', async () => {
+    const program = join(home, 'ordering', 'bin', 'claude.exe');
+    const probeMarker = join(home, 'version-probe-ran');
+    mkdirSync(dirname(program), { recursive: true });
+    writeFileSync(
+      program,
+      `#!/bin/sh\nprintf probed > ${JSON.stringify(probeMarker)}\n${NATIVE_PLACEHOLDER_BYTES.toString('utf8')}`,
+      { mode: 0o755 },
+    );
+    chmodSync(program, 0o755);
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = program;
+
+    expect(await runPatchCommand({})).toBe(1);
+
+    expect(logs.join('\n')).toMatch(/npm install is incomplete/);
+    expect(existsSync(probeMarker)).toBe(false);
+    expect(readPatchManifest()).toBeNull();
+    expect(backupFiles()).toEqual([]);
+  });
+});
+
+describe('runPatchCommand npm launcher resolution', () => {
+  /**
+   * The reporter's Windows layout (issue #193): `npm install -g` puts the three
+   * launchers it writes on PATH and the program itself under `node_modules`.
+   * `where.exe claude` returns the launchers; none of them is Claude Code.
+   */
+  function installNpmClaude(
+    version: string,
+    bundle = PRISTINE_BUNDLE,
+    nativePackage?: 'present' | 'missing',
+  ): {
+    binDir: string;
+    program: string;
+    installScript: string | null;
+    launchers: { sh: string; cmd: string; ps1: string };
+  } {
+    const binDir = join(home, 'nodejs');
+    const packageRoot = join(binDir, 'node_modules', '@anthropic-ai', 'claude-code');
+    const program = join(packageRoot, 'bin', 'claude.exe');
+    writeFakeClaude(program, version, bundle);
+
+    let installScript: string | null = null;
+    if (nativePackage !== undefined) {
+      installScript = join(packageRoot, 'install.cjs');
+      writeFileSync(join(packageRoot, 'package.json'), JSON.stringify({
+        name: '@anthropic-ai/claude-code',
+        version,
+        optionalDependencies: Object.fromEntries(
+          NATIVE_PACKAGE_NAMES.map(name => [name, version]),
+        ),
+      }));
+      writeFileSync(installScript, '// fixture for package resolution\n');
+      if (nativePackage === 'present') {
+        for (const name of NATIVE_PACKAGE_NAMES) {
+          const nativeRoot = join(binDir, 'node_modules', ...name.split('/'));
+          mkdirSync(nativeRoot, { recursive: true });
+          writeFileSync(join(nativeRoot, 'package.json'), JSON.stringify({ name, version }));
+        }
+      }
+    }
+
+    const launchers = {
+      sh: join(binDir, 'claude'),
+      cmd: join(binDir, 'claude.cmd'),
+      ps1: join(binDir, 'claude.ps1'),
+    };
+    writeFileSync(launchers.sh, NATIVE_LAUNCHERS.sh, { mode: 0o755 });
+    writeFileSync(launchers.cmd, NATIVE_LAUNCHERS.cmd, { mode: 0o755 });
+    writeFileSync(launchers.ps1, NATIVE_LAUNCHERS.ps1, { mode: 0o755 });
+    return {
+      binDir,
+      program: realpathSync(program),
+      installScript: installScript === null ? null : realpathSync(installScript),
+      launchers,
+    };
+  }
+
+  const candidateDirsIn = (directory: string) =>
+    readdirSync(directory).filter(name => name.startsWith('.clodex-patch-'));
+
+  const launcherNames = ['cmd', 'ps1', 'sh'] as const;
+
+  it.each(launcherNames)(
+    'patches the program a %s launcher starts and leaves every launcher byte-identical',
+    async kind => {
+      const { binDir, program, launchers } = installNpmClaude('2.1.266');
+      const pristineBytes = readFileSync(program);
+      const launcherBytes = {
+        sh: readFileSync(launchers.sh),
+        cmd: readFileSync(launchers.cmd),
+        ps1: readFileSync(launchers.ps1),
+      };
+      process.env.CLODEX_CLAUDE_PATH = launchers[kind];
+
+      expect(await runPatchCommand({})).toBe(0);
+
+      // The program was patched...
+      expect(bundleOf(program)).toContain('"sol"');
+      // ...and the launchers were not touched at all.
+      expect(readFileSync(launchers.sh)).toEqual(launcherBytes.sh);
+      expect(readFileSync(launchers.cmd)).toEqual(launcherBytes.cmd);
+      expect(readFileSync(launchers.ps1)).toEqual(launcherBytes.ps1);
+      // The candidate is created beside the PROGRAM, not beside the launcher, so
+      // that is where a leak would show up.
+      expect(candidateDirsIn(dirname(program))).toEqual([]);
+      expect(candidateDirsIn(binDir)).toEqual([]);
+
+      // Backup and manifest key off the PROGRAM, which is what makes --restore
+      // able to find them again.
+      const manifest = readPatchManifest();
+      expect(manifest?.binaryPath).toBe(program);
+      expect(manifest?.claudeVersion).toBe('2.1.266');
+      expect(manifest?.backupPath).toMatch(/claude-2\.1\.266-[0-9a-f]{16}\.orig$/);
+      expect(readFileSync(manifest!.backupPath)).toEqual(pristineBytes);
+      expect(manifest?.pristineSha256).toBe(sha256OfBuffer(pristineBytes));
+    },
+  );
+
+  it('reports an incomplete npm install after following a launcher, before any write', async () => {
+    const { binDir, program, installScript, launchers } = installNpmClaude(
+      '2.1.266',
+      PRISTINE_BUNDLE,
+      'present',
+    );
+    writeNativePlaceholder(program);
+    process.env.CLODEX_CLAUDE_PATH = launchers.cmd;
+    const programBefore = readFileSync(program);
+    const programInode = statSync(program).ino;
+    const launcherBefore = readFileSync(launchers.cmd);
+
+    expect(await runPatchCommand({})).toBe(1);
+
+    const output = logs.join('\n');
+    expect(output).toMatch(/npm install is incomplete/);
+    expect(output).toContain(program);
+    expect(output).toMatch(/platform-native package is installed/);
+    expect(output).toContain(`node "${installScript}"`);
+    expect(output).not.toMatch(/Reinstall Claude Code/);
+    expect(output).not.toMatch(/Could not determine the version/);
+    expect(readFileSync(program)).toEqual(programBefore);
+    expect(statSync(program).ino).toBe(programInode);
+    expect(readFileSync(launchers.cmd)).toEqual(launcherBefore);
+    expect(backupFiles()).toEqual([]);
+    expect(readPatchManifest()).toBeNull();
+    expect(candidateDirsIn(binDir)).toEqual([]);
+    expect(candidateDirsIn(dirname(program))).toEqual([]);
+    expect(hoisted.readContentCalls).toEqual([]);
+  });
+
+  it('reports the incomplete install on --restore without selecting or writing a backup', async () => {
+    const { binDir, program, installScript, launchers } = installNpmClaude(
+      '2.1.266',
+      PRISTINE_BUNDLE,
+      'missing',
+    );
+    writeNativePlaceholder(program);
+    process.env.CLODEX_CLAUDE_PATH = launchers.cmd;
+    const programBefore = readFileSync(program);
+    const programInode = statSync(program).ino;
+    const launcherBefore = readFileSync(launchers.cmd);
+
+    expect(await runPatchCommand({ restore: true })).toBe(1);
+
+    const output = logs.join('\n');
+    expect(output).toMatch(/npm install is incomplete/);
+    expect(output).toMatch(/platform-native optional package is missing/);
+    expect(output).toMatch(/`install\.cjs` cannot repair this state/);
+    expect(output).toMatch(/Reinstall Claude Code without `--ignore-scripts` \/ `--omit=optional`/);
+    expect(output).not.toContain(`node "${installScript}"`);
+    expect(output).toContain('Then run `clodex patch --restore` again');
+    expect(output).toContain(`pristine backups are in ${tweakccDir}`);
+    expect(output).not.toMatch(/no patch manifest records a pristine backup/);
+    expect(output).not.toMatch(/claude --version` failed/);
+    expect(readFileSync(program)).toEqual(programBefore);
+    expect(statSync(program).ino).toBe(programInode);
+    expect(readFileSync(launchers.cmd)).toEqual(launcherBefore);
+    expect(backupFiles()).toEqual([]);
+    expect(readPatchManifest()).toBeNull();
+    expect(candidateDirsIn(binDir)).toEqual([]);
+    expect(candidateDirsIn(dirname(program))).toEqual([]);
+    expect(hoisted.readContentCalls).toEqual([]);
+  });
+
+  it('refuses --restore without consuming an existing manifest or pristine backup', async () => {
+    const { binDir, program, installScript, launchers } = installNpmClaude(
+      '2.1.266',
+      PRISTINE_BUNDLE,
+      'missing',
+    );
+    const launcherBefore = readFileSync(launchers.cmd);
+    process.env.CLODEX_CLAUDE_PATH = launchers.cmd;
+
+    expect(await runPatchCommand({})).toBe(0);
+    const manifestBefore = readPatchManifest();
+    expect(manifestBefore).not.toBeNull();
+    const backupSnapshots = backupFiles().map(name => ({
+      name,
+      bytes: readFileSync(join(tweakccDir, name)),
+    }));
+
+    writeNativePlaceholder(program);
+    const placeholderBefore = readFileSync(program);
+    const programInode = statSync(program).ino;
+    logs.length = 0;
+    hoisted.readContentCalls.length = 0;
+
+    expect(await runPatchCommand({ restore: true })).toBe(1);
+
+    const output = logs.join('\n');
+    expect(output).toMatch(/npm install is incomplete/);
+    expect(output).toMatch(/platform-native optional package is missing/);
+    expect(output).not.toContain(`node "${installScript}"`);
+    expect(output).toContain('Then run `clodex patch --restore` again');
+    expect(output).toContain(`pristine backups are in ${tweakccDir}`);
+    expect(readFileSync(program)).toEqual(placeholderBefore);
+    expect(statSync(program).ino).toBe(programInode);
+    expect(readFileSync(launchers.cmd)).toEqual(launcherBefore);
+    expect(readPatchManifest()).toEqual(manifestBefore);
+    expect(backupFiles()).toEqual(backupSnapshots.map(snapshot => snapshot.name));
+    for (const snapshot of backupSnapshots) {
+      expect(readFileSync(join(tweakccDir, snapshot.name))).toEqual(snapshot.bytes);
+    }
+    expect(candidateDirsIn(binDir)).toEqual([]);
+    expect(candidateDirsIn(dirname(program))).toEqual([]);
+    expect(hoisted.readContentCalls).toEqual([]);
+  });
+
+  it('keeps launch-time patch checks non-fatal for an incomplete npm install', async () => {
+    const { program, installScript, launchers } = installNpmClaude(
+      '2.1.266',
+      PRISTINE_BUNDLE,
+      'present',
+    );
+    writeNativePlaceholder(program);
+    process.env.CLODEX_CLAUDE_PATH = launchers.cmd;
+    const before = readFileSync(program);
+    const inode = statSync(program).ino;
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    const output = stderr.mock.calls.flat().join('\n');
+    expect(output).toMatch(/npm install is incomplete/);
+    expect(output).toMatch(/platform-native package is installed/);
+    expect(output).toContain(`node "${installScript}"`);
+    expect(output).toContain('Then run the command again');
+    expect(readFileSync(program)).toEqual(before);
+    expect(statSync(program).ino).toBe(inode);
+    expect(backupFiles()).toEqual([]);
+    expect(readPatchManifest()).toBeNull();
+    expect(hoisted.readContentCalls).toEqual([]);
+  });
+
+  it('restores the program a launcher starts, not the launcher', async () => {
+    const { program, launchers } = installNpmClaude('2.1.266');
+    const pristineBytes = readFileSync(program);
+    const launcherBytes = readFileSync(launchers.cmd);
+    process.env.CLODEX_CLAUDE_PATH = launchers.cmd;
+
+    expect(await runPatchCommand({})).toBe(0);
+    expect(readFileSync(program)).not.toEqual(pristineBytes);
+
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(readFileSync(program)).toEqual(pristineBytes);
+    expect(readFileSync(launchers.cmd)).toEqual(launcherBytes);
+    expect(readPatchManifest()).toBeNull();
+  });
+
+  it('restores through a stale launcher after the program it named has gone', async () => {
+    // The rescue that failed issue #193's reporter. A patch succeeded, then the
+    // program disappeared (a broken reinstall, a moved node_modules). The
+    // launcher still NAMES it, so the failure carries that path rather than the
+    // launcher's — which is the only thing that lets the manifest recorded
+    // against the program still be recognised.
+    const { program, launchers } = installNpmClaude('2.1.266');
+    const pristineBytes = readFileSync(program);
+    process.env.CLODEX_CLAUDE_PATH = launchers.cmd;
+
+    expect(await runPatchCommand({})).toBe(0);
+    expect(readFileSync(program)).not.toEqual(pristineBytes);
+    rmSync(program);
+
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+
+    expect(existsSync(program)).toBe(true);
+    expect(readFileSync(program)).toEqual(pristineBytes);
+    expect(readPatchManifest()).toBeNull();
+    expect(logs.join('\n')).toMatch(/Restored pristine claude 2\.1\.266/);
+  });
+
+  it('refuses before any write when the launcher names a program that is gone', async () => {
+    const { binDir, program, launchers } = installNpmClaude('2.1.266');
+    rmSync(program);
+    const launcherBytes = readFileSync(launchers.cmd);
+    process.env.CLODEX_CLAUDE_PATH = launchers.cmd;
+
+    expect(await runPatchCommand({})).toBe(1);
+
+    expect(logs.join('\n')).toMatch(/does not exist/);
+    expect(logs.join('\n')).toMatch(/TWEAKCC_CC_INSTALLATION_PATH/);
+    expect(readFileSync(launchers.cmd)).toEqual(launcherBytes);
+    expect(backupFiles()).toEqual([]);
+    expect(readPatchManifest()).toBeNull();
+    expect(candidateDirsIn(binDir)).toEqual([]);
+    expect(candidateDirsIn(dirname(program))).toEqual([]);
+  });
+
+  it('refuses a Windows launcher it cannot read instead of handing it to the patcher', async () => {
+    const { binDir, program, launchers } = installNpmClaude('2.1.266');
+    writeFileSync(launchers.cmd, '@ECHO off\r\nnode "%~dp0\\..\\thing.js" %1\r\n');
+    process.env.CLODEX_CLAUDE_PATH = launchers.cmd;
+
+    expect(await runPatchCommand({})).toBe(1);
+
+    expect(logs.join('\n')).toMatch(/could not read which file it starts/);
+    expect(logs.join('\n')).toMatch(/TWEAKCC_CC_INSTALLATION_PATH/);
+    expect(backupFiles()).toEqual([]);
+    expect(readPatchManifest()).toBeNull();
+    expect(candidateDirsIn(binDir)).toEqual([]);
+    expect(candidateDirsIn(dirname(program))).toEqual([]);
+  });
+
+  it('keeps a launch alive, with one line of advice, when a launcher cannot be followed', async () => {
+    const { program, launchers } = installNpmClaude('2.1.266');
+    rmSync(program);
+    process.env.CLODEX_CLAUDE_PATH = launchers.cmd;
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await expect(runLaunchPatchCheck({})).resolves.toBeUndefined();
+
+    expect(stderr.mock.calls.flat().join('\n')).toMatch(/TWEAKCC_CC_INSTALLATION_PATH/);
+    expect(readPatchManifest()).toBeNull();
+  });
+
+  it('follows a legacy launcher to an npm cli.js and reads its version with node', () => {
+    // Older Claude Code packages declared `bin: cli.js`, so npm generated the
+    // node-plus-script launchers instead. A `cli.js` carries no executable bit
+    // on Windows and need not carry one anywhere, so the version has to be read
+    // by running it with node — from that exact file, never guessed.
+    const binDir = join(home, 'nodejs');
+    const cli = join(binDir, 'node_modules', '@anthropic-ai', 'claude-code', 'cli.js');
+    mkdirSync(dirname(cli), { recursive: true });
+    writeFileSync(
+      cli,
+      'if (process.argv.includes("--version")) console.log("2.1.266 (Claude Code)");\n',
+      { mode: 0o644 },
+    );
+    writeFileSync(join(binDir, 'claude.cmd'), LEGACY_LAUNCHERS.cmd, { mode: 0o755 });
+    process.env.CLODEX_CLAUDE_PATH = join(binDir, 'claude.cmd');
+
+    expect(resolveClaudeBinaryForPatch()).toEqual({
+      ok: true,
+      binaryPath: realpathSync(cli),
+      version: '2.1.266',
+    });
+  });
+
+  it('refuses a launcher that names two different programs, before any write', async () => {
+    // No real cmd-shim output names two DISTINCT programs. A hand-edited one can,
+    // and picking either would patch an install the shell may never start.
+    const { binDir, program, launchers } = installNpmClaude('2.1.266');
+    const programBytes = readFileSync(program);
+    writeFileSync(launchers.cmd, [
+      '@ECHO off',
+      '"%dp0%\\decoy.exe"   %*',
+      '"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe"   %*',
+      '',
+    ].join('\r\n'));
+    process.env.CLODEX_CLAUDE_PATH = launchers.cmd;
+
+    expect(await runPatchCommand({})).toBe(1);
+
+    expect(logs.join('\n')).toMatch(/names more than one program/);
+    expect(logs.join('\n')).toMatch(/TWEAKCC_CC_INSTALLATION_PATH/);
+    expect(readFileSync(program)).toEqual(programBytes);
+    expect(backupFiles()).toEqual([]);
+    expect(readPatchManifest()).toBeNull();
+    expect(candidateDirsIn(binDir)).toEqual([]);
+    expect(candidateDirsIn(dirname(program))).toEqual([]);
+  });
+
+  it('tells the user the launcher could not be read, not that a version probe failed', async () => {
+    // `--restore` refuses before any version probe when the launcher names no
+    // program at all, so reporting a failed `claude --version` would name the
+    // wrong cause and send the user to the wrong remedy.
+    const { launchers } = installNpmClaude('2.1.266');
+    writeFileSync(launchers.cmd, '@ECHO off\r\nnode "%~dp0\\..\\thing.js" %1\r\n');
+    process.env.CLODEX_CLAUDE_PATH = launchers.cmd;
+
+    expect(await runPatchCommand({ restore: true })).toBe(1);
+
+    expect(logs.join('\n')).toMatch(/could not read which file it starts/);
+    expect(logs.join('\n')).toMatch(/TWEAKCC_CC_INSTALLATION_PATH/);
+    expect(logs.join('\n')).not.toMatch(/claude --version` failed/);
+    expect(backupFiles()).toEqual([]);
+  });
+
+  it('patches a wrapper-style claude that is not an npm launcher rather than following it', async () => {
+    // The over-scope negative. A hand-written wrapper (cmux installs one) execs
+    // an absolute path and is NOT a cmd-shim; clodex must patch the file it
+    // found, exactly as it did before launcher resolution existed.
+    const real = installClaude('2.1.220', `${PRISTINE_BUNDLE}\nexec "/opt/real/claude" "$@"`);
+
+    expect(await runPatchCommand({})).toBe(0);
+    expect(bundleOf(real)).toContain('"sol"');
+    expect(readPatchManifest()?.binaryPath).toBe(real);
   });
 });
 
@@ -434,6 +969,95 @@ describe('runPatchCommand local patches', () => {
     expect(logs.join('\n')).toMatch(/FAIL\s+LOCAL PATCH SET.*postconditions/);
   });
 
+  it('injects an alias whose name collides with an unrelated switch elsewhere in the bundle', async () => {
+    // The regression: the presence test read the WHOLE bundle, so an alias
+    // named after any word another switch already branches on read as
+    // natively resolved. zod's schema walker ships `case"union":return ...`,
+    // which is where this was found — one unlucky alias NAME silently lost its
+    // case, and the missing case then cost every local patch, because its
+    // built-in postcondition could not be captured.
+    const bundle = `${PRISTINE_BUNDLE}\nfunction walk(d){switch(d.type){case"union":return d.options.map(walk);default:return d}}`;
+    const real = installClaude('2.1.220', bundle);
+    mkdirSync(clodexHome, { recursive: true });
+    writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({
+      favoriteModels: [{ providerId: 'opencode-go', modelId: 'union-alpha' }],
+      modelAliases: [{ name: 'union', providerId: 'opencode-go', modelId: 'union-alpha' }],
+    }));
+    writeFileSync(join(clodexHome, 'local-patches.mjs'), `
+      export default [{
+        id: 'runs-alongside',
+        apply(source, { marker }) { return source + '\\n' + marker; },
+      }];
+    `);
+
+    expect(await runPatchCommand({ localPatches: true })).toBe(0);
+    // The alias reaches the resolver...
+    expect(bundleOf(real)).toContain('case"union":return "union";');
+    // ...the unrelated switch is untouched...
+    expect(bundleOf(real)).toContain('case"union":return d.options.map(walk);');
+    // ...and the local patch set still runs, which is what the dropped case cost.
+    expect(bundleOf(real)).toContain('/*clodex-local:runs-alongside*/');
+    expect(logs.join('\n')).not.toMatch(/FAIL\s+LOCAL PATCH SET/);
+  });
+
+  it('reads the resolver region from case"best" forward, not the cases before it', async () => {
+    // A competing case for the alias sits BEFORE case"best", where only the
+    // reserved tier names live today. The presence test must not read it: if
+    // the region reached back over it, the alias would read as present, its
+    // case would be skipped, and the missing built-in postcondition would
+    // abandon the local patch set.
+    const bundle = PRISTINE_BUNDLE.replace(
+      'case"best":{return "opus"}',
+      'case"orbit":return "decoy";case"best":{return "opus"}',
+    );
+    const real = installClaude('2.1.220', bundle);
+    mkdirSync(clodexHome, { recursive: true });
+    writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({
+      favoriteModels: [{ providerId: 'opencode-go', modelId: 'orbit-1' }],
+      modelAliases: [{ name: 'orbit', providerId: 'opencode-go', modelId: 'orbit-1' }],
+    }));
+    writeFileSync(join(clodexHome, 'local-patches.mjs'), `
+      export default [{
+        id: 'runs-alongside',
+        apply(source, { marker }) { return source + '\\n' + marker; },
+      }];
+    `);
+
+    expect(await runPatchCommand({ localPatches: true })).toBe(0);
+    expect(bundleOf(real)).toContain('case"orbit":return "orbit";');
+    expect(bundleOf(real)).toContain('/*clodex-local:runs-alongside*/');
+    expect(logs.join('\n')).not.toMatch(/FAIL\s+LOCAL PATCH SET/);
+  });
+
+  it('keeps a re-patch idempotent at the documented alias maximum', async () => {
+    // 20 favorites (MAX_MODEL_CATALOG) with 64-char aliases (the alias
+    // pattern's maximum) inject 2900 bytes into the resolver region. The
+    // built-in verification re-runs the patches over their own output and
+    // demands a no-op; a region bound that our own cases can outgrow reads
+    // every alias as missing on that re-run and duplicates them all.
+    const names = Array.from({ length: 20 }, (_, i) => `a${String(i).padStart(2, '0')}${'x'.repeat(61)}`);
+    const real = installClaude('2.1.220');
+    mkdirSync(clodexHome, { recursive: true });
+    writeFileSync(join(clodexHome, 'config.json'), JSON.stringify({
+      favoriteModels: names.map((_, i) => ({ providerId: 'opencode-go', modelId: `m-${i}` })),
+      modelAliases: names.map((name, i) => ({ name, providerId: 'opencode-go', modelId: `m-${i}` })),
+    }));
+    writeFileSync(join(clodexHome, 'local-patches.mjs'), `
+      export default [{
+        id: 'runs-alongside',
+        apply(source, { marker }) { return source + '\\n' + marker; },
+      }];
+    `);
+
+    expect(await runPatchCommand({ localPatches: true })).toBe(0);
+    const patched = bundleOf(real);
+    for (const name of names) {
+      expect(patched.split(`case"${name}":return "${name}";`).length - 1).toBe(1);
+    }
+    expect(patched).toContain('/*clodex-local:runs-alongside*/');
+    expect(logs.join('\n')).not.toMatch(/FAIL\s+LOCAL PATCH SET/);
+  });
+
   it('allows a local edit adjacent to an intact built-in postcondition', async () => {
     const real = installClaude('2.1.220');
     writeFileSync(join(clodexHome, 'local-patches.mjs'), `
@@ -511,7 +1135,7 @@ describe('runPatchCommand pristine backup safety', () => {
 
     expect(await runPatchCommand({})).toBe(1);
     expect(readFileSync(real)).toEqual(patchedBytes);
-    expect(logs.join('\n')).toMatch(/no trustworthy pristine backup/);
+    expect(logs.join('\n')).toMatch(/failed its integrity check/);
   });
 
   it('never stores an already-patched binary as the pristine backup', async () => {
@@ -523,7 +1147,7 @@ describe('runPatchCommand pristine backup safety', () => {
     const before = readFileSync(real);
 
     expect(await runPatchCommand({})).toBe(1);
-    expect(logs.join('\n')).toMatch(/already patched and no trustworthy pristine backup/);
+    expect(logs.join('\n')).toMatch(/holds no pristine backup of claude 2\.1\.220 it can attribute to/);
     expect(readFileSync(real)).toEqual(before);
     expect(backupFiles()).toEqual([]);
   });
@@ -538,6 +1162,59 @@ describe('runPatchCommand pristine backup safety', () => {
     expect(await runPatchCommand({})).toBe(1);
     expect(logs.join('\n')).toMatch(/Refusing to use .*it reports version 2\.1\.215/);
     expect(readFileSync(real)).toEqual(before);
+  });
+
+  it('records which install a backup belongs to, and records a guess only AS a guess', async () => {
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const backup = readPatchManifest()!.backupPath;
+    expect(provenanceFor(backup, real)).toEqual({ install: real, assumed: false });
+
+    // Take the machine back to what an older clodex left behind: a backup with no
+    // record beside it and no manifest. The patch below has to fall back to the
+    // version tag — and must not write that guess down as established provenance,
+    // which is what would make every later restore trust it on sight (issue #204).
+    rmSync(installProvenancePath(backup, real));
+    rmSync(getPatchManifestPath());
+
+    expect(await runPatchCommand({})).toBe(0);
+    expect(logs.join('\n')).toMatch(/version tag alone/);
+    expect(provenanceFor(backup, real)).toEqual({ install: real, assumed: true });
+
+    // And the guess stays a guess: this re-patch reads a manifest the guessing run
+    // wrote, which is not independent evidence of anything.
+    rmSync(join(clodexHome, 'config.json'));
+    saveFavorites();
+    expect(await runPatchCommand({})).toBe(0);
+    expect(provenanceFor(backup, real)).toEqual({ install: real, assumed: true });
+  });
+
+  it('publishes no pristine backup it cannot record the owner of', async () => {
+    // The invariant the write order exists for: a published `.orig` with no record
+    // beside it is an unattributed same-version file, and the next restore of a
+    // DIFFERENT install matches it on its version tag. So the record is written
+    // first — if it cannot be written, nothing is published. Fault injected by
+    // parking a directory at the record's name.
+    const real = installClaude('2.1.220');
+    const expectedBackup = join(tweakccDir, `claude-2.1.220-${sha256Of(real).slice(0, 16)}.orig`);
+    mkdirSync(installProvenancePath(expectedBackup, real), { recursive: true });
+
+    expect(await runPatchCommand({})).toBe(1);
+    expect(backupFiles().filter(name => name.endsWith('.orig'))).toEqual([]);
+  });
+
+  it('keeps the record beside a backup it has already published', async () => {
+    // A patch that fails AFTER publishing the pristine backup must not leave that
+    // backup unattributed: the next restore of a different same-version install
+    // would then match it on its version tag. Fault injected by making the tweakcc
+    // mirror path a directory, so publishing the mirror fails after the `.orig`.
+    const real = installClaude('2.1.220');
+    mkdirSync(join(tweakccDir, 'native-binary.backup'), { recursive: true });
+
+    expect(await runPatchCommand({})).toBe(1);
+    const published = backupFiles().filter(name => name.endsWith('.orig'));
+    expect(published).toHaveLength(1);
+    expect(provenanceFor(join(tweakccDir, published[0]!), real)).toEqual({ install: real, assumed: false });
   });
 });
 
@@ -558,6 +1235,30 @@ describe('runPatchCommand legacy backup compatibility', () => {
     expect(manifest.backupPath).toMatch(/claude-2\.1\.220-[0-9a-f]{16}\.orig$/);
     expect(readFileSync(manifest.backupPath)).toEqual(pristineBytes);
     expect(bundleOf(real)).toContain('"sol"');
+
+    // BOTH names are attributed. The legacy file is deliberately left on disk for
+    // `tweakcc --restore` and older clodex, so an unattributed one would be the one
+    // file a later restore could still match on its version tag alone.
+    expect(provenanceFor(manifest.backupPath, real)).toEqual({ install: real, assumed: false });
+    expect(provenanceFor(legacy, real)).toEqual({ install: real, assumed: false });
+  });
+
+  it('records both names before publishing the adopted backup', async () => {
+    // Same rule as the fresh snapshot: whichever file exists must already say whose
+    // bytes it holds. Fault injected after the canonical publish would be the wrong
+    // test — this asserts the ordering by failing the mirror, which runs after it.
+    const real = installClaude('2.1.220');
+    const pristineBytes = readFileSync(real);
+    mkdirSync(tweakccDir, { recursive: true });
+    const legacy = join(tweakccDir, 'claude-2.1.220.orig');
+    writeFileSync(legacy, pristineBytes, { mode: 0o755 });
+    mkdirSync(join(tweakccDir, 'native-binary.backup'), { recursive: true });
+
+    expect(await runPatchCommand({})).toBe(1);
+    const canonical = backupFiles().find(name => /^claude-2\.1\.220-[0-9a-f]{16}\.orig$/.test(name));
+    expect(canonical).toBeDefined();
+    expect(provenanceFor(join(tweakccDir, canonical!), real)).toEqual({ install: real, assumed: false });
+    expect(provenanceFor(legacy, real)).toEqual({ install: real, assumed: false });
   });
 
   it('extracts the bundle exactly once when bootstrapping a pristine install', async () => {
@@ -617,6 +1318,35 @@ describe('runPatchCommand legacy backup compatibility', () => {
 });
 
 describe('runPatchCommand --restore', () => {
+  // Issue #216. Rewriting the binary IN PLACE leaves it on the same inode, and
+  // macOS caches a code signature per vnode once a binary has run — an in-place
+  // overwrite was reported to leave every later launch killed with `Code Signature
+  // Invalid` until the file was replaced through a new inode. The patch path has
+  // always published by rename; this asserts the restore path does too.
+  it('publishes the restored binary as a new inode, not over the old one', async () => {
+    const real = installClaude('2.1.220');
+    const pristineBytes = readFileSync(real);
+    const pristineMode = statSync(real).mode;
+    expect(await runPatchCommand({})).toBe(0);
+    const patchedInode = statSync(real).ino;
+
+    // Take the executable bit off the BACKUP file. Publishing by rename hands the
+    // destination whatever mode the temp copy carries, so without an explicit
+    // chmod this is how a restore produces a claude that cannot be executed —
+    // a worse outcome than the code-signature fault being fixed.
+    const backupPath = readPatchManifest()?.backupPath;
+    expect(backupPath).toBeTruthy();
+    chmodSync(backupPath!, 0o600);
+
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+
+    expect(readFileSync(real)).toEqual(pristineBytes);
+    expect(statSync(real).ino).not.toBe(patchedInode);
+    expect(statSync(real).mode).toBe(pristineMode);
+    // No temp file is left beside it for the backup scanner to trip over.
+    expect(readdirSync(dirname(real)).filter(name => name.includes('.tmp-'))).toEqual([]);
+  });
+
   it('restores the pristine binary and drops the manifest', async () => {
     const real = installClaude('2.1.220');
     const pristineBytes = readFileSync(real);
@@ -628,13 +1358,525 @@ describe('runPatchCommand --restore', () => {
     expect(readPatchManifest()).toBeNull();
   });
 
+  // The rescue path the rename introduces. Creating the temp file needs write
+  // permission on the DIRECTORY; overwriting the existing binary needs it only on
+  // the FILE — so a read-only directory fails the rename publish while leaving the
+  // in-place write available, which is the shape Windows hits when another process
+  // holds the binary open. A restore is a rescue command, so it must still finish.
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'falls back to writing in place when it cannot publish a new file',
+    async () => {
+      const real = installClaude('2.1.220');
+      const pristineBytes = readFileSync(real);
+      expect(await runPatchCommand({})).toBe(0);
+      expect(readFileSync(real)).not.toEqual(pristineBytes);
+
+      const dir = dirname(real);
+      const dirMode = statSync(dir).mode;
+      chmodSync(dir, 0o555);
+      try {
+        expect(await runPatchCommand({ restore: true })).toBe(0);
+      } finally {
+        chmodSync(dir, dirMode);
+      }
+
+      expect(readFileSync(real)).toEqual(pristineBytes);
+      expect(readPatchManifest()).toBeNull();
+      expect(logs.join('\n')).toMatch(/writing the pristine bytes in place instead/);
+    },
+  );
+
+  // Issue #199. Two supported installs of ONE Claude Code version are different
+  // files (npm platform package vs native installer), so "same version tag" was
+  // never proof that a backup belongs to the install being restored.
+  it('records what a manifest for another version proved before a restore clears it', async () => {
+    // A manifest naming this same path at a DIFFERENT claude version is about an older
+    // install whose backup is still on disk. Restoring the current version clears that
+    // manifest — it matches on path — so its attribution has to be migrated first.
+    // Reachable by restoring an older `~/.clodex` from a machine backup, which is also
+    // why the manifest is read as untrusted elsewhere in this module.
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+
+    // Stage the older version's backup and the manifest that is its only attribution.
+    const oldBackup = join(tweakccDir, 'claude-2.1.215-0123456789abcdef.orig');
+    writeFileSync(oldBackup, 'pristine 2.1.215 bytes');
+    writeFileSync(getPatchManifestPath(), JSON.stringify({
+      ...readPatchManifest()!,
+      claudeVersion: '2.1.215',
+      backupPath: oldBackup,
+    }));
+
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(provenanceFor(oldBackup, real)).toEqual({ install: real, assumed: false });
+  });
+
+  it('records what an outgoing manifest proved before a patch replaces it', async () => {
+    // The manifest holds ONE install, and patching a second one overwrites it. For an
+    // upgrading user that manifest is the only thing attributing the first install's
+    // backup, so replacing it without migrating strips that install's rescue record.
+    const first = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const firstBackup = readPatchManifest()!.backupPath;
+    const firstPristine = readFileSync(firstBackup);
+    rmSync(installProvenancePath(firstBackup, first));
+
+    const other = installOtherClaude('2.1.220');
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = other;
+    expect(await runPatchCommand({})).toBe(0);
+    expect(readPatchManifest()?.binaryPath).toBe(other);
+    expect(provenanceFor(firstBackup, first)).toEqual({ install: first, assumed: false });
+
+    // Which is what keeps the first install rescuable now that its manifest is gone.
+    delete process.env.TWEAKCC_CC_INSTALLATION_PATH;
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(readFileSync(first)).toEqual(firstPristine);
+    expect(logs.join('\n')).not.toMatch(/version tag alone/);
+  });
+
+  it('refuses to restore another install\'s backup over a same-version install', async () => {
+    const patched = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    expect(readPatchManifest()?.binaryPath).toBe(patched);
+
+    // A second, pristine 2.1.220 install becomes the target — a stale
+    // CLODEX_CLAUDE_PATH, a PATH change, or a corrected launcher all do this.
+    const other = installOtherClaude('2.1.220');
+    const otherBytes = readFileSync(other);
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = other;
+
+    expect(await runPatchCommand({ restore: true })).toBe(1);
+
+    // The install it had no backup for is untouched, and the manifest that can
+    // still rescue the FIRST install survives.
+    expect(readFileSync(other)).toEqual(otherBytes);
+    expect(readPatchManifest()?.binaryPath).toBe(patched);
+    expect(logs.join('\n')).toMatch(/records a different Claude Code install/);
+
+    // And the rescue the manifest exists for still works.
+    delete process.env.TWEAKCC_CC_INSTALLATION_PATH;
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(readPatchManifest()).toBeNull();
+  });
+
+  // Issue #204. The manifest holds ONE install, so it could never rule a backup in
+  // by elimination and this used to refuse. Each backup now records the install it
+  // was made for, which decides it positively — and the manifest for the install
+  // that was NOT restored has to survive, or restoring one install would destroy
+  // the other's only rescue record.
+  it('restores each of two same-version installs from its own recorded backup', async () => {
+    const other = installOtherClaude('2.1.220');
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = other;
+    expect(await runPatchCommand({})).toBe(0);
+    const otherPristine = readFileSync(readPatchManifest()!.backupPath);
+
+    delete process.env.TWEAKCC_CC_INSTALLATION_PATH;
+    const native = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    expect(readPatchManifest()?.binaryPath).toBe(native);
+    expect(backupFiles().filter(name => name.endsWith('.orig'))).toHaveLength(2);
+
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = other;
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(readFileSync(other)).toEqual(otherPristine);
+    expect(readPatchManifest()?.binaryPath).toBe(native);
+    // Nothing was guessed: the backup itself records which install it belongs to.
+    expect(logs.join('\n')).not.toMatch(/version tag alone/);
+
+    // And the OTHER one still restores from its own bytes afterwards — the point is
+    // that both work, not that the refusal moved to the other install.
+    const nativePristine = readFileSync(readPatchManifest()!.backupPath);
+    delete process.env.TWEAKCC_CC_INSTALLATION_PATH;
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(readFileSync(native)).toEqual(nativePristine);
+    expect(readPatchManifest()).toBeNull();
+    expect(backupFiles().filter(name => name.endsWith('.orig'))).toHaveLength(2);
+  });
+
+  // Issue #204, the sequence that needed no lost files: a successful restore
+  // DELETES the manifest, so the backup outlives the only record of what it was
+  // made for. Version tags then matched, and the second install was overwritten.
+  it('refuses a backup whose install is gone once the manifest no longer exists', async () => {
+    const first = installClaude('2.1.220');
+    const firstPristine = readFileSync(first);
+    expect(await runPatchCommand({})).toBe(0);
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(readPatchManifest()).toBeNull();
+    expect(readFileSync(first)).toEqual(firstPristine);
+
+    // A PATH change, an uninstall, or a corrected launcher now reaches a
+    // DIFFERENT install of the same version.
+    const other = installOtherClaude('2.1.220');
+    const otherBytes = readFileSync(other);
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = other;
+
+    expect(await runPatchCommand({ restore: true })).toBe(1);
+    expect(readFileSync(other)).toEqual(otherBytes);
+    expect(logs.join('\n')).toMatch(/recorded as the pristine content of/);
+  });
+
+  it('refuses to re-seed an install from another install\'s backup when its own is gone', async () => {
+    // Issue #204's laundering sequence. Patching here used to replace this
+    // install's bytes with the other install's pristine bytes AND write a manifest
+    // recording them as this install's pristine content — after which every later
+    // restore published them "correctly", with no warning left anywhere.
+    const other = installOtherClaude('2.1.220');
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = other;
+    expect(await runPatchCommand({})).toBe(0);
+    const otherBackup = readPatchManifest()!.backupPath;
+    const otherPatched = readFileSync(other);
+
+    delete process.env.TWEAKCC_CC_INSTALLATION_PATH;
+    installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(readPatchManifest()).toBeNull();
+
+    // clodex's own conflict message tells the user to remove a backup, so this
+    // state is reachable without inventing anything.
+    rmSync(otherBackup);
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = other;
+    expect(await runPatchCommand({})).toBe(1);
+    expect(readFileSync(other)).toEqual(otherPatched);
+    expect(readPatchManifest()).toBeNull();
+    expect(logs.join('\n')).toMatch(/recorded as the pristine content of/);
+  });
+
+  it('still restores a backup written before provenance was recorded', async () => {
+    // Refusing here would strand every backup an earlier clodex wrote, so the
+    // version tag remains enough when there is no record at all — loudly.
+    const real = installClaude('2.1.220');
+    const pristineBytes = readFileSync(real);
+    expect(await runPatchCommand({})).toBe(0);
+    const backup = readPatchManifest()!.backupPath;
+    rmSync(installProvenancePath(backup, real));
+    rmSync(getPatchManifestPath());
+
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(readFileSync(real)).toEqual(pristineBytes);
+    expect(logs.join('\n')).toMatch(/version tag alone/);
+    // The guess is written down AS a guess, so a later run keeps warning about it
+    // instead of treating it as established.
+    expect(provenanceFor(backup, real)).toEqual({ install: real, assumed: true });
+  });
+
+  it('records a second install whose bytes are identical to the first', async () => {
+    // Two installs can legitimately ship the same pristine bytes, and then one
+    // content-addressed backup is correct for both. The second install reaches it by
+    // the `reuse` plan — its live bytes already match a stored backup — and must be
+    // recorded there, or restoring it later is refused as another install's.
+    installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const backup = readPatchManifest()!.backupPath;
+
+    const second = installOtherClaude('2.1.220', PRISTINE_BUNDLE);
+    const secondPristine = readFileSync(second);
+    // Byte-identical to the backup the FIRST install produced (`first` itself is
+    // patched by now), which is what makes one backup correct for both.
+    expect(sha256Of(second)).toBe(sha256Of(backup));
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = second;
+    expect(await runPatchCommand({})).toBe(0);
+    expect(provenanceFor(backup, second)).toEqual({ install: second, assumed: false });
+    expect(backupFiles().filter(name => name.endsWith('.orig'))).toHaveLength(1);
+
+    // Which is what lets it be restored on its own record, with nothing guessed.
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(readFileSync(second)).toEqual(secondPristine);
+    expect(logs.join('\n')).not.toMatch(/version tag alone/);
+  });
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'refuses a guessed restore it cannot record as a guess, leaving the binary alone',
+    async () => {
+      // The guess changes the live bytes to the backup's, after which "the live bytes
+      // match this backup" is no longer independent evidence — so the record saying it
+      // was a guess has to be on disk FIRST. It is the optional compatibility path, so
+      // refusing costs nothing. Fault injected by making the backup directory
+      // read-only, which fails the write while leaving nothing behind to read.
+      const real = installClaude('2.1.220');
+      expect(await runPatchCommand({})).toBe(0);
+      const backup = readPatchManifest()!.backupPath;
+      const patched = readFileSync(real);
+      rmSync(installProvenancePath(backup, real));
+      rmSync(getPatchManifestPath());
+      chmodSync(tweakccDir, 0o500);
+
+      try {
+        expect(await runPatchCommand({ restore: true })).toBe(1);
+        expect(readFileSync(real)).toEqual(patched);
+        expect(logs.join('\n')).toMatch(/Refusing to restore/);
+      } finally {
+        chmodSync(tweakccDir, 0o700);
+      }
+    },
+  );
+
+  it('does not let a snapshot of the bytes a guess installed establish them', async () => {
+    // Nothing promotes a guess — not even a snapshot, which looks like independent
+    // evidence and is not: if the guess restored these very bytes onto this install,
+    // then "the install holds them" is a fact the guess created. Establishing on it
+    // would hand the bytes' true owner a refusal.
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const backup = readPatchManifest()!.backupPath;
+    rmSync(installProvenancePath(backup, real));
+    rmSync(getPatchManifestPath());
+    expect(await runPatchCommand({})).toBe(0);
+    expect(provenanceFor(backup, real)).toEqual({ install: real, assumed: true });
+
+    // The backup is lost, the install is pristine again at the same bytes, and only
+    // the guess remains to say where those bytes came from.
+    rmSync(backup);
+    rmSync(getPatchManifestPath());
+    installClaude('2.1.220');
+
+    expect(await runPatchCommand({})).toBe(0);
+    expect(provenanceFor(backup, real)).toEqual({ install: real, assumed: true });
+    expect(readPatchManifest()?.pristineProvenance).toBe('assumed');
+
+    // And the install is not stranded by that: its own restores still work, which is
+    // what refusing to promote has to cost nothing to be acceptable.
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(logs.join('\n')).toMatch(/version tag alone/);
+  });
+
+  it('keeps patching and restoring an install that has been snapshotted twice', async () => {
+    // tweakcc theming rewrites the binary in place, so one install legitimately has
+    // two pristine snapshots and two true records. Refusing on that contradiction
+    // made every later patch AND restore fail permanently, with a message telling the
+    // user to reinstall — which does not clear a record.
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const first = readPatchManifest()!.backupPath;
+    rmSync(getPatchManifestPath());
+    installClaude('2.1.220', `${PRISTINE_BUNDLE}\n// themed by something else\n`);
+    expect(await runPatchCommand({})).toBe(0);
+    const second = readPatchManifest()!.backupPath;
+    expect(second).not.toBe(first);
+    expect(provenanceFor(first, real)).toEqual({ install: real, assumed: false });
+    expect(provenanceFor(second, real)).toEqual({ install: real, assumed: false });
+
+    // A config change re-patches, and a restore returns the bytes the manifest
+    // describes — the one record that is provably current.
+    const secondPristine = readFileSync(second);
+    rmSync(join(clodexHome, 'config.json'));
+    saveFavorites();
+    expect(await runPatchCommand({})).toBe(0);
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(readFileSync(real)).toEqual(secondPristine);
+  });
+
+  it('keeps a guessed manifest, so deleting the record cannot clear the guess', async () => {
+    // The manifest a guessing run wrote is the second carrier of that taint. Trading
+    // it for a record that only repeats the guess would mean the next run, with the
+    // record gone, reads a clean slate.
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const backup = readPatchManifest()!.backupPath;
+    rmSync(installProvenancePath(backup, real));
+    rmSync(getPatchManifestPath());
+    expect(await runPatchCommand({})).toBe(0);
+    expect(readPatchManifest()?.pristineProvenance).toBe('assumed');
+
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(readPatchManifest()?.pristineProvenance).toBe('assumed');
+  });
+
+  it('refuses to guess a second install onto bytes already guessed onto a first', async () => {
+    // Issue #204's reachable sequence, with the pre-record backup an upgrading user
+    // has: A is restored by the version-tag fallback, and that guess is the reason
+    // not to repeat it for B. Before this, B was simply overwritten.
+    const first = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const backup = readPatchManifest()!.backupPath;
+    rmSync(installProvenancePath(backup, first));
+    rmSync(getPatchManifestPath());
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(logs.join('\n')).toMatch(/version tag alone/);
+
+    const other = installOtherClaude('2.1.220');
+    const otherBytes = readFileSync(other);
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = other;
+    expect(await runPatchCommand({ restore: true })).toBe(1);
+    expect(readFileSync(other)).toEqual(otherBytes);
+    expect(logs.join('\n')).toMatch(/have already been restored onto/);
+  });
+
+  it('does not establish a guess through a THIRD name another install created', async () => {
+    // The route a per-filename confidence check missed: the guess sits beside the
+    // legacy name, and the canonical name is created later by a DIFFERENT install's
+    // patch, so the guessing install's next patch found no record beside the name it
+    // chose. Confidence has to be resolved for the bytes, not the filename.
+    const native = installClaude('2.1.220');
+    const pristineBytes = readFileSync(native);
+    mkdirSync(tweakccDir, { recursive: true });
+    const legacy = join(tweakccDir, 'claude-2.1.220.orig');
+    writeFileSync(legacy, pristineBytes, { mode: 0o755 });
+
+    // B is restored from the legacy backup on its version tag alone.
+    const other = installOtherClaude('2.1.220');
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = other;
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(provenanceFor(legacy, other)).toEqual({ install: other, assumed: true });
+
+    // A is patched in between, which adopts the legacy backup under its content
+    // address — a name B has no record beside.
+    delete process.env.TWEAKCC_CC_INSTALLATION_PATH;
+    expect(await runPatchCommand({})).toBe(0);
+    const canonical = readPatchManifest()!.backupPath;
+    expect(canonical).not.toBe(legacy);
+
+    // B is patched. The guess must still be a guess under the new name.
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = other;
+    expect(await runPatchCommand({})).toBe(0);
+    expect(provenanceFor(canonical, other)).toEqual({ install: other, assumed: true });
+    expect(readPatchManifest()?.pristineProvenance).toBe('assumed');
+
+    // Which is what keeps a later reinstall of B safe: A owns these bytes.
+    rmSync(getPatchManifestPath());
+    const replaced = installOtherClaude('2.1.220', `${PRISTINE_BUNDLE}\n// reinstalled\n`);
+    const replacedBytes = readFileSync(replaced);
+    expect(await runPatchCommand({ restore: true })).toBe(1);
+    expect(readFileSync(replaced)).toEqual(replacedBytes);
+  });
+
+  it('keeps a guess when only a record beside a deleted legacy backup remembers it', async () => {
+    // The scan finds records only beside an existing `.orig`, so a guess recorded
+    // against a legacy backup that is later deleted is invisible to it. The snapshot
+    // that follows would establish the very bytes the guess installed.
+    const native = installClaude('2.1.220');
+    const pristineBytes = readFileSync(native);
+    mkdirSync(tweakccDir, { recursive: true });
+    const legacy = join(tweakccDir, 'claude-2.1.220.orig');
+    writeFileSync(legacy, pristineBytes, { mode: 0o755 });
+
+    const other = installOtherClaude('2.1.220');
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = other;
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(provenanceFor(legacy, other)).toEqual({ install: other, assumed: true });
+
+    // Everything but the record is gone, and B now holds the guessed bytes.
+    rmSync(legacy);
+
+    expect(await runPatchCommand({})).toBe(0);
+    const canonical = readPatchManifest()!.backupPath;
+    expect(provenanceFor(canonical, other)).toEqual({ install: other, assumed: true });
+  });
+
+  it('does not establish a guess under the content address a legacy backup is adopted into', async () => {
+    // A pre-content-addressing backup holds install A's bytes. B is restored from it
+    // by version tag — correctly recorded as a guess — and then patched, which copies
+    // those bytes to a content-addressed name. Establishing the new name would launder
+    // the guess through a filename change.
+    const real = installClaude('2.1.220');
+    const pristineBytes = readFileSync(real);
+    mkdirSync(tweakccDir, { recursive: true });
+    const legacy = join(tweakccDir, 'claude-2.1.220.orig');
+    writeFileSync(legacy, pristineBytes, { mode: 0o755 });
+
+    const other = installOtherClaude('2.1.220');
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = other;
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(logs.join('\n')).toMatch(/version tag alone/);
+    expect(provenanceFor(legacy, other)).toEqual({ install: other, assumed: true });
+
+    expect(await runPatchCommand({})).toBe(0);
+    const canonical = readPatchManifest()!.backupPath;
+    expect(canonical).not.toBe(legacy);
+    expect(provenanceFor(canonical, other)).toEqual({ install: other, assumed: true });
+    expect(readPatchManifest()?.pristineProvenance).toBe('assumed');
+  });
+
+  it('records what the manifest proved before deleting it', async () => {
+    // An upgrading user's backup predates provenance records, so the manifest is the
+    // only thing tying it to this install — and a successful restore deletes the
+    // manifest. Without this migration the backup is left unattributed and the next
+    // same-version install is restored from it by version tag alone (issue #204).
+    const real = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const backup = readPatchManifest()!.backupPath;
+    rmSync(installProvenancePath(backup, real));
+
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(readPatchManifest()).toBeNull();
+    expect(provenanceFor(backup, real)).toEqual({ install: real, assumed: false });
+
+    // Which is what makes the second install safe now that the manifest is gone.
+    const other = installOtherClaude('2.1.220');
+    const otherBytes = readFileSync(other);
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = other;
+    expect(await runPatchCommand({ restore: true })).toBe(1);
+    expect(readFileSync(other)).toEqual(otherBytes);
+  });
+
+  it('keeps the manifest when it cannot record what the manifest proved', async () => {
+    // The migration must not turn a working rescue into a failure: the copy still
+    // happens, and the manifest is kept so the association is not lost either.
+    const real = installClaude('2.1.220');
+    const pristineBytes = readFileSync(real);
+    expect(await runPatchCommand({})).toBe(0);
+    const backup = readPatchManifest()!.backupPath;
+    // Make the record unwritable by parking a directory at its name.
+    rmSync(installProvenancePath(backup, real));
+    mkdirSync(installProvenancePath(backup, real), { recursive: true });
+
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(readFileSync(real)).toEqual(pristineBytes);
+    expect(readPatchManifest()?.binaryPath).toBe(real);
+    expect(logs.join('\n')).toMatch(/Restoring anyway and keeping the patch manifest/);
+  });
+
+  it('still restores an install the manifest passed over at a DIFFERENT version', async () => {
+    // Patch 2.1.220 here, patch a second install at 2.1.221, then come back. The
+    // manifest names a 2.1.221 backup, which is not a candidate for 2.1.220 at
+    // all, so it is no reason to refuse — this used to be a working restore.
+    const real = installClaude('2.1.220');
+    const pristineBytes = readFileSync(real);
+    expect(await runPatchCommand({})).toBe(0);
+
+    const other = installOtherClaude('2.1.221');
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = other;
+    expect(await runPatchCommand({})).toBe(0);
+    expect(readPatchManifest()?.claudeVersion).toBe('2.1.221');
+
+    delete process.env.TWEAKCC_CC_INSTALLATION_PATH;
+    expect(await runPatchCommand({ restore: true })).toBe(0);
+    expect(readFileSync(real)).toEqual(pristineBytes);
+    // And it is not a guess any more: this backup records the install it was made
+    // for, so the restore rests on that rather than on the version in its name.
+    expect(logs.join('\n')).not.toMatch(/version tag alone/);
+  });
+
+  it('refuses when the manifest records this install but its backup was deleted', async () => {
+    // The user is told to remove a bad backup by clodex's own error text, so this
+    // state is reachable. The remaining same-version backup belongs to the OTHER
+    // install, and the manifest says so.
+    const other = installOtherClaude('2.1.220');
+    process.env.TWEAKCC_CC_INSTALLATION_PATH = other;
+    expect(await runPatchCommand({})).toBe(0);
+
+    delete process.env.TWEAKCC_CC_INSTALLATION_PATH;
+    const native = installClaude('2.1.220');
+    expect(await runPatchCommand({})).toBe(0);
+    const nativeBackup = readPatchManifest()!.backupPath;
+    const nativePatched = readFileSync(native);
+    rmSync(nativeBackup);
+
+    expect(await runPatchCommand({ restore: true })).toBe(1);
+    expect(readFileSync(native)).toEqual(nativePatched);
+    // The manifest's own refusal, not one of the provenance ones — with a
+    // same-version backup on disk all three are available and they mean different
+    // things.
+    expect(logs.join('\n')).toMatch(/and clodex cannot use it/);
+  });
+
   it('reports an error instead of restoring when no trustworthy backup exists', async () => {
     const real = installClaude('2.1.220');
     const before = sha256Of(real);
 
     expect(await runPatchCommand({ restore: true })).toBe(1);
     expect(sha256Of(real)).toBe(before);
-    expect(logs.join('\n')).toMatch(/no trustworthy pristine backup/);
+    expect(logs.join('\n')).toMatch(/holds no pristine backup of claude 2\.1\.220 it can attribute to/);
   });
 
   it('still restores when the binary is too broken to report its version', async () => {
