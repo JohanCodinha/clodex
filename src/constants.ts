@@ -8,16 +8,22 @@ import type { ModelFormat } from './types.js';
 // require it; clodex also uses it for other OAuth Responses models so
 // connection-local previous_response_id continuation remains available.
 export const CODEX_RESPONSES_LITE_WS_URL = 'wss://chatgpt.com/backend-api/codex/responses';
-// `version` header the Codex backend expects on Responses-Lite requests. The
-// official Codex CLI sends its own version here, and the backend refuses a
-// model when this is below that model's `minimal_client_version` in the Codex
-// catalog (chatgpt.com/backend-api/codex/models). The refusal reads either
+// `version` header sent on OAuth requests for models flagged useResponsesLite
+// (provider-factory.ts), over HTTP or WebSocket; the official Codex CLI sends
+// its own version here. A version the backend considers too old is refused with
 // "The '<model>' model requires a newer version of Codex" or "The '<model>'
 // model is not supported when using Codex with a ChatGPT account" — the latter
-// is also the reply for a model the account cannot use. Keep this at or above
-// the highest `minimal_client_version` among `use_responses_lite` models:
-// gpt-6-sol and gpt-6-luna need 0.155.0 (measured 2026-09-22; 0.154.0 refused).
-export const CODEX_RESPONSES_LITE_VERSION = '0.156.0';
+// is also the reply for a model the account cannot use. The catalog's
+// `minimal_client_version` can understate the real gate: gpt-6.1-sol reports
+// 0.153.0 but was refused through 0.158.0 and accepted at 0.159.0 on a Plus
+// account (2026-09-29, #298). The catalog endpoint's own client_version filter
+// matched that gate where measured (omitted at 0.156.0 and 0.158.0, listed at
+// 0.159.0), so a refresh also fetches it at this version and records each model it
+// withholds; codex-client-version.ts hides a Responses-Lite model whose minimum
+// exceeds this pin or that was withheld at a version this pin does not exceed. Keep
+// this at or above every catalog minimum among use_responses_lite models and every
+// version measured as required.
+export const CODEX_RESPONSES_LITE_VERSION = '0.159.0';
 // OpenAI-Beta opt-in for the WebSocket Responses transport.
 export const CODEX_RESPONSES_WEBSOCKETS_BETA = 'responses_websockets=2026-02-06';
 
