@@ -1,7 +1,7 @@
 // Maps an OpenCode provider's `npm` package (the field providers.ts already
 // reads) to a Vercel AI SDK LanguageModel instance. The SDK owns wire format,
 // endpoint selection, and provider quirks.
-import type { LanguageModel } from 'ai';
+import type { LanguageModel, LanguageModelMiddleware } from 'ai';
 import { wrapLanguageModel, extractReasoningMiddleware } from 'ai';
 import { VERTEX_ANTHROPIC_NPM, CODEX_RESPONSES_LITE_VERSION, CODEX_RESPONSES_LITE_WS_URL } from './constants.js';
 import { extractOpenAiAccountId } from './oauth/openai.js';
@@ -97,6 +97,88 @@ export function createGitHubCopilotFetch(baseFetch?: typeof fetch): typeof fetch
       });
     }
     return response;
+  };
+}
+
+/**
+ * Carries a ChatGPT-OAuth request's service tier past the AI SDK. Never sent:
+ * withCodexServiceTier removes it before the transport sees the request.
+ */
+const CODEX_SERVICE_TIER_HEADER = 'x-clodex-service-tier';
+
+/**
+ * The AI SDK sends `service_tier: "priority"` only for ids on its own list
+ * (gpt-4*, gpt-5*, o3, o4-mini) and drops it with an "unsupported" warning for
+ * every other id — gpt-6-astra and gpt-6.1-sol included, although the Codex
+ * catalog offers them the Fast tier. resolveServiceTier has already decided the
+ * tier and only sets one on the ChatGPT-OAuth route, so hand it to the
+ * transport in a header the SDK leaves alone. The SDK's warning that it dropped
+ * the tier is removed with it, or reportUnsupportedServiceTier would tell the
+ * user the tier was not sent when it was.
+ */
+const codexServiceTierMiddleware: LanguageModelMiddleware = {
+  specificationVersion: 'v4',
+  transformParams: async ({ params }) => {
+    const tier = carriedServiceTier(params);
+    return tier
+      ? { ...params, headers: { ...params.headers, [CODEX_SERVICE_TIER_HEADER]: tier } }
+      : params;
+  },
+  wrapGenerate: async ({ doGenerate, params }) => {
+    const result = await doGenerate();
+    return carriedServiceTier(params)
+      ? { ...result, warnings: withoutServiceTierWarning(result.warnings) }
+      : result;
+  },
+  wrapStream: async ({ doStream, params }) => {
+    const result = await doStream();
+    if (!carriedServiceTier(params)) return result;
+    return {
+      ...result,
+      stream: result.stream.pipeThrough(new TransformStream({
+        transform(part, controller) {
+          controller.enqueue(part.type === 'stream-start'
+            ? { ...part, warnings: withoutServiceTierWarning(part.warnings) }
+            : part);
+        },
+      })),
+    };
+  },
+};
+
+function carriedServiceTier(params: { providerOptions?: { openai?: Record<string, unknown> } }): string | undefined {
+  const tier = params.providerOptions?.openai?.serviceTier;
+  return typeof tier === 'string' ? tier : undefined;
+}
+
+function withoutServiceTierWarning<W extends { type: string; feature?: string }>(warnings: W[]): W[] {
+  return warnings.filter(warning => !(warning.type === 'unsupported' && warning.feature === 'serviceTier'));
+}
+
+/**
+ * Writes the tier from codexServiceTierMiddleware into the request body when
+ * the SDK left it out, and strips the header either way. A request with no
+ * header passes through untouched.
+ */
+export function withCodexServiceTier(transport: typeof fetch): typeof fetch {
+  return (input, init) => {
+    const source = init?.headers;
+    const entries = source instanceof Headers ? [...source.entries()]
+      : Array.isArray(source) ? source
+        : Object.entries(source ?? {});
+    const tier = entries.find(([name]) => name.toLowerCase() === CODEX_SERVICE_TIER_HEADER)?.[1];
+    if (tier === undefined) return transport(input, init);
+    const headers = entries.filter(([name]) => name.toLowerCase() !== CODEX_SERVICE_TIER_HEADER);
+    let body = init?.body;
+    if (typeof body === 'string') {
+      try {
+        const payload = JSON.parse(body) as Record<string, unknown>;
+        if (payload.service_tier === undefined) body = JSON.stringify({ ...payload, service_tier: tier });
+      } catch {
+        // Not JSON: nothing to carry the tier in.
+      }
+    }
+    return transport(input, { ...init, headers: Object.fromEntries(headers), body });
   };
 }
 
@@ -273,11 +355,11 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
           // same connection-local previous_response_id continuation cache.
           ...(useResponsesEndpoint
             ? {
-                fetch: createResponsesWebSocketFetch(CODEX_RESPONSES_LITE_WS_URL, spec.onDebug, {
+                fetch: withCodexServiceTier(createResponsesWebSocketFetch(CODEX_RESPONSES_LITE_WS_URL, spec.onDebug, {
                   providerId: spec.providerId ?? 'openai',
                   accountId,
                   onDiagnostic: spec.onWebSocketDiagnostic,
-                }),
+                })),
               }
             : {}),
         }
@@ -293,6 +375,12 @@ export async function createLanguageModel(spec: ProviderModelSpec): Promise<Lang
         // the provider's key there.
         : { apiKey, ...(baseURL ? { baseURL } : {}), ...(spec.headers ? { headers: spec.headers } : {}) };
     const openai = createOpenAI(oauthOptions);
+    if (spec.authType === 'oauth' && useResponsesEndpoint) {
+      return wrapLanguageModel({
+        model: openai.responses(modelId),
+        middleware: codexServiceTierMiddleware,
+      }) as unknown as LanguageModel;
+    }
     return useResponsesEndpoint ? openai.responses(modelId) : openai.chat(modelId);
   }
   // Registry stores root URL (no /v1) for GET /v1/models discovery — passing it here
