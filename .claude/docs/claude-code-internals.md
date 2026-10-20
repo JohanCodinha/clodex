@@ -249,10 +249,7 @@ the typed env accessor instead (`i=a.CLAUDE_CODE_REMOTE===!0`), and `us()` (darw
 the returned copy (`let Z={...r,...m},E={...i};…return E}`), and `is(e)` in all eight builds of
 2.1.304, which took an optional base env the parent's env is spread over
 (`if(_||e!==void 0){i={...e,...process.env};…}`) and passes through only when it is absent
-(`if(e===void 0&&…)return process.env`). Of its 32 references in each 2.1.304 build, 30 are
-no-argument calls, one is a dependency object (`{childEnv:is}`, invoked as `s.childEnv()`), and the
-only call passing the parameter, `Object.keys(is(this.#r))` with the shell snapshot's exports, reads
-nothing but the key set. That is why PATCH 10's anchor
+(`if(e===void 0&&…)return process.env`). That is why PATCH 10's anchor
 identifies the function by landmarks inside its body that survive all of that — the agent-proxy env
 it folds in (`getAgentProxyEnv`, spelled inline by every measured builder from 2.1.246 on, with the
 `CLAUDE_CODE_REMOTE` ternary the measured 2.1.238 builder uses still accepted as the alternative),
@@ -287,6 +284,20 @@ for PATCH 10.
 **Claude Code snapshots the login shell** — `<shell> -c -l <script>` once into `shell-snapshots/`,
 then reuses it. rc-derived state is captured at snapshot time and cached, and the snapshot itself is
 built with `pH()` env.
+
+**From 2.1.304 the snapshot's exports come back through the builder's parameter** (all eight builds,
+where the builder is `is(e)`; snippets are darwin-arm64 spellings). The snapshot shell runs with
+`{...process.env.CLAUDE_CODE_DONT_INHERIT_ENV?{}:is(),SHELL:e,GIT_EDITOR:"true",CLAUDECODE:"1"}`
+and reports its whole environment. When the snapshot finishes, that report is parsed into
+`shellExports`, keeping a name only when `is()[name]===void 0` at that moment, and the first report
+is kept until `reset()` (`this.#r??=`). The report is collected only when the host entrypoint is
+`claude-desktop` or `claude-desktop-3p` and the platform is not Windows (`RB()&&M()!=="windows"`).
+Two calls pass `shellExports` as the parameter. `Object.keys(is(this.#r))` reads only the key set.
+The Bash tool's spawn env, `{...is(w),SHELL:…}` with
+`envDefaults:r==="bash"&&!q&&!ot?jP().shellExports:void 0`, carries the values into the command.
+Every other use is a no-argument call (48, 18 of them spreads `...is()`), the dependency object
+`{childEnv:is}` (invoked only as `s.childEnv()`), or an import or re-export. What this means for
+PATCH 10 is in `patcher.md`.
 
 **Settings-sourced env is applied AFTER any wrapper snapshot.** `S7()`/`mht()` do
 `Object.assign(process.env, phr(<settings>.env, scope))` per scope, and the recorder keeps only

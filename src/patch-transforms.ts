@@ -111,10 +111,15 @@ import {
  * `process.env` is spread over (`i={...e,...process.env}`), so the head, which
  * admitted only a zero-arg `function X(){`, and the `{...process.env` body check
  * both refused it. The head now admits one plain parameter and the body check
- * asks only that the body spread `...process.env`. Measured on 2.1.304 the only
- * caller passing that parameter reads just its keys, so the restore still decides
- * what network values a child sees. Every bundle without the parameter matches
- * exactly as under version 15.
+ * asks only that the body spread `...process.env`. The restored env is spread over
+ * the parameter, so a key the restore removes shows the base's value through. On
+ * 2.1.304 the Bash tool passes such a base whose values reach the child: the
+ * shell snapshot's exports, collected under the desktop host. On the clodex-only
+ * path they cannot recover clodex's values, because the snapshot shell is spawned
+ * with this builder's restored env and its exports keep only names the builder
+ * leaves unset when they are parsed. That is a property of Claude Code's callers,
+ * not something this transform enforces. Every measured bundle without the
+ * parameter matches exactly as under version 15.
  */
 export const PATCH_TRANSFORMS_VERSION = 16;
 

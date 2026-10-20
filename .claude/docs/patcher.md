@@ -477,13 +477,34 @@ relocates the Bun section and strands its old copy; that is independent of the r
   (`if(e===void 0&&…)return process.env`). The head admitted only a zero-arg `function X(){` and
   the body check required a literal `{...process.env`, so `clodex patch` refused the release. The
   head now admits one plain parameter and the body check asks only that the body spread
-  `...process.env`. The only caller measured passing the parameter (`is(this.#r)`, the shell
-  snapshot's exports, in all eight builds) reads just `Object.keys` of the result, so the restore
-  still decides which network values a child sees. That is a measurement, not something the
-  transform enforces: if a later build passes a base env whose VALUES reach a child, a key clodex
-  removes (original `null`) would show the base's value through. Output over 2.1.296–2.1.303 is byte-identical to version 15's.
+  `...process.env`. Output over 2.1.296–2.1.303 is byte-identical to version 15's.
   `.claude/harnesses/cc304-patch10-execute-real-builder` executes the patched builder from all
   eight 2.1.304 bundles with and without the parameter.
+
+  **The parameter's values do reach a child, and the restore does not police them.** The patched
+  builder spreads the restored env over the base, so a key the restore keeps wins, but a key it
+  REMOVES (original `null`) shows the base's value through. Two calls pass the parameter in all
+  eight 2.1.304 builds, both with the shell snapshot's exports. `Object.keys(is(this.#r))` reads
+  only the key set. The Bash tool's spawn env does not: `{...is(w),SHELL:…}`, with
+  `envDefaults:r==="bash"&&!q&&!ot?jP().shellExports:void 0` (darwin-arm64 spelling; the other
+  builds rename the locals but test the same conditions), carries the base's values into the
+  command. Claude Code collects those exports only under a desktop host entrypoint
+  (`claude-desktop`, `claude-desktop-3p`) and not on Windows; everywhere else the base is
+  `undefined`.
+
+  On the clodex-only path that is safe because of where the exports come from, not because of the
+  transform. The snapshot shell is spawned with the no-argument builder's env, so it does not
+  inherit the injected proxy, CA or contract:
+  `{...process.env.CLAUDE_CODE_DONT_INHERIT_ENV?{}:is(),SHELL:e,GIT_EDITOR:"true",CLAUDECODE:"1"}`.
+  What it reports is its whole environment after startup, and the parser keeps a name only if
+  `is()`, called when the snapshot finishes, leaves it unset. So the base cannot recover the
+  injected values from the live parent env. The builder's existing overlays still apply to the
+  snapshot shell as to any other child: settings env, and the remote agent-proxy fallback described
+  under "Two paths overlay the child env AFTER PATCH 10's restore" in `claude-code-internals.md`. A
+  later release that passes an unsanitized base, such as the live `process.env`, could put the
+  injected values back in front of a child, so re-check every arg-passing call when the builder
+  moves. Count callers with a scope-aware walk, not a text search: a lookbehind that excludes `.`
+  skips the 18 spread calls (`...is()`) and the Bash tool's `...is(w)`.
 - **Calibrate a patch-anchor weakness by corpus reachability and by which direction it fails, not
   by whether an attack can be constructed** — one always can, against every site we ship.
   PATCH 5's surviving hole needs upstream to make two coordinated changes at once (respell its own

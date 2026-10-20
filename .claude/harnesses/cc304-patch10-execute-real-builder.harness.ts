@@ -16,11 +16,11 @@
 // which is asserted. A binding is only proven present and correctly mapped when a
 // scenario below REACHES it.
 //
-//   cat > vitest.h304.config.ts <<'EOF'
+//   cat > /tmp/h304.config.ts <<'EOF'
 //   import { defineConfig } from 'vitest/config';
 //   export default defineConfig({ test: { include: ['.claude/harnesses/cc304-*.harness.ts'] } });
 //   EOF
-//   REVIEW_BUNDLE_DIR=~/.cache/clodex-review-bundles/2.1.304 pnpm vitest run --config vitest.h304.config.ts
+//   REVIEW_BUNDLE_DIR=~/.cache/clodex-review-bundles/2.1.304 pnpm vitest run --config /tmp/h304.config.ts
 import { describe, expect, it } from 'vitest';
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
