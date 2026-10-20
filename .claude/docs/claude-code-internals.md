@@ -128,22 +128,21 @@ and drops all of it. That is what broke `clodex patch` on 2.1.246 on every platf
 
 The bundle lived in a Bun data blob as one module among ~15 (see the code-split section above for
 what changed in 2.1.242), and tweakcc finds it **by name**:
-`/claude`, `claude`, `/claude.exe`, `claude.exe`, `/src/entrypoints/cli.js`, `src/entrypoints/cli.js`.
+`/claude`, `claude`, `/claude.exe`, `claude.exe`, `/src/entrypoints/cli.js`,
+`src/entrypoints/cli.js`, `/cli`, `cli` (tweakcc 4.3.3).
 
 | Version | Entry module |
 | --- | --- |
 | 2.1.224, 2.1.226, 2.1.228 | `/$bunfs/root/src/entrypoints/cli.js` |
 | 2.1.229, 2.1.231–2.1.234, 2.1.241–2.1.243 | `/$bunfs/root/cli` |
 
-(2.1.228 is the last release clodex's pinned tweakcc 4.3.0 — and clodex's own mirrored copy of its
-name list — can discover, and 2.1.230 was never published for any platform package, so 2.1.229 is
-where the rename actually landed. Confirmed on linux-x64 and darwin-arm64.)
-
-2.1.229 and later match none of them, so `readContent` threw and every patch failed with
-"Failed to extract JavaScript from native installation" — which reads like the `node-gyp-build`
-packaging fault described in `patcher.md` and is not it. tweakcc carried the old list through
-4.3.2; **4.3.3** added `/cli`, but clodex mirrors the list itself and is still pinned to 4.3.0, so
-`src/bun-entry-module.ts` works around it; see `patcher.md`.
+(2.1.228 was the last release recognized by the earlier tweakcc 4.3.0, and 2.1.230 was
+never published for any platform package, so 2.1.229 is where the rename actually landed.
+Confirmed on linux-x64 and darwin-arm64.) Under tweakcc 4.3.0–4.3.2 without clodex's former
+entry-module rename, 2.1.229+ failed extraction with "Failed to extract JavaScript from native
+installation". clodex's rename kept those releases patchable. tweakcc 4.3.3 recognizes `/cli`
+directly, so clodex no longer renames the entry module before reading or writing the binary. Future
+unknown names have no shim fallback; tweakcc must add recognition upstream.
 
 Two things that are easy to assume wrongly about the blob:
 
@@ -412,6 +411,34 @@ all string values and replace lone UTF-16 surrogates with U+FFFD (@211704–2122
 Clodex therefore keeps the original summary strings inside its JSON-encoded signature, whose
 escaped surrogate code units survive that sanitizer, rather than depending on unchanged display
 text or sanitizing individual deltas (which would break valid pairs split across deltas).
+
+### Thinking from another model after a model switch (verified 2.1.281, darwin-arm64)
+
+The request builder (`IMt`) passes the history through `JMt(messages, model, keepForeignThinking)`,
+which removes signed `thinking` and all `redacted_thinking` blocks (`K5t`) from every assistant
+message whose `message.model` is neither the request's model nor a model the server is known to
+have served for it (`iue`) — unless the keep mode says otherwise. The mode (`oAt`/`Cfo`) is
+`"none"` off first-party, else `CLAUDE_CODE_RUSTLING_PIXEL` if set, else the GrowthBook flag
+`tengu_rustling_pixel`, default `"all"`. `"upgrade"` keeps only Claude-to-newer-Claude
+(`CCo` parses both ids as Claude models, so a `clodex:` id never qualifies); **`"all"` keeps
+every foreign block, so Claude's signed thinking reaches a `clodex:` model's request.** That is
+what exposed #274. 2.1.273, 2.1.274 and 2.1.276 have only the upgrade mode
+(`keepForeignThinkingOnUpgrade`), so on those builds a switch to a clodex model strips Claude's
+thinking before clodex sees it. The flag is server-controlled: on this machine (2026-09-24) it
+resolved to strip, while the reporters' clients evidently kept the thinking — their 400 quotes a
+Claude signature. `CLAUDE_CODE_RUSTLING_PIXEL=all` forces the reporters' path.
+
+The heal path does not help a translated route. When an error message matches `umr` —
+`signature in thinking block`, `thinking.signature` + `field required`, or `thinking block` /
+`redacted_thinking` with `invalid signature` / `cannot be modified` (Anthropic sends
+``Invalid `signature` in `thinking` block``) — Claude Code strips all thinking,
+retries, resets the keep mode to `"none"` for the process (`vG`), and persists a
+`thinking_stripped` attachment (`scope: "all"`) so later requests in that transcript strip
+everything before it. OpenAI's `The encrypted content ... could not be verified` matches none of
+those, so nothing heals and every later turn fails the same way. The reverse switch does heal: a
+clodex envelope sent to Anthropic costs one rejected request, then the retry succeeds without any
+thinking — and the marker also drops the OpenAI reasoning from later OpenAI turns in that
+transcript (observed live, 2.1.281, OpenAI -> haiku -> OpenAI).
 
 ## Voice dictation transport (verified 2.1.263, darwin-arm64)
 

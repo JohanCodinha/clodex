@@ -278,16 +278,27 @@ describe('translateMessages', () => {
     expect(xai[0].content[1]).toEqual({ type: 'tool-call', toolCallId: 'call_1', toolName: 'Read', input: {} });
   });
 
-  it('round-trips OpenAI reasoningEncryptedContent via thinking.signature', () => {
+  it('does not forward a thinking signature clodex did not wrap as OpenAI encrypted reasoning', () => {
+    // Claude's own signature (or a pre-envelope clodex raw ciphertext): OpenAI
+    // cannot verify a blob it did not issue and fails the whole request (#274).
     const msg = [{ role: 'assistant' as const, content: [
       { type: 'thinking', thinking: 'chain...', signature: 'enc_blob_abc' },
+      { type: 'text', text: 'answer' },
     ] }];
     const openai = translateMessages(msg, '@ai-sdk/openai') as any[];
-    expect(openai[0].content[0]).toEqual({
-      type: 'reasoning',
-      text: 'chain...',
-      providerOptions: { openai: { reasoningEncryptedContent: 'enc_blob_abc' } },
-    });
+    expect(openai[0].content).toEqual([{ type: 'text', text: 'answer' }]);
+  });
+
+  it('keeps foreign thinking text for OpenAI-compatible chat providers, without a signature', () => {
+    const msg = [{ role: 'assistant' as const, content: [
+      { type: 'thinking', thinking: 'chain...', signature: 'enc_blob_abc' },
+      { type: 'text', text: 'answer' },
+    ] }];
+    const compatible = translateMessages(msg, '@ai-sdk/openai-compatible') as any[];
+    expect(compatible[0].content).toEqual([
+      { type: 'reasoning', text: 'chain...' },
+      { type: 'text', text: 'answer' },
+    ]);
   });
 
   it('drops empty OpenAI thinking blocks without encrypted content', () => {
@@ -1381,6 +1392,7 @@ describe('generateAnthropicResponse', () => {
     process.env['CLODEX_UPSTREAM_MAX_RETRIES'] = '4';
     const generateText = vi.fn(async () => ({
       text: 'done',
+      content: [{ type: 'text', text: 'done' }],
       toolCalls: [],
       finishReason: 'stop',
       usage: { inputTokens: 1, outputTokens: 1 },
@@ -1448,6 +1460,7 @@ describe('generateAnthropicResponse', () => {
     vi.resetModules();
     const generateText = vi.fn(async () => ({
       text: 'done',
+      content: [{ type: 'text', text: 'done' }],
       toolCalls: [],
       finishReason: 'stop',
       usage: {
@@ -1488,6 +1501,7 @@ describe('generateAnthropicResponse', () => {
     vi.resetModules();
     const generateText = vi.fn(async () => ({
       text: 'done',
+      content: [{ type: 'text', text: 'done' }],
       toolCalls: [],
       finishReason: 'stop',
       usage: undefined,
@@ -1549,6 +1563,13 @@ describe('generateAnthropicResponse', () => {
     vi.resetModules();
     const generateText = vi.fn(async () => ({
       text: '',
+      content: [{
+        type: 'tool-call',
+        toolCallId: 'call_1',
+        toolName: 'Read',
+        input: { path: 'a' },
+        providerMetadata: { google: { thoughtSignature: 'SIG' } },
+      }],
       toolCalls: [{
         toolCallId: 'call_1',
         toolName: 'Read',

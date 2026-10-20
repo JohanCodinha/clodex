@@ -17,6 +17,20 @@ hand-rolled per-provider translation. Preserved hard-won behavior:
   responses in testing.
 - Cache reads and GPT-5.6 cache writes map to Anthropic
   `cache_read_input_tokens`/`cache_creation_input_tokens`.
+- **On OpenRouter routes, translated requests carry an `x-session-id` header** so OpenRouter can
+  keep a conversation on one upstream provider; its prompt-caching guide names the header as its
+  sticky routing key. The value is Claude Code's session UUID put through
+  `claudeSessionPromptCacheKey` — the same opaque key the OpenAI route sends as
+  `prompt_cache_key` — or the system+tools prompt cache key when the client sends no session
+  identity. Stickiness is per provider, not per backend node, and subject to OpenRouter's
+  eligibility rules, fallback and 10-minute idle expiry; no cache-hit improvement has been
+  measured for it.
+  The route is recognised by `isOpenRouterRoute`, which in practice matches a base URL containing
+  `openrouter.ai`: its other two clauses, the `@openrouter/ai-sdk-provider` package and an
+  `openrouter` provider id, name nothing clodex ships. **Keep it endpoint-derived.** A custom
+  provider's id comes from the display name the user typed and a gateway can list `openrouter/*`
+  model ids, so neither is evidence of the upstream — and the same predicate decides reasoning
+  capabilities and effort, where a false positive silently changes what a provider is asked to do.
 - Consecutive OpenAI Responses reasoning summaries/items stream into **one Anthropic thinking
   block** until text, a tool, or successful completion closes it. A thinking-only WebSocket drop
   leaves that block open, so an earlier summary cannot disable Claude Code's mid-stream retry.
@@ -28,14 +42,43 @@ hand-rolled per-provider translation. Preserved hard-won behavior:
   change what goes back to OpenAI. This duplicates summary text in client requests and transcripts
   and retains any intermediate ciphertext the SDK exposes; only each item's final ciphertext goes
   upstream. The envelope itself is never sent upstream. No process-local registry or provider
-  ciphertext rewriting is involved. Legacy raw signatures remain readable. An unknown or malformed
-  envelope is omitted, never forwarded as ciphertext; switching a valid envelope to another
-  translated provider retains only the display text. Older clodex builds cannot decode these new
-  signatures and would forward the envelope as provider ciphertext, which can cause upstream errors.
+  ciphertext rewriting is involved. An unknown or malformed envelope is omitted, never forwarded as
+  ciphertext; switching a valid envelope to another translated provider retains only the display
+  text. Older clodex builds cannot decode these new signatures and would forward the envelope as
+  provider ciphertext, which can cause upstream errors.
   Resume such transcripts with an envelope-aware build rather than downgrading the bridge. This does not
-  change non-streaming responses' existing omission of reasoning, or the transport's prohibition
-  on replaying already-emitted model output. The guarantee covers SDK-visible summary text,
-  grouping and encrypted content, not output-only fields the SDK omits (such as `status`).
+  change the transport's prohibition on replaying already-emitted model output. The guarantee
+  covers SDK-visible summary text, grouping and encrypted content, not output-only fields the SDK
+  omits (such as `status`).
+
+  **On `@ai-sdk/openai`, a thinking block whose signature is not a clodex envelope is dropped
+  whole** — text and signature. Claude Code (2.1.281; not 2.1.276), under a server-side flag, keeps
+  Claude's own signed thinking in the history when the user switches model (Opus then an OpenAI
+  model, or `opusplan`) — see `claude-code-internals.md`. OpenAI answers a request carrying that
+  signature as `encrypted_content` with 400 "could not be verified", and every later OpenAI turn in
+  the session failed (#274). Sending the text without the signature is not an
+  alternative: the SDK skips a reasoning part that has neither an item id nor encrypted content.
+  The discriminator is provenance clodex controls — its own envelope — not the ciphertext's
+  format, which neither provider documents. The cost: clodex <= 2.11.3 stored OpenAI's raw
+  ciphertext as the signature, and those old turns' hidden reasoning is no longer replayed. Visible
+  text and tool calls are unaffected, and a live WebSocket chain still continues (its
+  `omitted_reasoning` match). `@ai-sdk/openai-compatible` reads no `openai` part options, so a
+  foreign block's text still goes up as `reasoning_content` there and its signature never did.
+- **A non-streaming response carries the turn's reasoning, as the stream does.** Claude Code
+  asks for one once its mid-stream retries are spent (see `claude-code-internals.md`), and it
+  keeps whatever that response holds. A turn returned without thinking lost its reasoning from
+  every later request in the session: the encrypted reasoning item on OpenAI routes, and the
+  `reasoning_content` DeepSeek's thinking mode requires back on every request that carries tools.
+  `src/non-stream-content.ts` builds the content in arrival order with `writeAnthropicStream`'s
+  thinking-block rules, and `tests/non-stream-reasoning.test.ts` holds the two to the same blocks
+  and the same replayed upstream request for the shapes it covers. Two differences are
+  deliberate: an empty text block is dropped, and in a `generateText` result, reasoning without an
+  OpenAI item id that follows the text moves to the front, because `@ai-sdk/openai-compatible`
+  appends it after the text although the model reasoned first. Parity is not complete: the SDK's
+  `<think>` extraction middleware (installed for compatible model ids that name a reasoning model)
+  splits text differently when generating and streaming — text before the tag, several sections,
+  an unclosed tag — and a Responses message with several `output_text` parts becomes several text
+  blocks. The reasoning itself is kept in each case.
 - **A tool schema's regexes are dropped when they hit a known Python incompatibility**, on every
   route but Anthropic-format ones (`src/tool-schema-sanitize.ts`). OpenAI rejects the same
   constructs python-jsonschema does — its 400 reads `'<pattern>' is not a 'regex'`, that library's

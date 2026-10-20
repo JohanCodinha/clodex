@@ -1,5 +1,76 @@
 # Changelog
 
+## [2.18.4](https://github.com/bman654/clodex/compare/v2.18.3...v2.18.4) (2026-09-28)
+
+
+### Bug Fixes
+
+* **models:** keep each OpenRouter conversation on one provider to help reuse its prompt cache ([#294](https://github.com/bman654/clodex/issues/294)) ([c678fac](https://github.com/bman654/clodex/commit/c678faccbf6bf68eb3b7455d8871afc03de92cfc))
+
+## [2.18.3](https://github.com/bman654/clodex/compare/v2.18.2...v2.18.3) (2026-09-27)
+
+
+### Bug Fixes
+
+* **reasoning:** keep a turn's reasoning when Claude Code recovers from a dropped stream ([#295](https://github.com/bman654/clodex/issues/295)) ([a179ba0](https://github.com/bman654/clodex/commit/a179ba0502d0ff50892bd6c0787e887f35670178))
+
+## [2.18.2](https://github.com/bman654/clodex/compare/v2.18.1...v2.18.2) (2026-09-26)
+
+
+### Bug Fixes
+
+* **models:** show clodex models in /model when Claude Code gets its model list from Anthropic ([#291](https://github.com/bman654/clodex/issues/291)) ([5de5fec](https://github.com/bman654/clodex/commit/5de5fec431c53491620642cdae74ee5c4525a855))
+
+## [2.18.1](https://github.com/bman654/clodex/compare/v2.18.0...v2.18.1) (2026-09-25)
+
+
+### Bug Fixes
+
+* **models:** call GPT-5.6 Sol and Terra as OpenAI expects when the model list can't load ([#282](https://github.com/bman654/clodex/issues/282)) ([c413fde](https://github.com/bman654/clodex/commit/c413fde7c7e482d6c506c9341cc1b170a9b303a1))
+* **patch:** refuse to replace Claude Code on a Mac unless its signature verifies ([#284](https://github.com/bman654/clodex/issues/284)) ([add05c7](https://github.com/bman654/clodex/commit/add05c7e873b59ea37913e00fdf8dab0ea96357c))
+* **proxy:** stop clodex from hanging when proxy settings loop back to itself ([#283](https://github.com/bman654/clodex/issues/283)) ([ee7fc06](https://github.com/bman654/clodex/commit/ee7fc0644d6cad6ba1bd163d6ecfe35a3b084edf))
+
+## [2.18.0](https://github.com/bman654/clodex/compare/v2.17.0...v2.18.0) (2026-09-24)
+
+
+### Features
+
+* **vscode:** warn and print the fix when a Claude Code extension update hides clodex models ([#280](https://github.com/bman654/clodex/issues/280)) ([0b53171](https://github.com/bman654/clodex/commit/0b5317185a6eea372cd0df4bfbaaefcb739345ee))
+
+
+### Bug Fixes
+
+* **help:** stop the clodex claude --provider/--model example from failing by default ([#275](https://github.com/bman654/clodex/issues/275)) ([1484242](https://github.com/bman654/clodex/commit/1484242c3b3eedf20fd89f3be567635ef2993d81))
+* **models:** hide unsupported ChatGPT-plan models to prevent repeated request failures ([#277](https://github.com/bman654/clodex/issues/277)) ([ac28ad4](https://github.com/bman654/clodex/commit/ac28ad466a975dc5eeed411b78cbaebfa7196b63))
+* **oauth:** keep GPT-6 and Daybreak Blue usable after upgrading from an older model list ([#276](https://github.com/bman654/clodex/issues/276)) ([70c681e](https://github.com/bman654/clodex/commit/70c681e574d622958d58901ca59408a1b68f350a))
+* **openai:** stop OpenAI models failing every turn after a Claude reply that used thinking ([#278](https://github.com/bman654/clodex/issues/278)) ([ca22d2b](https://github.com/bman654/clodex/commit/ca22d2bcd5e8ff3fbb7a2794026eaac2ab11612f))
+* **openai:** warn API-key users when large prompts trigger higher prices ([#279](https://github.com/bman654/clodex/issues/279)) ([2d92b18](https://github.com/bman654/clodex/commit/2d92b18cd0065c90b36b0f2ee3be29436a9479d3))
+
+## [2.17.0](https://github.com/bman654/clodex/compare/v2.16.0...v2.17.0) (2026-09-23)
+
+
+### Features
+
+* **models:** add GPT-6 Sol and Luna with their context limits and reasoning levels ([#266](https://github.com/bman654/clodex/issues/266)) ([b9c5613](https://github.com/bman654/clodex/commit/b9c56131c4c53732dde46de94ccac6e9ec209c53))
+
+
+### Bug Fixes
+
+* **oauth:** stop GPT-6 Sol and Luna failing every request on a ChatGPT plan ([#267](https://github.com/bman654/clodex/issues/267)) ([ebfacfe](https://github.com/bman654/clodex/commit/ebfacfe231c616ad156f0b56ce6a6b6616ed288e))
+
+## [2.16.0](https://github.com/bman654/clodex/compare/v2.15.0...v2.16.0) (2026-09-21)
+
+
+### Features
+
+* **opencode-go:** add the Muse Spark models, which clodex could not reach before ([c68fa2a](https://github.com/bman654/clodex/commit/c68fa2a195192624ed232c87c21d699ddf838300))
+
+
+### Bug Fixes
+
+* **models:** let you raise the context window on a model whose provider publishes none ([#259](https://github.com/bman654/clodex/issues/259)) ([3e2e3df](https://github.com/bman654/clodex/commit/3e2e3df6b81b69c18a36fc198b4ec0a33dcd88e3))
+* **proxy:** send web traffic through your HTTPS_PROXY so it works behind a corporate proxy ([be5f9a4](https://github.com/bman654/clodex/commit/be5f9a4d4530ed684246057f046e76b4224680d7))
+
 ## [2.15.0](https://github.com/bman654/clodex/compare/v2.14.1...v2.15.0) (2026-09-19)
 
 

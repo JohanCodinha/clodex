@@ -15,7 +15,7 @@ import {
   resolveContextStop,
   setSessionContextStops,
 } from './context-modes.js';
-import { resolveContextWindow } from './context-window.js';
+import { lookupKnownContextWindow } from './context-window.js';
 import {
   parseContextStopAssignments,
   savedStopsAfter,
@@ -82,6 +82,7 @@ import {
 import { runPatchCommand, runLaunchPatchCheck } from './patcher.js';
 import { installOutboundDispatcher } from './outbound-proxy.js';
 import { runInstallVscodeLauncherCommand } from './vscode-launcher.js';
+import { CHECKED_EDITORS_DESCRIPTION } from './editor-extension-version.js';
 const STARTER_CLAUDE_FLAGS = new Set(['--dry-run', '--trace', '--fast', '--endpoint', '--proxy', '--save-mode', '--help', '-h', '--version', '-v']);
 const CLODEX_LAUNCH_FLAGS = new Set(['--provider', '--model', '--context']);
 
@@ -463,8 +464,10 @@ ${pc.bold('Options:')}
                for the whole session (equivalent to CLODEX_SERVICE_TIER=fast;
                warns if the SDK omits it). To do this for one agent only, save
                a -fast alias with clodex models --alias
-  --provider   Boot provider id (skip wizard when paired with --model or in print mode)
-  --model      Boot model id (skip wizard when paired with --provider or in print mode)
+  --provider   Endpoint mode only: boot provider id (skip wizard when paired with
+               --model or in print mode)
+  --model      Endpoint mode only: boot model id (skip wizard when paired with
+               --provider or in print mode)
   --context    <model=stop> use a different share of a model's window for this
                launch only (standard, max, default, or a token count). Nothing is
                saved. It reaches Claude Code through the exported catalog, so a
@@ -508,7 +511,7 @@ ${pc.bold('Examples:')}
   clodex claude --trace --resume abc-123
   clodex claude --endpoint
   clodex claude --endpoint --save-mode
-  clodex claude --provider openai-oauth --model gpt-5.6-sol
+  clodex claude --endpoint --provider openai-oauth --model gpt-6-sol
   clodex claude -- --print "hello"
   clodex claude -- --dangerously-skip-permissions`;
 }
@@ -598,8 +601,8 @@ Manage favorite models for mid-session switching.
 ${pc.bold('Usage:')}
   clodex favorites
   clodex models --list
-  clodex models --alias sol=clodex:openai-oauth:gpt-5.6-sol
-  clodex models --alias sol-fast=clodex:openai-oauth:gpt-5.6-sol
+  clodex models --alias sol=clodex:openai-oauth:gpt-6-sol
+  clodex models --alias sol-fast=clodex:openai-oauth:gpt-6-sol
   clodex models --unalias sol
   clodex models --context sol=max --save
   clodex models --json
@@ -635,14 +638,17 @@ ${pc.bold('How it works:')}
   Claude Code binary so they pass model validation and report real context.
 
 ${pc.bold('Context stops and cost:')}
-  Some providers price large prompts in bands: GPT-5.6 bills the full request at
-  a higher rate above 272,000 input tokens. The standard stop stays under that
-  line, so max is opt-in and reports the boundary when you select it.
+  Some providers price large prompts in bands: GPT-5.6 and GPT-6 bill the full request at
+  a higher rate above 272,000 input tokens. For ChatGPT/Codex-plan models whose
+  catalog reports a 272,000-token window, standard stays at that line and a
+  larger window is opt-in. OpenAI API-key models retain their full window, so
+  standard may already cross the boundary. Choose a smaller numeric stop such
+  as 250k to limit exposure to the higher rate.
 
 ${pc.bold('Examples:')}
   clodex favorites
-  clodex models --alias sol=clodex:openai-oauth:gpt-5.6-sol
-  clodex models --alias sol-fast=clodex:openai-oauth:gpt-5.6-sol   # same model, fast mode
+  clodex models --alias sol=clodex:openai-oauth:gpt-6-sol
+  clodex models --alias sol-fast=clodex:openai-oauth:gpt-6-sol   # same model, fast mode
   clodex models --context sol=max --save
   clodex claude    # switch menu active when favorites are set`;
 }
@@ -676,7 +682,13 @@ ${pc.bold('Behavior:')}
   Local patches execute after the built-ins as an all-or-none set. Enabling
   them executes trusted JavaScript from local-patches.mjs with your full user
   permissions. Local failures are reported but never block the built-ins.
-  Run clodex patch again after every claude update.`;
+  Run clodex patch again after every claude update.
+
+  An editor launching Claude Code through clodex-claude runs this patched
+  install only when its Claude Code extension is the same build. When an
+  installed extension is a different version, clodex patch warns and prints the
+  commands that align them. Editors checked:
+    ${CHECKED_EDITORS_DESCRIPTION}`;
 }
 
 export function installVscodeLauncherHelpText(): string {
@@ -707,6 +719,8 @@ ${pc.bold('Behavior:')}
   As on macOS and Linux, clodex-claude then runs your clodex-patched install in
   place of the bundled claude.exe when the two builds match, so clodex models
   appear in the extension's model picker; re-run clodex patch after updates.
+  Like clodex patch, it warns when an installed Claude Code extension is a
+  different version from the Claude Code clodex last patched.
 
   The paths to node.exe and to the clodex install are compiled in: re-run this
   command after switching Node versions or moving the clodex install.
@@ -844,7 +858,7 @@ function applyContextStopAssignments(
       return 1;
     }
 
-    const limits = contextLimitsFrom(cached, resolveContextWindow(assignment.modelId));
+    const limits = contextLimitsFrom(cached, lookupKnownContextWindow(assignment.modelId));
     const resolved = resolveContextStop(limits, assignment.stop ?? 'standard');
     const target = modelAliasTarget(assignment);
     // An alias earns the parenthesised target; spelling the full id already showed it.

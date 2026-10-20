@@ -4,8 +4,9 @@ import { TEST_TIMEOUT_MS } from '../constants.js';
 import { OPENCODE_GO_PROVIDER_ID } from '../data/opencode-go-models.js';
 import { GITHUB_COPILOT_PROVIDER_ID, parseGitHubCopilotModels } from '../github-copilot.js';
 import { OPENROUTER_PROVIDER_ID, shapeOpenRouterModels } from '../openrouter.js';
+import { openAiPricingMetadata } from '../data/openai-oauth-models.js';
 import { deriveBrand } from '../models.js';
-import { resolveContextWindow } from '../context-window.js';
+import { lookupKnownContextWindow } from '../context-window.js';
 import type { ProviderTemplate } from '../provider-templates.js';
 import { normalizeGoogleDisplayName, normalizeGoogleModelId } from './google-model-id.js';
 import type { CachedModel } from './types.js';
@@ -143,7 +144,9 @@ function parseModelList(
       row.contextWindow ??
       row.context_window ??
       row.max_model_len ??
-      resolveContextWindow(id);
+      // Left undefined when nothing is known: persisting the invented 200,000
+      // would make it this model's permanent ceiling.
+      lookupKnownContextWindow(id);
     models.push({
       id,
       name: normalizeGoogleDisplayName(row.name, id),
@@ -151,6 +154,7 @@ function parseModelList(
       family,
       brand: deriveBrand(family),
       contextWindow,
+      ...(npm === '@ai-sdk/openai' ? openAiPricingMetadata(id) : {}),
       cost,
       isFree: isFreeStatus(freeStatus),
       freeStatus,
@@ -174,6 +178,9 @@ function materializeTemplateModel(
   const { id, upstreamModelId: normalizedUpstream } = normalizeGoogleModelId(model.id, npm);
   const family = model.family ?? (id.split(/[-/:]/)[0] ?? id);
   const freeStatus = model.freeStatus ?? classifyFreeStatus({ model });
+  const pricing = npm === '@ai-sdk/openai'
+    ? openAiPricingMetadata(model.upstreamModelId ?? id)
+    : {};
 
   return {
     ...model,
@@ -182,7 +189,9 @@ function materializeTemplateModel(
     upstreamModelId: model.upstreamModelId ?? normalizedUpstream,
     family,
     brand: model.brand ?? deriveBrand(family),
-    contextWindow: model.contextWindow ?? resolveContextWindow(id),
+    contextWindow: model.contextWindow ?? lookupKnownContextWindow(id),
+    pricingBoundary: model.pricingBoundary ?? pricing.pricingBoundary,
+    pricingBoundaryNote: model.pricingBoundaryNote ?? pricing.pricingBoundaryNote,
     isFree: model.isFree ?? isFreeStatus(freeStatus),
     freeStatus,
     modelFormat: model.modelFormat ?? modelFormatForNpm(npm),

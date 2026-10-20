@@ -13,6 +13,7 @@ import {
 } from '../src/provider-factory.js';
 import { VERTEX_ANTHROPIC_NPM } from '../src/constants.js';
 import { buildOpenCodeGoModels } from '../src/data/opencode-go-models.js';
+import { buildOpenAiOAuthModels } from '../src/data/openai-oauth-models.js';
 
 async function expectCredentialHeadersStripped(
   fetchImpl: typeof fetch,
@@ -211,6 +212,8 @@ describe('getReasoningCapabilities', () => {
     ['gpt-daybreak-blue-latest', ['none', 'low', 'medium', 'high', 'xhigh', 'max']],
     ['gpt-7-example', ['low', 'medium', 'high', 'xhigh', 'max']],
     ['gpt-5.6-sol', ['none', 'low', 'medium', 'high', 'xhigh', 'max']],
+    ['gpt-6-sol', ['none', 'low', 'medium', 'high', 'xhigh', 'max']],
+    ['gpt-6-luna', ['none', 'low', 'medium', 'high', 'xhigh', 'max']],
   ])('offers the patched-client effort menu for %s', (modelId, levels) => {
     expect(getPatchReasoningCapabilities('@ai-sdk/openai', modelId, { reasoning: true }).levels)
       .toEqual(levels);
@@ -237,6 +240,8 @@ describe('getReasoningCapabilities', () => {
     ['gpt-6-astra', false],
     ['gpt-daybreak-blue-latest', true],
     ['gpt-5.6-sol', true],
+    ['gpt-6-sol', true],
+    ['gpt-6-luna', true],
   ])('reports whether %s offers a none effort', (modelId, offersNone) => {
     const levels = getReasoningCapabilities('@ai-sdk/openai', modelId, { reasoning: true }).levels;
     expect(levels.includes('none')).toBe(offersNone);
@@ -538,10 +543,13 @@ describe('effortProviderOptions + deepMergeProviderOptions', () => {
       .toBeUndefined();
   });
 
-  it('keeps the none effort that gpt-daybreak-blue-latest accepts', () => {
-    expect(effortProviderOptions('@ai-sdk/openai', 'none', 'gpt-daybreak-blue-latest', { reasoning: true }))
-      .toEqual({ openai: { reasoningEffort: 'none', forceReasoning: true } });
-  });
+  it.each(['gpt-daybreak-blue-latest', 'gpt-6-sol', 'gpt-6-luna'])(
+    'keeps the none effort that %s accepts',
+    modelId => {
+      expect(effortProviderOptions('@ai-sdk/openai', 'none', modelId, { reasoning: true }))
+        .toEqual({ openai: { reasoningEffort: 'none', forceReasoning: true } });
+    },
+  );
 
   // The maintenance property: the extended range is read off the version, so a
   // family that does not exist yet is already covered.
@@ -674,6 +682,45 @@ describe('createLanguageModel', () => {
     vi.doUnmock('@ai-sdk/openai');
   });
 
+  // OpenCode Go serves Muse Spark only on /v1/responses. An API-key Responses
+  // route that dropped its base URL would default to api.openai.com and send
+  // the Go key there, so the destination is asserted, not assumed.
+  it('passes the configured base URL on an API-key Responses route', async () => {
+    vi.resetModules();
+    const responses = vi.fn((modelId: string) => ({ modelId, provider: 'openai-responses' }));
+    const chat = vi.fn((modelId: string) => ({ modelId, provider: 'openai-chat' }));
+    const createOpenAI = vi.fn(() => ({ responses, chat }));
+    vi.doMock('@ai-sdk/openai', () => ({ createOpenAI }));
+
+    const { createLanguageModel: create } = await import('../src/provider-factory.js');
+    await create({
+      npm: '@ai-sdk/openai',
+      modelId: 'muse-spark-1.3-contributor',
+      apiKey: 'go-key',
+      baseURL: 'https://opencode.ai/zen/go/v1',
+      authType: 'api',
+    });
+
+    expect(createOpenAI).toHaveBeenCalledWith({ apiKey: 'go-key', baseURL: 'https://opencode.ai/zen/go/v1' });
+    expect(responses).toHaveBeenCalledWith('muse-spark-1.3-contributor');
+    expect(chat).not.toHaveBeenCalled();
+    vi.doUnmock('@ai-sdk/openai');
+  });
+
+  it('leaves the SDK default host in place when an API-key route has no base URL', async () => {
+    vi.resetModules();
+    const responses = vi.fn((modelId: string) => ({ modelId, provider: 'openai-responses' }));
+    const chat = vi.fn((modelId: string) => ({ modelId, provider: 'openai-chat' }));
+    const createOpenAI = vi.fn(() => ({ responses, chat }));
+    vi.doMock('@ai-sdk/openai', () => ({ createOpenAI }));
+
+    const { createLanguageModel: create } = await import('../src/provider-factory.js');
+    await create({ npm: '@ai-sdk/openai', modelId: 'gpt-5.5', apiKey: 'sk-test', authType: 'api' });
+
+    expect(createOpenAI).toHaveBeenCalledWith({ apiKey: 'sk-test' });
+    vi.doUnmock('@ai-sdk/openai');
+  });
+
   // The Codex backend gates newer models on this header: gpt-6-astra answered
   // "requires a newer version of Codex. Please upgrade to the latest app or CLI"
   // (HTTP 400) while it was pinned at 0.144.1. Nothing tied the header to the
@@ -701,6 +748,37 @@ describe('createLanguageModel', () => {
     expect(headers['x-openai-internal-codex-responses-lite']).toBe('true');
     vi.doUnmock('@ai-sdk/openai');
   });
+
+  // Exercise the request built from the seed, not only the seed's metadata.
+  it.each(['gpt-5.6-sol', 'gpt-5.6-terra'])(
+    'sends Responses-Lite headers from the seeded %s row',
+    async id => {
+      vi.resetModules();
+      const responses = vi.fn((modelId: string) => ({ modelId, provider: 'openai-responses' }));
+      const createOpenAI = vi.fn((_options: { headers: Record<string, string> }) => (
+        { responses, chat: vi.fn() }
+      ));
+      vi.doMock('@ai-sdk/openai', () => ({ createOpenAI }));
+      try {
+        const { createLanguageModel: create } = await import('../src/provider-factory.js');
+        const { CODEX_RESPONSES_LITE_VERSION } = await import('../src/constants.js');
+        const seed = buildOpenAiOAuthModels().find(model => model.id === id);
+        expect(seed).toBeDefined();
+        await create({
+          npm: '@ai-sdk/openai', modelId: id, apiKey: 'tok', authType: 'oauth',
+          oauthAccountId: 'acct-1', useResponsesLite: seed?.useResponsesLite,
+        });
+        const options = createOpenAI.mock.calls[0]?.[0];
+        expect(options?.headers).toMatchObject({
+          version: CODEX_RESPONSES_LITE_VERSION,
+          'x-openai-internal-codex-responses-lite': 'true',
+        });
+        expect(responses).toHaveBeenCalledWith(id);
+      } finally {
+        vi.doUnmock('@ai-sdk/openai');
+      }
+    },
+  );
 
   // Under-scope guard: a model the backend did not flag must not carry the header.
   it('omits the Codex client version for a model that is not Responses-Lite', async () => {
